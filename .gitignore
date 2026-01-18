@@ -1,0 +1,16 @@
+.data/
+
+# Benchmark artifacts
+# Only baseline.jsonl is tracked (manually promoted "known good" reference).
+# history.jsonl is local scratch for dev iteration.
+.benchmarks/*
+!.benchmarks/baseline.jsonl
+!.benchmarks/README.md
+!.benchmarks/.gitkeep
+
+cmd/fileprocbench/fileprocbench
+cmd/ticketgen/ticketgen
+cmd/benchreport/benchreport
+/fileprocbench
+/ticketgen
+/benchreport

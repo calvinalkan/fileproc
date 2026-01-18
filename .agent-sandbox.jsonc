@@ -1,0 +1,5 @@
+{
+  "filesystem": {
+    "ro": ["Makefile", "backpressure", ".githooks"]
+  }
+}
