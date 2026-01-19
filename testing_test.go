@@ -9,6 +9,16 @@ import (
 	"fileproc"
 )
 
+// Shared test constants.
+const (
+	testNamePad     = 200
+	testNumFilesBig = 500
+	testNumFilesMed = 300
+	testNumDirs     = 201
+	testBadFile     = "bad.txt"
+	testSecretFile  = "secret.txt"
+)
+
 func writeFile(t *testing.T, root, rel string, data []byte) {
 	t.Helper()
 

@@ -121,7 +121,7 @@ func (r *replayReader) reset(fh fileHandle, prefix []byte, pendingErr error) {
 // Results are unordered when processed with multiple workers.
 //
 // Returns collected results and any errors ([IOError] or [ProcessError]). See
-// [Process] for cancellation semantics.
+// [Process] for cancellation and concurrent modification semantics.
 func ProcessReader[T any](ctx context.Context, path string, fn ProcessReaderFunc[T], opts Options) ([]Result[T], []error) {
 	proc := processor[T]{kind: procKindReader, fnReader: fn}
 

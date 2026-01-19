@@ -442,6 +442,12 @@ func processEntry[T any](
 //
 // Cancellation itself is not added to the error slice; check ctx.Err() (or
 // context.Cause(ctx) when using [context.WithCancelCause]).
+//
+// # Concurrent Modifications
+//
+// Files or directories created during processing (e.g., by a callback) may or
+// may not be seen depending on timing. Do not rely on newly created entries
+// being processed in the same call.
 func Process[T any](ctx context.Context, path string, fn ProcessFunc[T], opts Options) ([]Result[T], []error) {
 	proc := processor[T]{kind: procKindBytes, fnBytes: fn}
 
