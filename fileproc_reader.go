@@ -30,8 +30,11 @@ const readerProbeSize = 4096
 // The reader is only valid until ProcessReaderFunc returns. The underlying file
 // handle is owned and closed by the processor.
 //
-// Callbacks are not invoked for directories, symlinks, non-regular files, or
-// empty files.
+// Callbacks are not invoked for directories, symlinks, or other non-regular
+// files.
+//
+// Empty files are passed to ProcessReaderFunc with a reader that returns EOF
+// immediately.
 //
 // Return values:
 //   - (*T, nil): emit the result

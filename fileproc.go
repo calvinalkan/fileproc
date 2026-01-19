@@ -105,8 +105,10 @@ import (
 // slices alias internal reusable buffers; they are only valid until
 // ProcessFunc returns. Copy them if needed.
 //
-// Callbacks are not invoked for directories, symlinks, non-regular files, or
-// empty files.
+// Callbacks are not invoked for directories, symlinks, or other non-regular
+// files.
+//
+// Empty files are passed to ProcessFunc with a zero-length data slice.
 //
 // Return values:
 //   - (*T, nil): emit the result

@@ -282,10 +282,6 @@ func processFilesInto[T any](
 				}
 			}
 
-			if bytesRead <= 0 {
-				continue
-			}
-
 			val, fnErr := cfg.fnBytes(relPath, bufs.readBuf[:bytesRead])
 			if fnErr != nil {
 				procErr := &ProcessError{Path: getPathStr(relPath), Err: fnErr}
@@ -326,14 +322,6 @@ func processFilesInto[T any](
 				if ctx.Err() != nil {
 					return
 				}
-
-				continue
-			}
-
-			// Skip empty files.
-			if probeN <= 0 {
-				_ = openFH.closeHandle()
-				fhOpen = false
 
 				continue
 			}
