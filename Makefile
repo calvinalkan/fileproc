@@ -5,19 +5,22 @@ MAKEFLAGS += --warn-undefined-variables --no-builtin-rules -j
 .DELETE_ON_ERROR:
 .DEFAULT_GOAL := build
 
-.PHONY: build lint clean fmt bench check
+.PHONY: build lint clean fmt bench check test
 
 GO := go
 
 build:
 	@for dir in ./cmd/*/; do (cd "$$dir" && $(GO) build . && echo "$$dir built"); done
 
-check: lint
+check: lint test
 
 lint:
 	golangci-lint config verify
 	@for script in ./backpressure/*.sh; do "$$script"; done
 	golangci-lint run --fix ./...
+
+test:
+	go test -race ./...
 
 clean:
 	rm -f $(shell find cmd -maxdepth 2 -type f -executable 2>/dev/null)

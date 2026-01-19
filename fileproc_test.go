@@ -1861,6 +1861,7 @@ func Test_ProcessReader_Returns_IOError_When_Path_Is_Symlink(t *testing.T) {
 	writeFile(t, root, "target.txt", []byte("data"))
 
 	symPath := filepath.Join(root, "link.txt")
+
 	err := os.Symlink(filepath.Join(root, "target.txt"), symPath)
 	if err != nil {
 		t.Fatalf("symlink: %v", err)
