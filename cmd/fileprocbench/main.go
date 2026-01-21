@@ -54,6 +54,12 @@ type benchResult struct {
 
 var errMissingFrontmatterID = errors.New("missing frontmatter/id")
 
+const (
+	processFrontmatter = "frontmatter"
+	processNoop        = "noop"
+	processStat        = "stat"
+)
+
 type benchFlags struct {
 	dir        string
 	tree       bool
@@ -77,7 +83,7 @@ func parseFlags() *benchFlags {
 
 	flag.StringVar(&flags.dir, "dir", "", "directory to scan")
 	flag.BoolVar(&flags.tree, "tree", false, "scan recursively")
-	flag.StringVar(&flags.process, "process", "frontmatter", "process mode: frontmatter | noop")
+	flag.StringVar(&flags.process, "process", "frontmatter", "process mode: frontmatter | noop | stat")
 	flag.StringVar(&flags.suffix, "suffix", ".md", "file suffix filter (empty = all files)")
 	flag.IntVar(&flags.readSize, "read", 2048, "bytes to read per file (prefix only)")
 	flag.IntVar(&flags.workers, "workers", 0, "worker count (0=auto)")
@@ -173,13 +179,24 @@ func run(flags *benchFlags) int {
 	}
 
 	processFn := makeProcessFn(selectedProcess)
+	statFn := makeStatFn(selectedProcess)
 
 	var visited uint64
 
 	start := time.Now()
 
 	for range flags.repeat {
-		results, errs := fileproc.Process(ctx, flags.dir, processFn, opts)
+		var (
+			results []fileproc.Result[struct{}]
+			errs    []error
+		)
+
+		switch selectedProcess {
+		case processStat:
+			results, errs = fileproc.ProcessStat(ctx, flags.dir, statFn, opts)
+		default:
+			results, errs = fileproc.Process(ctx, flags.dir, processFn, opts)
+		}
 
 		// In benchmarks we never expect errors.
 		if len(errs) > 0 {
@@ -318,10 +335,10 @@ func run(flags *benchFlags) int {
 func parseProcess(processFlag string) (string, error) {
 	processName := strings.ToLower(strings.TrimSpace(processFlag))
 	switch processName {
-	case "frontmatter", "noop":
+	case processFrontmatter, processNoop, processStat:
 		return processName, nil
 	default:
-		return "", fmt.Errorf("invalid -process %q (expected: frontmatter | noop)", processFlag)
+		return "", fmt.Errorf("invalid -process %q (expected: frontmatter | noop | stat)", processFlag)
 	}
 }
 
@@ -329,11 +346,11 @@ func makeProcessFn(process string) fileproc.ProcessFunc[struct{}] {
 	var one struct{}
 
 	switch process {
-	case "noop":
+	case processNoop:
 		return func(_ []byte, _ []byte) (*struct{}, error) {
 			return &one, nil
 		}
-	case "frontmatter":
+	case processFrontmatter:
 		return func(_ []byte, data []byte) (*struct{}, error) {
 			if !hasFrontMatterAndID(data) {
 				return nil, errMissingFrontmatterID
@@ -345,6 +362,21 @@ func makeProcessFn(process string) fileproc.ProcessFunc[struct{}] {
 		// parseProcess guards against unexpected values; keep a clear error in case
 		// of internal misuse.
 		return func(_ []byte, _ []byte) (*struct{}, error) {
+			return nil, fmt.Errorf("unknown process mode: %s", process)
+		}
+	}
+}
+
+func makeStatFn(process string) fileproc.ProcessStatFunc[struct{}] {
+	var one struct{}
+
+	switch process {
+	case processStat:
+		return func(_ []byte, _ fileproc.Stat, _ fileproc.LazyFile) (*struct{}, error) {
+			return &one, nil
+		}
+	default:
+		return func(_ []byte, _ fileproc.Stat, _ fileproc.LazyFile) (*struct{}, error) {
 			return nil, fmt.Errorf("unknown process mode: %s", process)
 		}
 	}

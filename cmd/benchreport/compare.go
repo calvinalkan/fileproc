@@ -19,6 +19,7 @@ Options:
   --n N             For avg mode, number of runs to average (default: 5)
   --fail-above PCT  Exit with error if regression exceeds PCT percent
   --focus SIZES     Comma-separated sizes to focus on (e.g. 100k,1m)
+  --process NAME    Benchmark process to compare: frontmatter | stat | noop
   --history FILE    Path to history.jsonl (default: .benchmarks/history.jsonl)
   --baseline FILE   Baseline file (default: .benchmarks/baseline.jsonl)
   --json            Output as JSON instead of table
@@ -73,6 +74,7 @@ func runCompare(args []string) error {
 	n := fs.Int("n", 5, "number of runs for avg mode")
 	failAbove := fs.Float64("fail-above", 0, "fail if regression exceeds this percent")
 	focus := fs.String("focus", "", "comma-separated sizes to focus on")
+	process := fs.String("process", "frontmatter", "benchmark process to compare: frontmatter | stat | noop")
 	historyFile := fs.String("history", ".benchmarks/history.jsonl", "path to history file")
 	baselineFile := fs.String("baseline", ".benchmarks/baseline.jsonl", "path to baseline file")
 	outputJSON := fs.Bool("json", false, "output as JSON")
@@ -82,10 +84,10 @@ func runCompare(args []string) error {
 		return fmt.Errorf("parse flags: %w", parseErr)
 	}
 
-	return compare(*against, *n, *failAbove, *focus, *historyFile, *baselineFile, *outputJSON)
+	return compare(*against, *n, *failAbove, *focus, *process, *historyFile, *baselineFile, *outputJSON)
 }
 
-func compare(against string, n int, failAbove float64, focus, historyFile, baselineFile string, outputJSON bool) error {
+func compare(against string, n int, failAbove float64, focus, process, historyFile, baselineFile string, outputJSON bool) error {
 	// Load history
 	history, err := loadHistory(historyFile)
 	if err != nil {
@@ -125,9 +127,9 @@ func compare(against string, n int, failAbove float64, focus, historyFile, basel
 		targetDesc = fmt.Sprintf("avg of last %d runs", count)
 
 	case "baseline":
-		baselines, err := loadBaselineSet(baselineFile)
-		if err != nil {
-			return fmt.Errorf("loading baseline: %w (create with: benchreport baseline add .benchmarks/regress-<timestamp> --file %s)", err, baselineFile)
+		baselines, loadErr := loadBaselineSet(baselineFile)
+		if loadErr != nil {
+			return fmt.Errorf("loading baseline: %w (create with: benchreport baseline add .benchmarks/regress-<timestamp> --file %s)", loadErr, baselineFile)
 		}
 
 		if len(baselines) == 0 {
@@ -153,7 +155,10 @@ func compare(against string, n int, failAbove float64, focus, historyFile, basel
 	}
 
 	// Compare
-	comparison := buildComparison(&latest, &target, targetDesc, focusSizes)
+	comparison, err := buildComparison(&latest, &target, targetDesc, focusSizes, process)
+	if err != nil {
+		return err
+	}
 
 	if outputJSON {
 		enc := json.NewEncoder(os.Stdout)
@@ -293,20 +298,23 @@ func averageSummaries(summaries []Summary) Summary {
 	}
 }
 
-func buildComparison(latest, target *Summary, targetDesc string, focusSizes []string) Comparison {
-	// Get frontmatter benchmarks, optionally filtered
+func buildComparison(latest, target *Summary, targetDesc string, focusSizes []string, process string) (Comparison, error) {
+	// Get benchmarks for the requested process, optionally filtered
 	var (
 		benchmarks      []CompareResult
 		worstRegression float64
 	)
 
-	// Order matters for nice output
-	orderedBenches := []string{
-		"flat_1k_frontmatter", "nested1_1k_frontmatter",
-		"flat_5k_frontmatter", "nested1_5k_frontmatter",
-		"flat_100k_frontmatter", "nested1_100k_frontmatter",
-		"flat_1m_frontmatter", "nested1_1m_frontmatter",
+	process = strings.ToLower(strings.TrimSpace(process))
+	if process == "" {
+		process = "frontmatter"
 	}
+
+	if process != "frontmatter" && process != "stat" && process != "noop" {
+		return Comparison{}, fmt.Errorf("invalid process: %s (expected: frontmatter | stat | noop)", process)
+	}
+
+	orderedBenches, ratioSuffix := benchmarksForProcess(process)
 
 	for _, name := range orderedBenches {
 		// Apply focus filter
@@ -334,10 +342,15 @@ func buildComparison(latest, target *Summary, targetDesc string, focusSizes []st
 		}
 
 		// Extract prefix for ratio lookup (e.g., "flat_1k")
-		prefix := strings.TrimSuffix(name, "_frontmatter")
+		prefix := strings.TrimSuffix(name, "_"+process)
 
-		latestRatio := latest.Ratios[prefix]
-		targetRatio := target.Ratios[prefix]
+		ratioKey := prefix
+		if ratioSuffix != "" {
+			ratioKey = prefix + ratioSuffix
+		}
+
+		latestRatio := latest.Ratios[ratioKey]
+		targetRatio := target.Ratios[ratioKey]
 
 		meanChange := pctChange(latestR.MeanMs, targetR.MeanMs)
 		fpsChange := pctChange(latestR.FilesPerSec, targetR.FilesPerSec)
@@ -378,7 +391,24 @@ func buildComparison(latest, target *Summary, targetDesc string, focusSizes []st
 		TargetTS:        targetTS,
 		Benchmarks:      benchmarks,
 		WorstRegression: worstRegression,
+	}, nil
+}
+
+func benchmarksForProcess(process string) ([]string, string) {
+	suffix := "_" + process
+	ordered := []string{
+		"flat_1k" + suffix, "nested1_1k" + suffix,
+		"flat_5k" + suffix, "nested1_5k" + suffix,
+		"flat_100k" + suffix, "nested1_100k" + suffix,
+		"flat_1m" + suffix, "nested1_1m" + suffix,
 	}
+
+	ratioSuffix := ""
+	if process == "stat" {
+		ratioSuffix = "_stat"
+	}
+
+	return ordered, ratioSuffix
 }
 
 func printComparison(c *Comparison) error {

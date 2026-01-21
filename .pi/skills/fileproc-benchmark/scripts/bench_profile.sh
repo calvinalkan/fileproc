@@ -34,6 +34,7 @@ STRACE=false
 REPEAT=10
 WORKERS=""
 GC=""
+PROCESS="frontmatter"
 OUT_DIR=".benchmarks/profiles"
 
 BIN="./cmd/fileprocbench/fileprocbench"
@@ -53,6 +54,7 @@ Options:
   --repeat N        Iterations in single process (default: $REPEAT)
   --workers N       Worker count override
   --gc N            GC percent override
+  --process NAME    Process mode (default: $PROCESS)
   --out DIR         Output directory (default: $OUT_DIR)
   -h, --help        Show this help
 
@@ -80,6 +82,7 @@ while [[ $# -gt 0 ]]; do
     --repeat) REPEAT="$2"; shift 2 ;;
     --workers) WORKERS="$2"; shift 2 ;;
     --gc) GC="$2"; shift 2 ;;
+    --process) PROCESS="$2"; shift 2 ;;
     --out) OUT_DIR="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *)
@@ -155,7 +158,7 @@ mkdir -p "$OUT_DIR"
 STAMP=$(date +"%Y%m%d-%H%M%S")
 
 # Build base command
-CMD=("$BIN" -dir "$DIR" -repeat "$REPEAT")
+CMD=("$BIN" -dir "$DIR" -repeat "$REPEAT" -process "$PROCESS")
 
 if needs_tree "$CASE"; then
   CMD+=(-tree)
@@ -184,6 +187,7 @@ echo "  dir:      $DIR"
 echo "  repeat:   $REPEAT"
 echo "  workers:  ${WORKERS:-<default>}"
 echo "  gc:       ${GC:-<default>}"
+echo "  process:  ${PROCESS}"
 echo
 
 # Run pprof profiles (can do both in one run)

@@ -30,6 +30,7 @@ WORKERS_LIST=""  # empty = use defaults per case
 WORKERS_DEFAULT="1,2,4,8,16"
 WORKERS_DEFAULT_LARGE="6,8,12,16,24"  # 100k/1m: skip low worker counts
 CASES=""
+PROCESS="frontmatter"
 VERBOSE=false
 
 # Small datasets are very fast, so run more iterations for stability.
@@ -50,6 +51,7 @@ usage() {
   echo "  --workers LIST    Comma-separated worker counts (overrides defaults)"
   echo "  --runs N          Base runs per combination (default: $RUNS)"
   echo "  --warmup N        Warmup runs (default: $WARMUP)"
+  echo "  --process NAME    Process mode (default: $PROCESS)"
   echo "  --verbose, -v     Show full hyperfine output (default: summary table only)"
   echo ""
   echo "Defaults per case size:"
@@ -76,6 +78,7 @@ while [[ $# -gt 0 ]]; do
     --workers) WORKERS_LIST="$2"; shift 2 ;;
     --runs) RUNS="$2"; shift 2 ;;
     --warmup) WARMUP="$2"; shift 2 ;;
+    --process) PROCESS="$2"; shift 2 ;;
     --verbose|-v) VERBOSE=true; shift 1 ;;
     -h|--help)
       usage
@@ -148,6 +151,7 @@ fi
 echo "runs_base:   $RUNS (warmup: $WARMUP)"
 echo "runs_1k:     $((RUNS * MULT_1K)) (base × $MULT_1K)"
 echo "runs_5k:     $((RUNS * MULT_5K)) (base × $MULT_5K)"
+echo "process:     $PROCESS"
 echo
 
 echo "building..."
@@ -218,7 +222,7 @@ for c in "${CASE_ARR[@]}"; do
   # Add each worker count with a short name
   IFS=',' read -ra WORKER_ARR <<< "$case_workers"
   for w in "${WORKER_ARR[@]}"; do
-    hf_args+=(-n "w=$w" "$BIN -dir $dir $tree_flag -process frontmatter -workers $w")
+    hf_args+=(-n "w=$w" "$BIN -dir $dir $tree_flag -process $PROCESS -workers $w")
   done
   
   hyperfine "${hf_args[@]}"
