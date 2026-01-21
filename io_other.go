@@ -186,6 +186,35 @@ func (d dirHandle) openFile(name []byte) (fileHandle, error) {
 	return fileHandle{f: f}, nil
 }
 
+func (d dirHandle) statFile(name []byte) (Stat, statKind, error) {
+	if len(name) <= 1 {
+		return Stat{}, statKindOther, os.ErrNotExist
+	}
+
+	fullPath := filepath.Join(d.path, string(name[:len(name)-1]))
+
+	info, err := os.Lstat(fullPath)
+	if err != nil {
+		return Stat{}, statKindOther, err
+	}
+
+	kind := statKindOther
+	if info.Mode()&os.ModeSymlink != 0 {
+		kind = statKindSymlink
+	} else if info.IsDir() {
+		kind = statKindDir
+	} else if info.Mode().IsRegular() {
+		kind = statKindReg
+	}
+
+	return Stat{
+		Size:    info.Size(),
+		ModTime: info.ModTime().UnixNano(),
+		Mode:    uint32(info.Mode()),
+		Inode:   0,
+	}, kind, nil
+}
+
 func (f fileHandle) readInto(buf []byte) (n int, isDir bool, err error) {
 	n, err = f.f.Read(buf)
 	if err != nil {
@@ -230,4 +259,12 @@ func (f fileHandle) closeHandle() error {
 	}
 
 	return nil
+}
+
+func (f fileHandle) fdValue() uintptr {
+	if f.f == nil {
+		return 0
+	}
+
+	return f.f.Fd()
 }

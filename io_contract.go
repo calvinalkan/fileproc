@@ -73,12 +73,14 @@ type (
 	ioDirHandle interface {
 		closeHandle() error
 		openFile(name []byte) (fileHandle, error)
+		statFile(name []byte) (Stat, statKind, error)
 	}
 
 	ioFileHandle interface {
 		io.Reader
 		closeHandle() error
 		readInto(buf []byte) (n int, isDir bool, err error)
+		fdValue() uintptr
 	}
 )
 

@@ -207,6 +207,43 @@ func (d dirHandle) openFile(name []byte) (fileHandle, error) {
 	return fileHandle{fd: fd}, nil
 }
 
+func (d dirHandle) statFile(name []byte) (Stat, statKind, error) {
+	if len(name) <= 1 {
+		return Stat{}, statKindOther, syscall.ENOENT
+	}
+
+	nameStr := string(name[:nameLen(name)])
+
+	var st unix.Stat_t
+	for {
+		err := unix.Fstatat(d.fd, nameStr, &st, unix.AT_SYMLINK_NOFOLLOW)
+		if err == syscall.EINTR {
+			continue
+		}
+		if err != nil {
+			return Stat{}, statKindOther, err
+		}
+		break
+	}
+
+	kind := statKindOther
+	switch st.Mode & unix.S_IFMT {
+	case unix.S_IFREG:
+		kind = statKindReg
+	case unix.S_IFDIR:
+		kind = statKindDir
+	case unix.S_IFLNK:
+		kind = statKindSymlink
+	}
+
+	return Stat{
+		Size:    st.Size,
+		ModTime: st.Mtimespec.Nano(),
+		Mode:    uint32(st.Mode),
+		Inode:   st.Ino,
+	}, kind, nil
+}
+
 // Read implements io.Reader.
 func (f fileHandle) Read(buf []byte) (int, error) {
 	if len(buf) == 0 {
@@ -271,4 +308,12 @@ func (f fileHandle) closeHandle() error {
 	}
 
 	return nil
+}
+
+func (f fileHandle) fdValue() uintptr {
+	if f.fd < 0 {
+		return 0
+	}
+
+	return uintptr(f.fd)
 }

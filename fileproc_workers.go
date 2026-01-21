@@ -49,6 +49,7 @@ type fileProcCfg[T any] struct {
 
 	fnBytes  ProcessFunc[T]
 	fnReader ProcessReaderFunc[T]
+	fnStat   ProcessStatFunc[T]
 
 	notifier       *errNotifier
 	copyResultPath bool
@@ -119,6 +120,11 @@ func (p processor[T]) processFilesSequential(
 			pathBuf:   make([]byte, 0, pathBufCap),
 			pathArena: make([]byte, 0, pathArenaCap),
 		}
+	case procKindStat:
+		bufs = &workerBufs{
+			pathBuf:   make([]byte, 0, pathBufCap),
+			pathArena: make([]byte, 0, pathArenaCap),
+		}
 	}
 
 	results := make([]Result[T], 0, len(names))
@@ -129,6 +135,7 @@ func (p processor[T]) processFilesSequential(
 		kind:           p.kind,
 		fnBytes:        p.fnBytes,
 		fnReader:       p.fnReader,
+		fnStat:         p.fnStat,
 		notifier:       notifier,
 		copyResultPath: opts.CopyResultPath,
 	}
@@ -223,6 +230,69 @@ func processFilesInto[T any](
 			relPath = bufs.pathBuf
 		} else {
 			relPath = name[:nameLen(name)]
+		}
+
+		if cfg.kind == procKindStat {
+			statRes, kind, statErr := dh.statFile(name)
+			if statErr != nil {
+				// Ignore symlinks entirely (best-effort; should be filtered at readdir already).
+				if errors.Is(statErr, syscall.ELOOP) || kind == statKindSymlink {
+					continue
+				}
+
+				ioErr := &IOError{Path: getPathStr(relPath), Op: "stat", Err: statErr}
+				if cfg.notifier.ioErr(ioErr) {
+					*out.errs = append(*out.errs, ioErr)
+				}
+
+				if ctx.Err() != nil {
+					return
+				}
+
+				continue
+			}
+
+			if kind != statKindReg {
+				continue
+			}
+
+			lazy := newLazyFile(dh, name, &openFH, &fhOpen)
+
+			val, fnErr := cfg.fnStat(relPath, statRes, lazy)
+			if fnErr != nil {
+				procErr := &ProcessError{Path: getPathStr(relPath), Err: fnErr}
+				if cfg.notifier.callbackErr(procErr) {
+					*out.errs = append(*out.errs, procErr)
+				}
+
+				if ctx.Err() != nil {
+					return
+				}
+
+				continue
+			}
+
+			if fhOpen {
+				closeErr := openFH.closeHandle()
+				fhOpen = false
+
+				if closeErr != nil {
+					ioErr := &IOError{Path: getPathStr(relPath), Op: "close", Err: closeErr}
+					if cfg.notifier.ioErr(ioErr) {
+						*out.errs = append(*out.errs, ioErr)
+					}
+
+					if ctx.Err() != nil {
+						return
+					}
+				}
+			}
+
+			if val != nil {
+				*out.results = append(*out.results, Result[T]{Path: getPath(relPath, name), Value: val})
+			}
+
+			continue
 		}
 
 		fh, err := dh.openFile(name)
@@ -360,6 +430,13 @@ func processFilesInto[T any](
 			if val != nil {
 				*out.results = append(*out.results, Result[T]{Path: getPath(relPath, name), Value: val})
 			}
+
+		case procKindStat:
+			// Stat path is handled before openFile; this should be unreachable.
+			if fhOpen {
+				_ = openFH.closeHandle()
+				fhOpen = false
+			}
 		}
 	}
 }
@@ -396,6 +473,7 @@ func (p processor[T]) processDirPipelined(ctx context.Context, args *dirPipeline
 		kind:           p.kind,
 		fnBytes:        p.fnBytes,
 		fnReader:       p.fnReader,
+		fnStat:         p.fnStat,
 		notifier:       notifier,
 		copyResultPath: opts.CopyResultPath,
 	}
@@ -551,6 +629,10 @@ func (p processor[T]) processDirPipelined(ctx context.Context, args *dirPipeline
 			bufs = &workerBufs{
 				probeBuf: make([]byte, readerProbeSize),
 				pathBuf:  make([]byte, 0, pathBufCap),
+			}
+		case procKindStat:
+			bufs = &workerBufs{
+				pathBuf: make([]byte, 0, pathBufCap),
 			}
 		}
 

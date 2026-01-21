@@ -366,6 +366,7 @@ type procKind uint8
 const (
 	procKindBytes procKind = iota
 	procKindReader
+	procKindStat
 )
 
 type processor[T any] struct {
@@ -373,6 +374,7 @@ type processor[T any] struct {
 
 	fnBytes  ProcessFunc[T]
 	fnReader ProcessReaderFunc[T]
+	fnStat   ProcessStatFunc[T]
 }
 
 func (p processor[T]) run(ctx context.Context, path string, opts Options, notifier *errNotifier) ([]Result[T], []error) {
@@ -831,6 +833,12 @@ func (p processor[T]) processTree(
 				pathBuf:  make([]byte, 0, pathBufExtra),
 				// pathArena and batch start zero-valued, grow as needed.
 			}
+		case procKindStat:
+			bufs = &workerBufs{
+				dirBuf:  make([]byte, 0, dirReadBufSize),
+				pathBuf: make([]byte, 0, pathBufExtra),
+				// pathArena and batch start zero-valued, grow as needed.
+			}
 		}
 
 		// Pre-allocate batches for pipelining large directories.
@@ -1010,6 +1018,7 @@ func (p processor[T]) processTree(
 						kind:           p.kind,
 						fnBytes:        p.fnBytes,
 						fnReader:       p.fnReader,
+						fnStat:         p.fnStat,
 						notifier:       notifier,
 						copyResultPath: opts.CopyResultPath,
 					}
