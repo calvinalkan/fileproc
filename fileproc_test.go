@@ -13,7 +13,7 @@ import (
 	"syscall"
 	"testing"
 
-	"fileproc"
+	"github.com/calvinalkan/fileproc"
 )
 
 const openOp = "open"

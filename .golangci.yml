@@ -335,4 +335,4 @@ formatters:
   settings:
     goimports:
       local-prefixes:
-        - agent-sandbox
+        - fileproc

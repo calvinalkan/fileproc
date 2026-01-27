@@ -15,7 +15,7 @@ import (
 	"strings"
 	"time"
 
-	"fileproc"
+	"github.com/calvinalkan/fileproc"
 )
 
 type benchResult struct {

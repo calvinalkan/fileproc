@@ -8,7 +8,7 @@ import (
 	"sync"
 	"testing"
 
-	"fileproc"
+	"github.com/calvinalkan/fileproc"
 )
 
 func Test_Process_Drops_IOErrors_When_OnError_Returns_False(t *testing.T) {

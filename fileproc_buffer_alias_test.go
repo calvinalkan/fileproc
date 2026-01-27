@@ -11,7 +11,7 @@ import (
 	"time"
 	"unsafe"
 
-	"fileproc"
+	"github.com/calvinalkan/fileproc"
 )
 
 func Test_Process_Does_Not_Share_DataBuffers_When_Using_Concurrent_Tree_Workers(t *testing.T) {

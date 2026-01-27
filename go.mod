@@ -1,4 +1,4 @@
-module fileproc
+module github.com/calvinalkan/fileproc
 
 go 1.25.5
 

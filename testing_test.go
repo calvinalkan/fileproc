@@ -6,7 +6,7 @@ import (
 	"sort"
 	"testing"
 
-	"fileproc"
+	"github.com/calvinalkan/fileproc"
 )
 
 // Shared test constants.

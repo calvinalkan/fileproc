@@ -8,7 +8,7 @@ import (
 	"sync"
 	"testing"
 
-	"fileproc"
+	"github.com/calvinalkan/fileproc"
 )
 
 func Test_Process_Counts_Errors_Correctly_When_Mixed_IO_And_Process_Errors_Concurrent(t *testing.T) {

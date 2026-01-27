@@ -8,7 +8,7 @@ import (
 	"sync"
 	"testing"
 
-	"fileproc"
+	"github.com/calvinalkan/fileproc"
 )
 
 func Test_Process_Processes_All_Files_When_Pipelined_With_Multiple_ReadDirBatches(t *testing.T) {

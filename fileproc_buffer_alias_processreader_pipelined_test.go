@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"fileproc"
+	"github.com/calvinalkan/fileproc"
 )
 
 func Test_ProcessReader_Does_Not_Share_ReplayReader_When_Using_Pipelined_Workers(t *testing.T) {

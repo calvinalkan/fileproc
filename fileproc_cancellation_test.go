@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"fileproc"
+	"github.com/calvinalkan/fileproc"
 )
 
 func Test_Process_Does_Not_Hang_When_Cancelled_In_Pipelined_Mode(t *testing.T) {

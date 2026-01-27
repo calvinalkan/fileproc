@@ -7,7 +7,7 @@ import (
 	"sync"
 	"testing"
 
-	"fileproc"
+	"github.com/calvinalkan/fileproc"
 )
 
 func Test_Process_Processes_All_Files_When_Using_Recursive_Concurrent_Workers(t *testing.T) {

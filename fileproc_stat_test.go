@@ -11,7 +11,7 @@ import (
 	"sync"
 	"testing"
 
-	"fileproc"
+	"github.com/calvinalkan/fileproc"
 )
 
 func Test_ProcessStat_Returns_TopLevel_Files_When_NonRecursive(t *testing.T) {
