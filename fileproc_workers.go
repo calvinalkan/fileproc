@@ -265,6 +265,23 @@ func processFilesInto[T any](
 					*out.errs = append(*out.errs, procErr)
 				}
 
+				// Callback may have opened LazyFile; ensure handle closed on error.
+				if fhOpen {
+					closeErr := openFH.closeHandle()
+					fhOpen = false
+
+					if closeErr != nil {
+						ioErr := &IOError{Path: getPathStr(relPath), Op: "close", Err: closeErr}
+						if cfg.notifier.ioErr(ioErr) {
+							*out.errs = append(*out.errs, ioErr)
+						}
+
+						if ctx.Err() != nil {
+							return
+						}
+					}
+				}
+
 				if ctx.Err() != nil {
 					return
 				}

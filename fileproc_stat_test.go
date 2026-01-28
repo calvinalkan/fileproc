@@ -271,3 +271,86 @@ func Test_ProcessStat_Returns_Error_When_Callback_Fails(t *testing.T) {
 		t.Fatalf("unexpected path: %s", procErr.Path)
 	}
 }
+
+func Test_ProcessStat_Closes_LazyFile_When_Callback_Errors(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	writeFile(t, root, "a.txt", []byte("alpha"))
+	writeFile(t, root, "b.txt", []byte("bravo"))
+
+	expected := map[string][]byte{
+		"a.txt": []byte("alpha"),
+		"b.txt": []byte("bravo"),
+	}
+
+	opts := fileproc.Options{
+		Workers:            1,
+		SmallFileThreshold: 10,
+	}
+
+	sentinel := errors.New("boom")
+	mismatch := errors.New("mismatch")
+
+	var (
+		calls         int
+		errorInjected bool
+	)
+
+	_, errs := fileproc.ProcessStat(t.Context(), root, func(path []byte, _ fileproc.Stat, f fileproc.LazyFile) (*struct{}, error) {
+		calls++
+
+		if f == nil {
+			return nil, fmt.Errorf("nil lazy file: %w", mismatch)
+		}
+
+		data, err := io.ReadAll(f)
+		if err != nil {
+			return nil, fmt.Errorf("read lazy file: %w", err)
+		}
+
+		relPath := string(path)
+
+		exp, ok := expected[relPath]
+		if !ok {
+			return nil, fmt.Errorf("unexpected path %q: %w", relPath, mismatch)
+		}
+
+		if !errorInjected {
+			errorInjected = true
+
+			if !bytes.Equal(data, exp) {
+				return nil, fmt.Errorf("unexpected content for first file: %w", mismatch)
+			}
+
+			return nil, sentinel
+		}
+
+		if !bytes.Equal(data, exp) {
+			return nil, fmt.Errorf("stale lazy file handle: %w", mismatch)
+		}
+
+		return &struct{}{}, nil
+	}, opts)
+
+	if calls != 2 {
+		t.Fatalf("expected 2 callbacks, got %d", calls)
+	}
+
+	if len(errs) != 1 {
+		t.Fatalf("expected 1 error, got %d: %v", len(errs), errs)
+	}
+
+	var procErr *fileproc.ProcessError
+	if !errors.As(errs[0], &procErr) {
+		t.Fatalf("expected ProcessError, got %T", errs[0])
+	}
+
+	if !errors.Is(procErr, sentinel) {
+		t.Fatalf("unexpected error: %v", procErr)
+	}
+
+	if errors.Is(procErr, mismatch) {
+		t.Fatalf("unexpected mismatch error: %v", procErr)
+	}
+}
