@@ -1156,6 +1156,7 @@ func (p processor[T]) processDirPipelinedWithBatches(ctx context.Context, args *
 		kind:           p.kind,
 		fnBytes:        p.fnBytes,
 		fnReader:       p.fnReader,
+		fnStat:         p.fnStat,
 		notifier:       args.notifier,
 		copyResultPath: args.opts.CopyResultPath,
 	}
