@@ -266,9 +266,9 @@ func computeRatios(results map[string]BenchResult) map[string]float64 {
 			ratios[prefix] = fm.MeanMs / noop.MeanMs
 		}
 
-		stat, hasStat := results[prefix+"_stat"]
+		stat, hasStat := results[prefix+"_lazy"]
 		if hasStat && hasNoop && noop.MeanMs > 0 {
-			ratios[prefix+"_stat"] = stat.MeanMs / noop.MeanMs
+			ratios[prefix+"_lazy"] = stat.MeanMs / noop.MeanMs
 		}
 	}
 

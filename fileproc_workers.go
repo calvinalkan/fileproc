@@ -49,7 +49,7 @@ type fileProcCfg[T any] struct {
 
 	fnBytes  ProcessFunc[T]
 	fnReader ProcessReaderFunc[T]
-	fnStat   ProcessStatFunc[T]
+	fnLazy   ProcessLazyFunc[T]
 
 	notifier       *errNotifier
 	copyResultPath bool
@@ -120,10 +120,11 @@ func (p processor[T]) processFilesSequential(
 			pathBuf:   make([]byte, 0, pathBufCap),
 			pathArena: make([]byte, 0, pathArenaCap),
 		}
-	case procKindStat:
+	case procKindLazy:
 		bufs = &workerBufs{
 			pathBuf:   make([]byte, 0, pathBufCap),
 			pathArena: make([]byte, 0, pathArenaCap),
+			// dataBuf, dataArena, scratchBuf start zero-valued, grow as needed.
 		}
 	}
 
@@ -135,7 +136,7 @@ func (p processor[T]) processFilesSequential(
 		kind:           p.kind,
 		fnBytes:        p.fnBytes,
 		fnReader:       p.fnReader,
-		fnStat:         p.fnStat,
+		fnLazy:         p.fnLazy,
 		notifier:       notifier,
 		copyResultPath: opts.CopyResultPath,
 	}
@@ -232,40 +233,43 @@ func processFilesInto[T any](
 			relPath = name[:nameLen(name)]
 		}
 
-		if cfg.kind == procKindStat {
-			statRes, kind, statErr := dh.statFile(name)
-			if statErr != nil {
-				// Ignore symlinks entirely (best-effort; should be filtered at readdir already).
-				if errors.Is(statErr, syscall.ELOOP) || kind == statKindSymlink {
+		if cfg.kind == procKindLazy {
+			// Reset scratch buffer for this file (len=0, preserve capacity).
+			bufs.scratchBuf = bufs.scratchBuf[:0]
+
+			// Store relPath in arena for File.RelPath() to return.
+			arenaRelPath := appendToArena(relPath)
+
+			// Reuse File struct from workerBufs to avoid per-file heap allocation.
+			bufs.file = File{
+				dh:        dh,
+				name:      name,
+				relPath:   arenaRelPath,
+				fh:        &openFH,
+				fhOpen:    &fhOpen,
+				dataBuf:   &bufs.dataBuf,
+				dataArena: &bufs.dataArena,
+			}
+			bufs.scratch.buf = &bufs.scratchBuf
+
+			val, fnErr := cfg.fnLazy(&bufs.file, &bufs.scratch)
+			if fnErr != nil {
+				// Silent skip for race conditions (file became dir/symlink)
+				if errors.Is(fnErr, errSkipFile) {
+					if fhOpen {
+						_ = openFH.closeHandle()
+						fhOpen = false
+					}
+
 					continue
 				}
 
-				ioErr := &IOError{Path: getPathStr(relPath), Op: "stat", Err: statErr}
-				if cfg.notifier.ioErr(ioErr) {
-					*out.errs = append(*out.errs, ioErr)
-				}
-
-				if ctx.Err() != nil {
-					return
-				}
-
-				continue
-			}
-
-			if kind != statKindReg {
-				continue
-			}
-
-			lazy := newLazyFile(dh, name, &openFH, &fhOpen)
-
-			val, fnErr := cfg.fnStat(relPath, statRes, lazy)
-			if fnErr != nil {
 				procErr := &ProcessError{Path: getPathStr(relPath), Err: fnErr}
 				if cfg.notifier.callbackErr(procErr) {
 					*out.errs = append(*out.errs, procErr)
 				}
 
-				// Callback may have opened LazyFile; ensure handle closed on error.
+				// Callback may have opened file; ensure handle closed on error.
 				if fhOpen {
 					closeErr := openFH.closeHandle()
 					fhOpen = false
@@ -306,7 +310,8 @@ func processFilesInto[T any](
 			}
 
 			if val != nil {
-				*out.results = append(*out.results, Result[T]{Path: getPath(relPath, name), Value: val})
+				// For lazy mode, Result.Path uses arena-stored relPath (already stored above).
+				*out.results = append(*out.results, Result[T]{Path: arenaRelPath, Value: val})
 			}
 
 			continue
@@ -448,8 +453,8 @@ func processFilesInto[T any](
 				*out.results = append(*out.results, Result[T]{Path: getPath(relPath, name), Value: val})
 			}
 
-		case procKindStat:
-			// Stat path is handled before openFile; this should be unreachable.
+		case procKindLazy:
+			// Lazy path is handled before openFile; this should be unreachable.
 			if fhOpen {
 				_ = openFH.closeHandle()
 				fhOpen = false
@@ -490,7 +495,7 @@ func (p processor[T]) processDirPipelined(ctx context.Context, args *dirPipeline
 		kind:           p.kind,
 		fnBytes:        p.fnBytes,
 		fnReader:       p.fnReader,
-		fnStat:         p.fnStat,
+		fnLazy:         p.fnLazy,
 		notifier:       notifier,
 		copyResultPath: opts.CopyResultPath,
 	}
@@ -647,9 +652,10 @@ func (p processor[T]) processDirPipelined(ctx context.Context, args *dirPipeline
 				probeBuf: make([]byte, readerProbeSize),
 				pathBuf:  make([]byte, 0, pathBufCap),
 			}
-		case procKindStat:
+		case procKindLazy:
 			bufs = &workerBufs{
 				pathBuf: make([]byte, 0, pathBufCap),
+				// dataBuf, dataArena, scratchBuf start zero-valued, grow as needed.
 			}
 		}
 

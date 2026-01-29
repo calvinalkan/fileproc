@@ -45,13 +45,13 @@ make bench   # Run regression + compare vs avg of last 5 runs, fail if >1% regre
 |------|---------|
 | Run regression benchmarks | `.pi/skills/fileproc-benchmark/scripts/bench_regress.sh` |
 | Compare vs previous run | `cmd/benchreport/benchreport compare` |
-| Compare stat results | `cmd/benchreport/benchreport compare --process stat` |
+| Compare lazy results | `cmd/benchreport/benchreport compare --process lazy` |
 | Compare vs baseline | `cmd/benchreport/benchreport compare --against baseline` |
 | Fail if regression >5% | `cmd/benchreport/benchreport compare --against baseline --fail-above 5` |
 | Sweep worker counts | `.pi/skills/fileproc-benchmark/scripts/bench_sweep.sh --case flat_100k` |
-| Sweep stat worker counts | `.pi/skills/fileproc-benchmark/scripts/bench_sweep.sh --case flat_100k --process stat` |
+| Sweep lazy worker counts | `.pi/skills/fileproc-benchmark/scripts/bench_sweep.sh --case flat_100k --process lazy` |
 | Profile CPU/memory | `.pi/skills/fileproc-benchmark/scripts/bench_profile.sh --case flat_100k --cpu --mem` |
-| Profile stat-only | `.pi/skills/fileproc-benchmark/scripts/bench_profile.sh --case flat_100k --process stat --cpu --mem` |
+| Profile lazy-only | `.pi/skills/fileproc-benchmark/scripts/bench_profile.sh --case flat_100k --process lazy --cpu --mem` |
 | Profile everything | `.pi/skills/fileproc-benchmark/scripts/bench_profile.sh --case flat_100k --all` |
 
 All paths are from project root.
@@ -65,8 +65,8 @@ All paths are from project root.
 # Compare latest vs previous run
 ./cmd/benchreport/benchreport compare
 
-# Compare stat-only results vs previous run
-./cmd/benchreport/benchreport compare --process stat
+# Compare lazy-only results vs previous run
+./cmd/benchreport/benchreport compare --process lazy
 
 # Compare latest vs rolling average of last 5 runs
 ./cmd/benchreport/benchreport compare --against avg --n 5
@@ -87,8 +87,8 @@ All paths are from project root.
 # Syscall analysis - what syscalls dominate?
 .pi/skills/fileproc-benchmark/scripts/bench_profile.sh --case flat_100k --strace
 
-# Stat-only profiling
-.pi/skills/fileproc-benchmark/scripts/bench_profile.sh --case flat_100k --process stat --cpu --mem
+# Lazy-only profiling
+.pi/skills/fileproc-benchmark/scripts/bench_profile.sh --case flat_100k --process lazy --cpu --mem
 
 # Everything at once
 .pi/skills/fileproc-benchmark/scripts/bench_profile.sh --case flat_100k --all
@@ -103,8 +103,8 @@ All paths are from project root.
 # Sweep specific case
 .pi/skills/fileproc-benchmark/scripts/bench_sweep.sh --case flat_100k
 
-# Sweep stat-only worker counts
-.pi/skills/fileproc-benchmark/scripts/bench_sweep.sh --case flat_100k --process stat
+# Sweep lazy-only worker counts
+.pi/skills/fileproc-benchmark/scripts/bench_sweep.sh --case flat_100k --process lazy
 
 # Custom worker list
 .pi/skills/fileproc-benchmark/scripts/bench_sweep.sh --case flat_100k --workers 4,8,16,24,32

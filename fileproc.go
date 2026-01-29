@@ -97,6 +97,27 @@ import (
 	"sync"
 )
 
+// Internal stat classification used by stat-only processing.
+type statKind uint8
+
+const (
+	statKindReg statKind = iota
+	statKindDir
+	statKindSymlink
+	statKindOther
+)
+
+// Stat holds metadata for a file discovered by [ProcessLazy].
+//
+// ModTime is expressed as Unix nanoseconds to avoid time.Time allocations
+// in hot paths. Use time.Unix(0, st.ModTime) to convert when needed.
+type Stat struct {
+	Size    int64
+	ModTime int64
+	Mode    uint32
+	Inode   uint64
+}
+
 // ProcessFunc is called for each file with a prefix of its contents.
 //
 // ProcessFunc may be called concurrently and must be safe for concurrent use.
@@ -359,6 +380,26 @@ type workerBufs struct {
 	// initial probe read (stored in probeBuf) before continuing with the
 	// underlying file handle.
 	replay replayReader
+
+	// dataBuf is temporary buffer for File.Bytes() read syscall (used by ProcessLazy).
+	// Sized to st.Size+1, grows to max file size seen. Reused across files.
+	dataBuf []byte
+
+	// dataArena is append-only storage for File.Bytes() results (used by ProcessLazy).
+	// Each Bytes() result is a subslice. Grows across all files, never
+	// shrinks. GC'd when results are released.
+	dataArena []byte
+
+	// scratchBuf backs Scratch.Get() (used by ProcessLazy). Reset to len=0 for each file,
+	// capacity preserved across files.
+	scratchBuf []byte
+
+	// file is a reusable File struct for ProcessLazy callbacks.
+	// Reset for each file to avoid per-file heap allocation.
+	file File
+
+	// scratch is a reusable Scratch struct for ProcessLazy callbacks.
+	scratch Scratch
 }
 
 type procKind uint8
@@ -366,7 +407,7 @@ type procKind uint8
 const (
 	procKindBytes procKind = iota
 	procKindReader
-	procKindStat
+	procKindLazy
 )
 
 type processor[T any] struct {
@@ -374,7 +415,7 @@ type processor[T any] struct {
 
 	fnBytes  ProcessFunc[T]
 	fnReader ProcessReaderFunc[T]
-	fnStat   ProcessStatFunc[T]
+	fnLazy   ProcessLazyFunc[T]
 }
 
 func (p processor[T]) run(ctx context.Context, path string, opts Options, notifier *errNotifier) ([]Result[T], []error) {
@@ -833,11 +874,11 @@ func (p processor[T]) processTree(
 				pathBuf:  make([]byte, 0, pathBufExtra),
 				// pathArena and batch start zero-valued, grow as needed.
 			}
-		case procKindStat:
+		case procKindLazy:
 			bufs = &workerBufs{
 				dirBuf:  make([]byte, 0, dirReadBufSize),
 				pathBuf: make([]byte, 0, pathBufExtra),
-				// pathArena and batch start zero-valued, grow as needed.
+				// dataBuf, dataArena, scratchBuf start zero-valued, grow as needed.
 			}
 		}
 
@@ -1018,7 +1059,7 @@ func (p processor[T]) processTree(
 						kind:           p.kind,
 						fnBytes:        p.fnBytes,
 						fnReader:       p.fnReader,
-						fnStat:         p.fnStat,
+						fnLazy:         p.fnLazy,
 						notifier:       notifier,
 						copyResultPath: opts.CopyResultPath,
 					}
@@ -1156,7 +1197,7 @@ func (p processor[T]) processDirPipelinedWithBatches(ctx context.Context, args *
 		kind:           p.kind,
 		fnBytes:        p.fnBytes,
 		fnReader:       p.fnReader,
-		fnStat:         p.fnStat,
+		fnLazy:         p.fnLazy,
 		notifier:       args.notifier,
 		copyResultPath: args.opts.CopyResultPath,
 	}
