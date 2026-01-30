@@ -79,415 +79,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"path/filepath"
 	"strings"
 	"sync"
-	"syscall"
 )
-
-// Internal stat classification used by stat-only processing.
-type statKind uint8
-
-const (
-	statKindReg statKind = iota
-	statKindDir
-	statKindSymlink
-	statKindOther
-)
-
-// Stat holds metadata for a file discovered by [Process].
-//
-// ModTime is expressed as Unix nanoseconds to avoid time.Time allocations
-// in hot paths. Use time.Unix(0, st.ModTime) to convert when needed.
-type Stat struct {
-	Size    int64
-	ModTime int64
-	Mode    uint32
-	Inode   uint64
-}
-
-// File provides access to a file being processed by [Process].
-//
-// All methods are lazy: the underlying file is opened on first content access
-// (Bytes, Read, or Fd). The handle is owned by fileproc and closed after the
-// callback returns. File must not be retained beyond the callback.
-//
-// Bytes() and Read() are mutually exclusive per file. Calling one after
-// the other returns an error.
-type File struct {
-	dh   dirHandle
-	name []byte // NUL-terminated filename
-
-	relPath  []byte // ephemeral relative path (no NUL)
-	st       Stat
-	statDone bool
-
-	fh     *fileHandle
-	fhOpen *bool
-
-	dataBuf   *[]byte // temporary read buffer (reused across files)
-	dataArena *[]byte // append-only arena for Bytes() results
-
-	mode    fileMode
-	openErr error
-	statErr error
-}
-
-type fileMode uint8
-
-const (
-	fileModeNone fileMode = iota
-	fileModeBytes
-	fileModeReader
-)
-
-var (
-	errBytesAfterRead     = errors.New("Bytes: cannot call after Read")
-	errBytesAlreadyCalled = errors.New("Bytes: already called")
-	errReadAfterBytes     = errors.New("Read: cannot call after Bytes")
-
-	// errSkipFile is an internal sentinel indicating the file should be
-	// silently skipped (e.g., became a directory due to race condition).
-	// Not reported as an error to the user.
-	errSkipFile = errors.New("skip file")
-)
-
-// RelPathBorrowed returns the file path relative to the root directory passed to
-// Process.
-//
-// The returned slice is ephemeral and only valid during the callback.
-// Copy if you need to retain it.
-func (f *File) RelPathBorrowed() []byte {
-	return f.relPath
-}
-
-// Stat returns file metadata.
-//
-// Lazy: the stat syscall is made on first call and cached. Subsequent calls
-// return the cached value with no additional I/O.
-//
-// Returns zero Stat and an error if the stat syscall fails (e.g., file was
-// deleted or became a non-regular file).
-func (f *File) Stat() (Stat, error) {
-	if !f.statDone {
-		f.lazyStat()
-	}
-
-	return f.st, f.statErr
-}
-
-// BytesOption configures the behavior of [File.Bytes].
-type BytesOption struct {
-	sizeHint int
-}
-
-// WithSizeHint provides an expected file size to optimize buffer allocation.
-//
-// Use when file sizes are known or predictable (e.g., uniform log entries,
-// fixed-format records) to avoid buffer resizing without a stat syscall.
-//
-// The hint is a suggestion, not a limit. Files larger than the hint are
-// read completely; smaller files don't waste the extra space (only the
-// actual content is stored in the arena).
-//
-// The hint is ignored if [File.Stat] was called previously, since the
-// actual size is already known.
-//
-// Example:
-//
-//	// Pre-create option outside the processing loop (zero allocation)
-//	opt := fileproc.WithSizeHint(4096)
-//
-//	fileproc.Process(ctx, dir, func(f *fileproc.File, _ *fileproc.Worker) (*T, error) {
-//	    data, err := f.Bytes(opt)
-//	    // ...
-//	}, opts)
-func WithSizeHint(size int) BytesOption {
-	return BytesOption{sizeHint: size}
-}
-
-// Bytes reads and returns the full file content.
-//
-// The returned slice points into an internal arena and remains valid until
-// Process returns. Subslices share the same lifetime.
-//
-// Empty files return a non-nil empty slice ([]byte{}, nil).
-//
-// Single-use: Bytes can only be called once per File.
-// Returns error if called after [File.Read], or on I/O failure.
-//
-// Memory: content is retained in the arena until Process returns.
-// For large files or memory-constrained use cases, consider [File.Read]
-// with streaming processing instead.
-//
-// Buffer sizing: Bytes does not call stat internally. The buffer size is
-// determined by (in priority order):
-//  1. The actual size from [File.Stat], if it was called previously
-//  2. The hint from [WithSizeHint], if provided
-//  3. A default 512-byte buffer, grown as needed
-//
-// For workloads with known/uniform file sizes, use [WithSizeHint] to avoid
-// buffer resizing without the overhead of a stat syscall.
-func (f *File) Bytes(opts ...BytesOption) ([]byte, error) {
-	if f.mode == fileModeReader {
-		return nil, errBytesAfterRead
-	}
-
-	if f.mode == fileModeBytes {
-		return nil, errBytesAlreadyCalled
-	}
-
-	f.mode = fileModeBytes
-
-	// Open file if needed
-	openErr := f.open()
-	if openErr != nil {
-		return nil, openErr
-	}
-
-	// Buffer size priority: stat > sizeHint > default
-	maxInt := int(^uint(0) >> 1)
-	maxSize := maxInt - 1
-
-	var size int
-
-	if f.statDone && f.statErr == nil {
-		if f.st.Size > 0 {
-			if f.st.Size > int64(maxSize) {
-				size = maxSize
-			} else {
-				size = int(f.st.Size)
-			}
-		}
-	} else if len(opts) > 0 && opts[0].sizeHint > 0 {
-		size = min(opts[0].sizeHint, maxSize)
-	}
-
-	// +1 to detect growth / read past expected size
-	readSize := max(size+1, defaultReadBufSize)
-
-	// Ensure dataBuf capacity
-	if cap(*f.dataBuf) < readSize {
-		*f.dataBuf = make([]byte, 0, readSize)
-	}
-
-	*f.dataBuf = (*f.dataBuf)[:readSize]
-	buf := *f.dataBuf
-
-	// Single read syscall using backend
-	n, isDir, err := f.fh.readInto(buf)
-	if isDir {
-		return nil, errSkipFile
-	}
-
-	if err != nil {
-		return nil, err
-	}
-
-	// Buffer was filled - file may be larger, continue reading
-	if n == readSize {
-		var readErr error
-
-		for {
-			if n == len(buf) {
-				growBy := max(len(buf), 4096)
-				*f.dataBuf = append(*f.dataBuf, make([]byte, growBy)...)
-				buf = *f.dataBuf
-			}
-
-			m, isDir, err := f.fh.readInto(buf[n:])
-			if isDir {
-				return nil, errSkipFile
-			}
-
-			if err != nil {
-				readErr = err
-			}
-
-			n += m
-
-			if m == 0 || readErr != nil {
-				break
-			}
-		}
-
-		if readErr != nil {
-			return nil, readErr
-		}
-	}
-
-	// Empty file
-	if n == 0 {
-		return []byte{}, nil
-	}
-
-	// Copy to arena, return subslice
-	start := len(*f.dataArena)
-	*f.dataArena = append(*f.dataArena, buf[:n]...)
-
-	return (*f.dataArena)[start:], nil
-}
-
-// Read implements io.Reader for streaming access.
-//
-// Use when you need only a prefix or want to process in chunks without
-// retaining the full content. Data read via Read() is NOT arena-allocated;
-// caller provides and manages the buffer.
-//
-// Returns error if called after Bytes().
-//
-// Lazy: file is opened on first Read() call.
-func (f *File) Read(p []byte) (int, error) {
-	if f.mode == fileModeBytes {
-		return 0, errReadAfterBytes
-	}
-
-	f.mode = fileModeReader
-
-	err := f.open()
-	if err != nil {
-		return 0, err
-	}
-
-	n, err := f.fh.Read(p)
-	if err != nil {
-		if errors.Is(err, syscall.EISDIR) || errors.Is(err, syscall.ELOOP) {
-			return 0, errSkipFile
-		}
-	}
-
-	return n, err
-}
-
-// Fd returns the underlying file descriptor.
-//
-// Lazy: file is opened if not already open.
-//
-// Use for low-level operations (sendfile, mmap, etc.). The fd is owned by
-// fileproc and will be closed after the callback returns.
-//
-// Returns ^uintptr(0) (i.e., -1) if the file cannot be opened.
-func (f *File) Fd() uintptr {
-	err := f.open()
-	if err != nil {
-		return ^uintptr(0)
-	}
-
-	return f.fh.fdValue()
-}
-
-func (f *File) lazyStat() {
-	st, kind, err := f.dh.statFile(f.name)
-	f.statDone = true
-
-	if err != nil {
-		if errors.Is(err, syscall.ELOOP) || kind == statKindSymlink {
-			f.statErr = errSkipFile
-		} else {
-			f.statErr = err
-		}
-
-		return
-	}
-
-	if kind != statKindReg {
-		f.statErr = errSkipFile
-
-		return
-	}
-
-	f.st = st
-}
-
-func (f *File) open() error {
-	if f.fhOpen != nil && *f.fhOpen {
-		return nil // already open
-	}
-
-	if f.openErr != nil {
-		return f.openErr // previous attempt failed
-	}
-
-	fh, err := f.dh.openFile(f.name)
-	if err != nil {
-		// Symlink detected (race: was regular file during scan)
-		if errors.Is(err, syscall.ELOOP) || errors.Is(err, syscall.EISDIR) {
-			f.openErr = errSkipFile
-
-			return errSkipFile
-		}
-
-		f.openErr = err
-
-		return err
-	}
-
-	*f.fh = fh
-	*f.fhOpen = true
-
-	return nil
-}
-
-// Worker provides reusable temporary buffer space for callback processing.
-//
-// The buffer is reused across files within a worker. It is only valid during
-// the current callback and will be overwritten for the next file.
-//
-// Use for temporary parsing work, not for data that must survive the callback.
-type Worker struct {
-	buf []byte
-}
-
-// Buf returns a reusable buffer with at least the requested capacity.
-//
-// Returns a slice with len=0 and cap>=size, ready for append:
-//
-//	buf := w.Buf(4096)
-//	buf = append(buf, data...)  // no alloc if fits in capacity
-//
-// For use as a fixed-size read target, expand to full capacity:
-//
-//	buf := w.Buf(4096)
-//	buf = buf[:cap(buf)]
-//	n, _ := io.ReadFull(r, buf)
-//
-// The capacity grows to accommodate the largest request seen across all
-// files processed by this worker, then stabilizes.
-//
-// The returned slice is only valid during the current callback.
-func (w *Worker) Buf(size int) []byte {
-	if cap(w.buf) < size {
-		w.buf = make([]byte, 0, size)
-	}
-
-	return w.buf[:0]
-}
-
-// ProcessFunc is called for each file.
-//
-// ProcessFunc may be called concurrently and must be safe for concurrent use.
-//
-// f provides access to file metadata and content. f.RelPath() is ephemeral and
-// only valid during the callback.
-//
-// w provides reusable temporary buffer space. w.Buf() returns a slice that is
-// only valid during the callback.
-//
-// Callbacks are not invoked for directories, symlinks, or other non-regular
-// files.
-//
-// Return values:
-//   - (*T, nil): emit the result
-//   - (nil, nil): skip this file silently
-//   - (_, error): skip and report the error as a [ProcessError]
-//
-// Whether [ProcessError]s (and [IOError]s) are included in the returned error
-// slice depends on [WithOnError]. If OnError is nil, all errors are collected.
-//
-// Panics are not recovered by this package. Callbacks must not panic; if you
-// need to guard against panics, recover inside the callback.
-type ProcessFunc[T any] func(f *File, w *Worker) (*T, error)
 
 // IOError is returned when a file system operation fails.
 type IOError struct {
@@ -522,6 +117,65 @@ func (e *ProcessError) Error() string {
 
 func (e *ProcessError) Unwrap() error {
 	return e.Err
+}
+
+// Process processes files in a directory.
+//
+// By default, only the specified directory is processed. Use [WithRecursive]
+// to process subdirectories recursively.
+//
+// f.RelPath() returns the path relative to the root. Results are unordered
+// when processed with multiple workers.
+//
+// To stop processing on error, use [WithOnError] with a cancelable context:
+//
+//	ctx, cancel := context.WithCancelCause(ctx)
+//	results, errs := Process(ctx, path, fn, WithOnError(func(err error, _, _ int) bool {
+//	        cancel(err)
+//	        return true
+//	}))
+//
+// Returns collected results and any errors ([IOError] or [ProcessError]).
+//
+// # Cancellation
+//
+// Cancellation stops processing as soon as possible. Process returns whatever
+// results and errors were already produced/collected before cancellation was
+// observed. It does not guarantee that all already-discovered files are
+// processed before returning.
+//
+// Cancellation itself is not added to the error slice; check ctx.Err() (or
+// context.Cause(ctx) when using [context.WithCancelCause]).
+//
+// # Concurrent Modifications
+//
+// Files or directories created during processing (e.g., by a callback) may or
+// may not be seen depending on timing. Do not rely on newly created entries
+// being processed in the same call.
+func Process[T any](ctx context.Context, path string, fn ProcessFunc[T], opts ...Option) ([]*T, []error) {
+	path = filepath.Clean(path)
+
+	if strings.IndexByte(path, 0) >= 0 {
+		return nil, []error{&IOError{Path: ".", Op: "open", Err: errContainsNUL}}
+	}
+
+	if ctx.Err() != nil {
+		return nil, nil
+	}
+
+	cfg := applyOptions(opts)
+	if strings.IndexByte(cfg.Suffix, 0) >= 0 {
+		return nil, []error{fmt.Errorf("invalid suffix: %w", errContainsNUL)}
+	}
+
+	notifier := newErrNotifier(cfg.OnError)
+	proc := processor[T]{fn: fn}
+
+	if cfg.Recursive {
+		return proc.processTree(ctx, path, cfg, notifier)
+	}
+
+	return proc.processDir(ctx, path, cfg, notifier)
 }
 
 // Internal constants for buffer sizes and limits.
@@ -607,65 +261,6 @@ type workerBufs struct {
 
 type processor[T any] struct {
 	fn ProcessFunc[T]
-}
-
-// Process processes files in a directory.
-//
-// By default, only the specified directory is processed. Use [WithRecursive]
-// to process subdirectories recursively.
-//
-// f.RelPath() returns the path relative to the root. Results are unordered
-// when processed with multiple workers.
-//
-// To stop processing on error, use [WithOnError] with a cancelable context:
-//
-//	ctx, cancel := context.WithCancelCause(ctx)
-//	results, errs := Process(ctx, path, fn, WithOnError(func(err error, _, _ int) bool {
-//	        cancel(err)
-//	        return true
-//	}))
-//
-// Returns collected results and any errors ([IOError] or [ProcessError]).
-//
-// # Cancellation
-//
-// Cancellation stops processing as soon as possible. Process returns whatever
-// results and errors were already produced/collected before cancellation was
-// observed. It does not guarantee that all already-discovered files are
-// processed before returning.
-//
-// Cancellation itself is not added to the error slice; check ctx.Err() (or
-// context.Cause(ctx) when using [context.WithCancelCause]).
-//
-// # Concurrent Modifications
-//
-// Files or directories created during processing (e.g., by a callback) may or
-// may not be seen depending on timing. Do not rely on newly created entries
-// being processed in the same call.
-func Process[T any](ctx context.Context, path string, fn ProcessFunc[T], opts ...Option) ([]*T, []error) {
-	path = filepath.Clean(path)
-
-	if strings.IndexByte(path, 0) >= 0 {
-		return nil, []error{&IOError{Path: ".", Op: "open", Err: errContainsNUL}}
-	}
-
-	if ctx.Err() != nil {
-		return nil, nil
-	}
-
-	cfg := applyOptions(opts)
-	if strings.IndexByte(cfg.Suffix, 0) >= 0 {
-		return nil, []error{fmt.Errorf("invalid suffix: %w", errContainsNUL)}
-	}
-
-	notifier := newErrNotifier(cfg.OnError)
-	proc := processor[T]{fn: fn}
-
-	if cfg.Recursive {
-		return proc.processTree(ctx, path, cfg, notifier)
-	}
-
-	return proc.processDir(ctx, path, cfg, notifier)
 }
 
 // ============================================================================
@@ -1281,229 +876,6 @@ func readDirUntilThresholdOrEOF(ctx context.Context, dirEnumerator readdirHandle
 }
 
 // ============================================================================
-// nameBatch: Arena-Style Allocation for Directory Entries
-// ============================================================================
-//
-// nameBatch collects filenames using an "arena" allocation pattern that
-// minimizes heap allocations when reading directories with many files.
-//
-// THE PROBLEM:
-//
-// A naive implementation would allocate each filename separately:
-//
-//	names := []string{}
-//	for _, entry := range dirEntries {
-//	    names = append(names, entry.Name())  // ALLOCATES for each file!
-//	}
-
-// For a directory with 1000 files, this causes 1000+ allocations. When
-// processing thousands of directories, allocation overhead dominates.
-//
-// THE SOLUTION: Arena-Style Storage
-//
-// Instead of allocating each filename separately, we pack all filenames
-// into a single contiguous byte buffer ("storage"), then create slices
-// that point into this buffer ("names"). This reduces allocations from
-// O(files) to O(1).
-//
-// MEMORY LAYOUT:
-//
-// After appending "file1.md", "file2.md", and "doc.txt":
-//
-//	storage (one contiguous []byte allocation):
-//	┌───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┐
-//	│ f │ i │ l │ e │ 1 │ . │ m │ d │\0 │ f │ i │ l │ e │ 2 │ . │ m │ d │\0 │ d │ o │ c │ . │ t │ x │ t │\0 │
-//	└───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───┘
-//	  0   1   2   3   4   5   6   7   8   9  10  11  12  13  14  15  16  17  18  19  20  21  22  23  24  25
-//	  ▲                               ▲   ▲                               ▲   ▲                           ▲
-//	  │                               │   │                               │   │                           │
-//	  └───────── names[0] ────────────┘   └───────── names[1] ────────────┘   └──────── names[2] ─────────┘
-//	         storage[0:9]                        storage[9:18]                      storage[18:26]
-//
-//	names ([][]byte - slice of slice headers, NOT new allocations):
-//	┌─────────────────┬─────────────────┬─────────────────┐
-//	│ ptr=&storage[0] │ ptr=&storage[9] │ ptr=&storage[18]│
-//	│ len=9, cap=9    │ len=9, cap=9    │ len=8, cap=8    │
-//	└─────────────────┴─────────────────┴─────────────────┘
-//	      names[0]          names[1]          names[2]
-//
-// KEY INSIGHT: Each entry in `names` is just a slice header (24 bytes:
-// pointer + length + capacity). The slice header points into `storage`
-// rather than owning its own memory. No per-filename allocation occurs!
-//
-// WHY NUL TERMINATORS?
-//
-// The NUL byte (\0) after each filename is required for Unix syscalls.
-// Functions like openat(2) expect C-style NUL-terminated strings. By
-// storing the NUL as part of each name slice, we can pass names directly
-// to syscalls without any conversion or allocation.
-//
-// ALLOCATION COMPARISON:
-//
-//	Directory with 1000 files:
-//	┌─────────────────────┬──────────────────────────────────┐
-//	│ Approach            │ Heap Allocations                 │
-//	├─────────────────────┼──────────────────────────────────┤
-//	│ []string            │ ~1000 (one per filename)         │
-//	│ nameBatch (arena)   │ ~2 (storage + names slice)       │
-//	└─────────────────────┴──────────────────────────────────┘
-//
-// USAGE PATTERNS:
-//
-//	// For syscalls (NUL included, ready to use):
-//	fd, err := unix.Openat(dirfd, &name[0], flags, 0)
-//
-//	// For display/logging (exclude NUL):
-//	fmt.Println(string(name[:nameLen(name)]))  // "file1.md"
-//
-//	// For path building (get length without NUL):
-//	pathLen := prefixLen + nameLen(name)  // 8, not 9
-//
-// INVARIANT: Every slice in names includes its NUL terminator, so
-// name[len(name)-1] == 0 always holds. This makes the contract explicit
-// and allows direct use with syscalls.
-type nameBatch struct {
-	// storage is the arena: a single contiguous byte buffer that holds
-	// all filenames packed together with NUL terminators between them.
-	// Pre-sized to avoid growth during directory reading.
-	storage []byte
-
-	// names contains slice headers pointing into storage. Each slice
-	// represents one filename INCLUDING its NUL terminator. These are
-	// NOT separate allocations - they're just "views" into storage.
-	names [][]byte
-}
-
-// byteSeq is a small constraint used for shared helper functions that work on
-// both string directory entry names (non-Linux/Windows ReadDir) and []byte
-// directory entry names (Linux getdents64 parsing).
-//
-// Keeping these helpers in one place avoids drift across platform-specific
-// files.
-type byteSeq interface {
-	~string | ~[]byte
-}
-
-// hasSuffix reports whether name ends with suffix. Empty suffix matches all.
-//
-// Implemented once for both string and []byte names.
-func hasSuffix[S byteSeq](name S, suffix string) bool {
-	if suffix == "" {
-		return true
-	}
-
-	if len(name) < len(suffix) {
-		return false
-	}
-
-	start := len(name) - len(suffix)
-	for i := range len(suffix) {
-		if name[start+i] != suffix[i] {
-			return false
-		}
-	}
-
-	return true
-}
-
-// reset prepares the batch for reuse, preserving allocated capacity.
-//
-// The storageCap parameter hints at expected total bytes for all filenames.
-// Typically set to len(dirBuf) * 2, estimating that filenames occupy about
-// half of the raw dirent data returned by getdents64.
-//
-// After reset, the batch is empty but retains its backing arrays, enabling
-// zero-allocation reuse across multiple directories.
-func (b *nameBatch) reset(storageCap int) {
-	// Grow storage capacity if needed, otherwise just reset length to 0.
-	// The backing array is retained for reuse.
-	if storageCap > 0 && cap(b.storage) < storageCap {
-		b.storage = make([]byte, 0, storageCap)
-	} else {
-		b.storage = b.storage[:0]
-	}
-
-	// Pre-size the names slice to avoid growth allocations during append.
-	//
-	// Heuristic: assume average filename is ~20 bytes (including NUL).
-	// For storageCap=64KB, this pre-allocates space for ~3200 names.
-	// This eliminates the repeated allocations that occur when a slice
-	// grows: 0→1→2→4→8→16→...→2048 (about 11 allocations for 1000 files).
-	//
-	// If the estimate is wrong, append still works - it just allocates.
-	// But for typical directories, this eliminates all names slice growth.
-	namesCap := storageCap / 20
-	if namesCap > 0 && cap(b.names) < namesCap {
-		b.names = make([][]byte, 0, namesCap)
-	} else {
-		b.names = b.names[:0]
-	}
-}
-
-// appendBytes / appendString add a filename to the batch, appending a NUL
-// terminator. Both variants avoid conversions in hot paths.
-
-// appendBytes adds a filename to the batch, appending a NUL terminator.
-//
-// name must NOT include a NUL terminator (it is added here).
-func (b *nameBatch) appendBytes(name []byte) {
-	start := len(b.storage)
-	b.storage = append(b.storage, name...) // copy filename bytes into arena
-	b.storage = append(b.storage, 0)       // append NUL terminator for syscalls
-	b.names = append(b.names, b.storage[start:len(b.storage)])
-}
-
-// copyName copies a name that already includes its NUL terminator.
-// Used when transferring names between batches (e.g., pipelining).
-func (b *nameBatch) copyName(name []byte) {
-	start := len(b.storage)
-	b.storage = append(b.storage, name...) // name already includes NUL
-	b.names = append(b.names, b.storage[start:len(b.storage)])
-}
-
-// nameLen returns the length of the filename EXCLUDING the NUL terminator.
-// Use this when calculating buffer sizes or path lengths.
-func nameLen(name []byte) int {
-	if len(name) == 0 {
-		return 0
-	}
-
-	return len(name) - 1
-}
-
-// ============================================================================
-// Path helpers
-// ============================================================================
-
-// appendPathBytesPrefix builds a path from prefix and name (which includes NUL terminator).
-// Returns a slice WITHOUT NUL terminator (for display/string conversion).
-func appendPathBytesPrefix(buf []byte, prefix []byte, name []byte) []byte {
-	buf = buf[:0]
-	buf = appendPathPrefix(buf, prefix)
-
-	buf = append(buf, name[:nameLen(name)]...)
-
-	return buf
-}
-
-// appendPathPrefix appends prefix and a separator (if needed) to buf.
-// Caller controls buf capacity and initial length.
-func appendPathPrefix(buf []byte, prefix []byte) []byte {
-	if len(prefix) == 0 {
-		return buf
-	}
-
-	buf = append(buf, prefix...)
-
-	last := prefix[len(prefix)-1]
-	if last != os.PathSeparator && last != '/' {
-		buf = append(buf, os.PathSeparator)
-	}
-
-	return buf
-}
-
-// ============================================================================
 // Error notification
 // ============================================================================
 
@@ -1552,54 +924,4 @@ func (n *errNotifier) callbackErr(err error) bool {
 	n.mu.Unlock()
 
 	return n.onError(err, ioCount, procCount)
-}
-
-// pathWithNul converts a string path to []byte with NUL terminator.
-// Used for syscalls that require NUL-terminated paths.
-func pathWithNul(s string) []byte {
-	b := make([]byte, 0, len(s)+1)
-	b = append(b, s...)
-	b = append(b, 0)
-
-	return b
-}
-
-// pathStr converts a NUL-terminated path back to string (strips NUL).
-// Used for error messages.
-func pathStr(p []byte) string {
-	if len(p) > 0 && p[len(p)-1] == 0 {
-		return string(p[:len(p)-1])
-	}
-
-	return string(p)
-}
-
-// joinPathWithNul joins a base path (NUL-terminated) with a name and returns
-// a new NUL-terminated path. base must be NUL-terminated.
-func joinPathWithNul(base, name []byte) []byte {
-	// base includes NUL at end, name does not include NUL.
-	baseLen := len(base)
-	if baseLen > 0 && base[baseLen-1] == 0 {
-		baseLen--
-	}
-
-	sep := byte(os.PathSeparator)
-
-	// Note: We must not blindly append a separator. For example, when base is the
-	// filesystem root ("/" on Unix, "C:\\" on Windows), it already ends with a
-	// separator.
-	result := make([]byte, 0, baseLen+1+len(name)+1)
-
-	result = append(result, base[:baseLen]...)
-	if baseLen > 0 {
-		last := base[baseLen-1]
-		if last != sep && last != '/' {
-			result = append(result, sep)
-		}
-	}
-
-	result = append(result, name...)
-	result = append(result, 0)
-
-	return result
 }
