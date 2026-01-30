@@ -19,7 +19,7 @@ Options:
   --n N             For avg mode, number of runs to average (default: 5)
   --fail-above PCT  Exit with error if regression exceeds PCT percent
   --focus SIZES     Comma-separated sizes to focus on (e.g. 100k,1m)
-  --process NAME    Benchmark process to compare: bytes | read | stat (default: bytes)
+  --process NAME    Benchmark process to compare: bytes | read | stat | all (default: all)
   --history FILE    Path to history.jsonl (default: .benchmarks/history.jsonl)
   --baseline FILE   Baseline file (default: .benchmarks/baseline.jsonl)
   --json            Output as JSON instead of table
@@ -71,7 +71,7 @@ func runCompare(args []string) error {
 	n := fs.Int("n", 5, "number of runs for avg mode")
 	failAbove := fs.Float64("fail-above", 0, "fail if regression exceeds this percent")
 	focus := fs.String("focus", "", "comma-separated sizes to focus on")
-	process := fs.String("process", "bytes", "benchmark process to compare: bytes | read | stat")
+	process := fs.String("process", "all", "benchmark process to compare: bytes | read | stat | all")
 	historyFile := fs.String("history", ".benchmarks/history.jsonl", "path to history file")
 	baselineFile := fs.String("baseline", ".benchmarks/baseline.jsonl", "path to baseline file")
 	outputJSON := fs.Bool("json", false, "output as JSON")
@@ -280,11 +280,11 @@ func buildComparison(latest, target *Summary, targetDesc string, focusSizes []st
 
 	process = strings.ToLower(strings.TrimSpace(process))
 	if process == "" {
-		process = "bytes"
+		process = "all"
 	}
 
-	if process != "bytes" && process != "read" && process != "stat" {
-		return Comparison{}, fmt.Errorf("invalid process: %s (expected: bytes | read | stat)", process)
+	if process != "bytes" && process != "read" && process != "stat" && process != "all" {
+		return Comparison{}, fmt.Errorf("invalid process: %s (expected: bytes | read | stat | all)", process)
 	}
 
 	orderedBenches := benchmarksForProcess(process)
@@ -353,6 +353,20 @@ func buildComparison(latest, target *Summary, targetDesc string, focusSizes []st
 }
 
 func benchmarksForProcess(process string) []string {
+	if process == "all" {
+		// Return all benchmarks grouped by size
+		return []string{
+			"flat_1k_bytes", "flat_1k_read", "flat_1k_stat",
+			"nested1_1k_bytes", "nested1_1k_read", "nested1_1k_stat",
+			"flat_5k_bytes", "flat_5k_read", "flat_5k_stat",
+			"nested1_5k_bytes", "nested1_5k_read", "nested1_5k_stat",
+			"flat_100k_bytes", "flat_100k_read", "flat_100k_stat",
+			"nested1_100k_bytes", "nested1_100k_read", "nested1_100k_stat",
+			"flat_1m_bytes", "flat_1m_read", "flat_1m_stat",
+			"nested1_1m_bytes", "nested1_1m_read", "nested1_1m_stat",
+		}
+	}
+
 	suffix := "_" + process
 	ordered := []string{
 		"flat_1k" + suffix, "nested1_1k" + suffix,
