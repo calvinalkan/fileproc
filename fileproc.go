@@ -84,41 +84,6 @@ import (
 	"sync"
 )
 
-// IOError is returned when a file system operation fails.
-type IOError struct {
-	// Path is the path relative to the root directory passed to [Process].
-	// The root directory itself is reported as ".".
-	Path string
-	// Op is the operation that failed: "open", "read", "close", or "readdir".
-	Op string
-	// Err is the underlying error.
-	Err error
-}
-
-func (e *IOError) Error() string {
-	return fmt.Sprintf("%s %s: %v", e.Op, e.Path, e.Err)
-}
-
-func (e *IOError) Unwrap() error {
-	return e.Err
-}
-
-// ProcessError is returned when a user callback ([ProcessFunc]) returns an error.
-type ProcessError struct {
-	// Path is the relative file path (owned, not borrowed).
-	Path string
-	// Err is the error returned by the callback.
-	Err error
-}
-
-func (e *ProcessError) Error() string {
-	return fmt.Sprintf("process %s: %v", e.Path, e.Err)
-}
-
-func (e *ProcessError) Unwrap() error {
-	return e.Err
-}
-
 // Process processes files in a directory.
 //
 // By default, only the specified directory is processed. Use [WithRecursive]
@@ -176,6 +141,41 @@ func Process[T any](ctx context.Context, path string, fn ProcessFunc[T], opts ..
 	}
 
 	return proc.processDir(ctx, path, cfg, notifier)
+}
+
+// IOError is returned when a file system operation fails.
+type IOError struct {
+	// Path is the path relative to the root directory passed to [Process].
+	// The root directory itself is reported as ".".
+	Path string
+	// Op is the operation that failed: "open", "read", "close", or "readdir".
+	Op string
+	// Err is the underlying error.
+	Err error
+}
+
+func (e *IOError) Error() string {
+	return fmt.Sprintf("%s %s: %v", e.Op, e.Path, e.Err)
+}
+
+func (e *IOError) Unwrap() error {
+	return e.Err
+}
+
+// ProcessError is returned when a user callback ([ProcessFunc]) returns an error.
+type ProcessError struct {
+	// Path is the relative file path (owned, not borrowed).
+	Path string
+	// Err is the error returned by the callback.
+	Err error
+}
+
+func (e *ProcessError) Error() string {
+	return fmt.Sprintf("process %s: %v", e.Path, e.Err)
+}
+
+func (e *ProcessError) Unwrap() error {
+	return e.Err
 }
 
 // Internal constants for buffer sizes and limits.

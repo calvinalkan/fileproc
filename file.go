@@ -16,36 +16,6 @@ type Stat struct {
 	Inode   uint64
 }
 
-// BytesOption configures the behavior of [File.Bytes].
-type BytesOption struct {
-	sizeHint int
-}
-
-// WithSizeHint provides an expected file size to optimize buffer allocation.
-//
-// Use when file sizes are known or predictable (e.g., uniform log entries,
-// fixed-format records) to avoid buffer resizing without a stat syscall.
-//
-// The hint is a suggestion, not a limit. Files larger than the hint are
-// read completely; smaller files don't waste the extra space (only the
-// actual content is stored in the arena).
-//
-// The hint is ignored if [File.Stat] was called previously, since the
-// actual size is already known.
-//
-// Example:
-//
-//	// Pre-create option outside the processing loop (zero allocation)
-//	opt := fileproc.WithSizeHint(4096)
-//
-//	fileproc.Process(ctx, dir, func(f *fileproc.File, _ *fileproc.Worker) (*T, error) {
-//	    data, err := f.Bytes(opt)
-//	    // ...
-//	}, opts)
-func WithSizeHint(size int) BytesOption {
-	return BytesOption{sizeHint: size}
-}
-
 // File provides access to a file being processed by [Process].
 //
 // All methods are lazy: the underlying file is opened on first content access
@@ -95,6 +65,36 @@ func (f *File) Stat() (Stat, error) {
 	}
 
 	return f.st, f.statErr
+}
+
+// BytesOption configures the behavior of [File.Bytes].
+type BytesOption struct {
+	sizeHint int
+}
+
+// WithSizeHint provides an expected file size to optimize buffer allocation.
+//
+// Use when file sizes are known or predictable (e.g., uniform log entries,
+// fixed-format records) to avoid buffer resizing without a stat syscall.
+//
+// The hint is a suggestion, not a limit. Files larger than the hint are
+// read completely; smaller files don't waste the extra space (only the
+// actual content is stored in the arena).
+//
+// The hint is ignored if [File.Stat] was called previously, since the
+// actual size is already known.
+//
+// Example:
+//
+//	// Pre-create option outside the processing loop (zero allocation)
+//	opt := fileproc.WithSizeHint(4096)
+//
+//	fileproc.Process(ctx, dir, func(f *fileproc.File, _ *fileproc.Worker) (*T, error) {
+//	    data, err := f.Bytes(opt)
+//	    // ...
+//	}, opts)
+func WithSizeHint(size int) BytesOption {
+	return BytesOption{sizeHint: size}
 }
 
 // Bytes reads and returns the full file content.
