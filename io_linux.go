@@ -457,7 +457,7 @@ func (f fileHandle) closeHandle() error {
 
 func (f fileHandle) fdValue() uintptr {
 	if f.fd < 0 {
-		return 0
+		return ^uintptr(0)
 	}
 
 	return uintptr(f.fd)

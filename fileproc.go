@@ -688,9 +688,9 @@ func (p processor[T]) processDir(
 ) ([]*T, []error) {
 	dirPath := pathWithNul(dir)
 
-	dirEnumerator, err := openDirEnumerator(dirPath)
-	if err != nil {
-		ioErr := &IOError{Path: ".", Op: "open", Err: err}
+	dirEnumerator, readDirErr := openDirEnumerator(dirPath)
+	if readDirErr != nil {
+		ioErr := &IOError{Path: ".", Op: "open", Err: readDirErr}
 		if notifier.ioErr(ioErr) {
 			return nil, []error{ioErr}
 		}
@@ -704,62 +704,52 @@ func (p processor[T]) processDir(
 	batch := &nameBatch{}
 	batch.reset(cap(dirBuf) * 2)
 
-	for {
-		if ctx.Err() != nil {
-			return nil, nil
-		}
+	exceedsSmallFileTreshold, readDirErr := readDirUntilThresholdOrEOF(
+		ctx,
+		dirEnumerator,
+		dirBuf[:cap(dirBuf)],
+		opts.Suffix,
+		batch,
+		nil,
+		opts.SmallFileThreshold,
+	)
 
-		err := readDirBatch(dirEnumerator, dirBuf[:cap(dirBuf)], opts.Suffix, batch, nil)
-		if err != nil && !errors.Is(err, io.EOF) {
-			// Best-effort: keep names already read, but surface the readdir error.
-			readErr := err
-
-			if len(batch.names) == 0 {
-				ioErr := &IOError{Path: ".", Op: "readdir", Err: readErr}
-				if notifier.ioErr(ioErr) {
-					return nil, []error{ioErr}
-				}
-
-				return nil, nil
-			}
-
-			results, errs := p.processFilesSequential(ctx, dir, nil, batch.names, notifier)
-
-			ioErr := &IOError{Path: ".", Op: "readdir", Err: readErr}
-			if notifier.ioErr(ioErr) {
-				errs = append(errs, ioErr)
-			}
-
-			return results, errs
-		}
-
-		if len(batch.names) > opts.SmallFileThreshold {
-			return p.processDirPipelined(ctx, &dirPipelinedArgs{
-				dir:           dir,
-				relPrefix:     nil,
-				dirEnumerator: dirEnumerator,
-				initialNames:  batch.names,
-				opts:          opts,
-				reportSubdir:  nil,
-				notifier:      notifier,
-				dirBuf:        dirBuf[:cap(dirBuf)],
-			})
-		}
-
-		if err == nil {
-			continue
-		}
-
-		if errors.Is(err, io.EOF) {
-			break
-		}
-	}
-
-	if len(batch.names) == 0 {
+	if ctx.Err() != nil {
 		return nil, nil
 	}
 
-	return p.processFilesSequential(ctx, dir, nil, batch.names, notifier)
+	if exceedsSmallFileTreshold {
+		return p.processDirPipelined(ctx, &dirPipelinedArgs{
+			dir:           dir,
+			relPrefix:     nil,
+			dirEnumerator: dirEnumerator,
+			initialNames:  batch.names,
+			opts:          opts,
+			reportSubdir:  nil,
+			notifier:      notifier,
+			dirBuf:        dirBuf[:cap(dirBuf)],
+		})
+	}
+
+	var (
+		results []*T
+		errs    []error
+	)
+
+	if len(batch.names) > 0 {
+		// If we have a read dir error, but already have some files, process
+		// them before returning the errors
+		results, errs = p.processFilesSequential(ctx, dir, nil, batch.names, notifier)
+	}
+
+	if readDirErr != nil && !errors.Is(readDirErr, io.EOF) {
+		ioErr := &IOError{Path: ".", Op: "readdir", Err: readDirErr}
+		if notifier.ioErr(ioErr) {
+			errs = append(errs, ioErr)
+		}
+	}
+
+	return results, errs
 }
 
 // ============================================================================
@@ -1133,7 +1123,7 @@ func (p processor[T]) processTree(
 				// This avoids pipeline setup overhead for small directories
 				// while still benefiting from overlap in large ones.
 				//
-				large, err := readDirUntilFileThresholdOrEOF(
+				large, err := readDirUntilThresholdOrEOF(
 					ctx,
 					dirEnumerator,
 					bufs.dirBuf[:cap(bufs.dirBuf)],
@@ -1273,7 +1263,7 @@ func (p processor[T]) processTree(
 	return results, allErrs
 }
 
-func readDirUntilFileThresholdOrEOF(ctx context.Context, dirEnumerator readdirHandle, dirBuf []byte, suffix string, batch *nameBatch, reportSubdir func([]byte), threshold int) (bool, error) {
+func readDirUntilThresholdOrEOF(ctx context.Context, dirEnumerator readdirHandle, dirBuf []byte, suffix string, batch *nameBatch, reportSubdir func([]byte), threshold int) (bool, error) {
 	for {
 		if ctx.Err() != nil {
 			return false, io.EOF
