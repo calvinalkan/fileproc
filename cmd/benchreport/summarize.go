@@ -11,7 +11,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 )
 
@@ -103,29 +102,38 @@ func summarize(runDir, historyFile string, maxHistory int, noHistory bool) error
 		return fmt.Errorf("parsing meta.txt: %w", err)
 	}
 
+	// Load dataset metadata for file counts
+	datasetMeta, datasetMetaErr := loadDatasetMeta(".data/meta.json")
+	if datasetMetaErr != nil {
+		fmt.Fprintf(os.Stderr, "warning: %v (using default file counts)\n", datasetMetaErr)
+	}
+
 	// Parse hyperfine results
-	expects := map[string]int{
-		"1k":   intOrDefault(meta["expect_1k"], 1000),
-		"5k":   intOrDefault(meta["expect_5k"], 5000),
-		"100k": intOrDefault(meta["expect_100k"], 100000),
-		"1m":   intOrDefault(meta["expect_1m"], 1000000),
+	type sizeInfo struct {
+		files int
+		bytes int
+	}
+
+	sizeInfoMap := map[string]sizeInfo{
+		"1k":   {getFileCount(datasetMeta, "tickets_flat_1k", 1000), getTotalBytes(datasetMeta, "tickets_flat_1k")},
+		"5k":   {getFileCount(datasetMeta, "tickets_flat_5k", 5000), getTotalBytes(datasetMeta, "tickets_flat_5k")},
+		"100k": {getFileCount(datasetMeta, "tickets_flat_100k", 100000), getTotalBytes(datasetMeta, "tickets_flat_100k")},
+		"1m":   {getFileCount(datasetMeta, "tickets_flat_1m", 1000000), getTotalBytes(datasetMeta, "tickets_flat_1m")},
 	}
 
 	results := make(map[string]BenchResult)
 
 	for _, size := range sizes {
 		jsonPath := filepath.Join(runDir, fmt.Sprintf("hyperfine-%s.json", size))
+		info := sizeInfoMap[size]
 
-		sizeResults, parseErr := parseHyperfine(jsonPath, expects[size])
+		sizeResults, parseErr := parseHyperfine(jsonPath, info.files, info.bytes)
 		if parseErr != nil {
 			return fmt.Errorf("parsing %s: %w", jsonPath, parseErr)
 		}
 
 		maps.Copy(results, sizeResults)
 	}
-
-	// Compute ratios (frontmatter_mean / noop_mean)
-	ratios := computeRatios(results)
 
 	// Get additional metadata
 	hostname, _ := os.Hostname()
@@ -158,7 +166,6 @@ func summarize(runDir, historyFile string, maxHistory int, noHistory bool) error
 			CPUSet:  meta["cpu_set"],
 		},
 		Results: results,
-		Ratios:  ratios,
 	}
 
 	// Write summary.json
@@ -219,7 +226,7 @@ func parseMeta(path string) (map[string]string, error) {
 	return meta, nil
 }
 
-func parseHyperfine(path string, expect int) (map[string]BenchResult, error) {
+func parseHyperfine(path string, fileCount, totalBytes int) (map[string]BenchResult, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read hyperfine output %s: %w", path, err)
@@ -233,41 +240,30 @@ func parseHyperfine(path string, expect int) (map[string]BenchResult, error) {
 	}
 
 	results := make(map[string]BenchResult)
+
 	for _, r := range hf.Results {
+		bytesPerSec := 0.0
+		mbPerSec := 0.0
+
+		if totalBytes > 0 {
+			bytesPerSec = float64(totalBytes) / r.Mean
+			mbPerSec = bytesPerSec / 1_000_000
+		}
+
 		results[r.Command] = BenchResult{
 			MeanMs:      r.Mean * 1000,
 			StddevMs:    r.Stddev * 1000,
 			MedianMs:    r.Median * 1000,
 			MinMs:       r.Min * 1000,
 			MaxMs:       r.Max * 1000,
-			FilesPerSec: float64(expect) / r.Mean,
+			FilesPerSec: float64(fileCount) / r.Mean,
+			BytesPerSec: bytesPerSec,
+			MBPerSec:    mbPerSec,
 			Runs:        len(r.Times),
 		}
 	}
 
 	return results, nil
-}
-
-func computeRatios(results map[string]BenchResult) map[string]float64 {
-	prefixes := []string{
-		"flat_1k", "nested1_1k",
-		"flat_5k", "nested1_5k",
-		"flat_100k", "nested1_100k",
-		"flat_1m", "nested1_1m",
-	}
-
-	ratios := make(map[string]float64)
-
-	for _, prefix := range prefixes {
-		fm, hasFM := results[prefix+"_frontmatter"]
-
-		noop, hasNoop := results[prefix+"_noop"]
-		if hasFM && hasNoop && noop.MeanMs > 0 {
-			ratios[prefix] = fm.MeanMs / noop.MeanMs
-		}
-	}
-
-	return ratios
 }
 
 func appendHistory(path string, summary *Summary, maxLines int) error {
@@ -333,17 +329,60 @@ func extractCPUModel(meta map[string]string) string {
 	return "unknown"
 }
 
-func intOrDefault(s string, def int) int {
-	if s == "" {
-		return def
-	}
+// datasetMetaEntry is the structure of entries in meta.json written by ticketgen.
+type datasetMetaEntry struct {
+	Files      int `json:"files"`
+	TotalBytes int `json:"total_bytes"`
+	AvgBytes   int `json:"avg_bytes"`
+}
 
-	v, err := strconv.Atoi(s)
+// loadDatasetMeta loads the dataset metadata file.
+func loadDatasetMeta(path string) (map[string]datasetMetaEntry, error) {
+	data, err := os.ReadFile(path)
 	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", path, err)
+	}
+
+	var meta map[string]datasetMetaEntry
+
+	unmarshalErr := json.Unmarshal(data, &meta)
+	if unmarshalErr != nil {
+		return nil, fmt.Errorf("parse %s: %w", path, unmarshalErr)
+	}
+
+	return meta, nil
+}
+
+// getFileCount returns the file count for a dataset, or default if not found.
+func getFileCount(meta map[string]datasetMetaEntry, dataset string, def int) int {
+	if meta == nil {
 		return def
 	}
 
-	return v
+	entry, ok := meta[dataset]
+	if !ok {
+		return def
+	}
+
+	if entry.Files <= 0 {
+		return def
+	}
+
+	return entry.Files
+}
+
+// getTotalBytes returns the total bytes for a dataset, or 0 if not found.
+func getTotalBytes(meta map[string]datasetMetaEntry, dataset string) int {
+	if meta == nil {
+		return 0
+	}
+
+	entry, ok := meta[dataset]
+	if !ok {
+		return 0
+	}
+
+	return entry.TotalBytes
 }
 
 // marshalJSON encodes v to JSON without escaping <, >, & characters.

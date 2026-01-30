@@ -30,7 +30,7 @@ WORKERS_LIST=""  # empty = use defaults per case
 WORKERS_DEFAULT="1,2,4,8,16"
 WORKERS_DEFAULT_LARGE="6,8,12,16,24"  # 100k/1m: skip low worker counts
 CASES=""
-PROCESS="frontmatter"
+PROCESS="bytes"
 VERBOSE=false
 
 # Small datasets are very fast, so run more iterations for stability.
@@ -51,7 +51,7 @@ usage() {
   echo "  --workers LIST    Comma-separated worker counts (overrides defaults)"
   echo "  --runs N          Base runs per combination (default: $RUNS)"
   echo "  --warmup N        Warmup runs (default: $WARMUP)"
-  echo "  --process NAME    Process mode: frontmatter | noop (default: $PROCESS)"
+  echo "  --process NAME    Process mode: bytes | read | stat (default: $PROCESS)"
   echo "  --verbose, -v     Show full hyperfine output (default: summary table only)"
   echo ""
   echo "Defaults per case size:"

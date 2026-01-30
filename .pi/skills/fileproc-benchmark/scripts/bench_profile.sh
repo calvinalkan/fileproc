@@ -18,7 +18,7 @@ set -euo pipefail
 #   --repeat N        Iterations per run (default: 10, more = better profiles)
 #   --workers N       Worker count (default: fileprocbench default)
 #   --gc N            GC percent (default: fileprocbench default)
-#   --process NAME    Process mode: frontmatter | noop (default: frontmatter)
+#   --process NAME    Process mode: bytes | read | stat (default: bytes)
 #   --out DIR         Output directory (default: .benchmarks/profiles)
 
 # Find project root (this script lives in .pi/skills/fileproc-benchmark/scripts/)
@@ -35,7 +35,7 @@ STRACE=false
 REPEAT=10
 WORKERS=""
 GC=""
-PROCESS="frontmatter"
+PROCESS="bytes"
 OUT_DIR=".benchmarks/profiles"
 
 BIN="./cmd/fileprocbench/fileprocbench"
@@ -55,7 +55,7 @@ Options:
   --repeat N        Iterations in single process (default: $REPEAT)
   --workers N       Worker count override
   --gc N            GC percent override
-  --process NAME    Process mode: frontmatter | noop (default: $PROCESS)
+  --process NAME    Process mode: bytes | read | stat (default: $PROCESS)
   --out DIR         Output directory (default: $OUT_DIR)
   -h, --help        Show this help
 

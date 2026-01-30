@@ -39,34 +39,48 @@ go run ./cmd/ticketgen --out .data/tickets_nested3_1m --files 1m --layout deep
 make bench   # Run regression + compare vs avg of last 5 runs, fail if >1% regression
 ```
 
-## 3. Commands Reference
+## 3. Process Modes
+
+Benchmarks support three process modes via `--process`:
+
+| Mode | What it measures |
+|------|------------------|
+| `bytes` | `f.Bytes()` — read full file into arena (default) |
+| `read` | `f.Read(buf)` — read into worker buffer |
+| `stat` | `f.Stat()` — metadata only, no content read |
+
+## 4. Commands Reference
 
 | Task | Command |
 |------|---------|
 | Run regression benchmarks | `.pi/skills/fileproc-benchmark/scripts/bench_regress.sh` |
 | Compare vs previous run | `cmd/benchreport/benchreport compare` |
-| Compare noop results | `cmd/benchreport/benchreport compare --process noop` |
+| Compare read results | `cmd/benchreport/benchreport compare --process read` |
+| Compare stat results | `cmd/benchreport/benchreport compare --process stat` |
 | Compare vs baseline | `cmd/benchreport/benchreport compare --against baseline` |
 | Fail if regression >5% | `cmd/benchreport/benchreport compare --against baseline --fail-above 5` |
 | Sweep worker counts | `.pi/skills/fileproc-benchmark/scripts/bench_sweep.sh --case flat_100k` |
-| Sweep noop worker counts | `.pi/skills/fileproc-benchmark/scripts/bench_sweep.sh --case flat_100k --process noop` |
+| Sweep with read mode | `.pi/skills/fileproc-benchmark/scripts/bench_sweep.sh --case flat_100k --process read` |
 | Profile CPU/memory | `.pi/skills/fileproc-benchmark/scripts/bench_profile.sh --case flat_100k --cpu --mem` |
-| Profile noop-only | `.pi/skills/fileproc-benchmark/scripts/bench_profile.sh --case flat_100k --process noop --cpu --mem` |
+| Profile stat-only | `.pi/skills/fileproc-benchmark/scripts/bench_profile.sh --case flat_100k --process stat --cpu --mem` |
 | Profile everything | `.pi/skills/fileproc-benchmark/scripts/bench_profile.sh --case flat_100k --all` |
 
 All paths are from project root.
 
-## 4. Regression Testing
+## 5. Regression Testing
 
 ```bash
 # Run full regression suite (1k, 5k, 100k, 1m datasets)
 .pi/skills/fileproc-benchmark/scripts/bench_regress.sh
 
-# Compare latest vs previous run
+# Compare latest vs previous run (default: bytes mode)
 ./cmd/benchreport/benchreport compare
 
-# Compare noop-only results vs previous run
-./cmd/benchreport/benchreport compare --process noop
+# Compare read-mode results vs previous run
+./cmd/benchreport/benchreport compare --process read
+
+# Compare stat-mode results vs previous run
+./cmd/benchreport/benchreport compare --process stat
 
 # Compare latest vs rolling average of last 5 runs
 ./cmd/benchreport/benchreport compare --against avg --n 5
@@ -75,7 +89,7 @@ All paths are from project root.
 ./cmd/benchreport/benchreport compare --against baseline --fail-above 5
 ```
 
-## 5. Profiling
+## 6. Profiling
 
 ```bash
 # CPU profile - where is time spent?
@@ -87,14 +101,14 @@ All paths are from project root.
 # Syscall analysis - what syscalls dominate?
 .pi/skills/fileproc-benchmark/scripts/bench_profile.sh --case flat_100k --strace
 
-# Noop-only profiling
-.pi/skills/fileproc-benchmark/scripts/bench_profile.sh --case flat_100k --process noop --cpu --mem
+# Profile stat-only (discovery + metadata)
+.pi/skills/fileproc-benchmark/scripts/bench_profile.sh --case flat_100k --process stat --cpu --mem
 
 # Everything at once
 .pi/skills/fileproc-benchmark/scripts/bench_profile.sh --case flat_100k --all
 ```
 
-## 6. Parameter Sweeps
+## 7. Parameter Sweeps
 
 ```bash
 # Sweep worker counts across all cases
@@ -103,14 +117,14 @@ All paths are from project root.
 # Sweep specific case
 .pi/skills/fileproc-benchmark/scripts/bench_sweep.sh --case flat_100k
 
-# Sweep noop-only worker counts
-.pi/skills/fileproc-benchmark/scripts/bench_sweep.sh --case flat_100k --process noop
+# Sweep with read mode
+.pi/skills/fileproc-benchmark/scripts/bench_sweep.sh --case flat_100k --process read
 
 # Custom worker list
 .pi/skills/fileproc-benchmark/scripts/bench_sweep.sh --case flat_100k --workers 4,8,16,24,32
 ```
 
-## 7. Managing Baseline
+## 8. Managing Baseline
 
 Update baseline after verified improvements:
 
@@ -129,7 +143,7 @@ git add .benchmarks/baseline.jsonl
 git commit -m "bench: update baseline after reducing allocations"
 ```
 
-## 8. File Locations
+## 9. File Locations
 
 | Path | Purpose |
 |------|---------|
@@ -141,7 +155,7 @@ git commit -m "bench: update baseline after reducing allocations"
 | `cmd/benchreport/` | Comparison tool |
 | `cmd/ticketgen/` | Data generator |
 
-## 9. Script Options
+## 10. Script Options
 
 ### bench_regress.sh
 
@@ -166,6 +180,7 @@ git commit -m "bench: update baseline after reducing allocations"
 --strace          Syscall analysis
 --repeat N        Iterations (default: 10)
 --workers N       Override workers
+--process NAME    bytes | read | stat (default: bytes)
 --help            Show detailed help
 ```
 
@@ -175,6 +190,7 @@ git commit -m "bench: update baseline after reducing allocations"
 --case CASES      Comma-separated cases (default: all)
 --workers LIST    Worker counts to test
 --runs N          Runs per combination
+--process NAME    bytes | read | stat (default: bytes)
 --verbose         Show full output
 --help            Show detailed help
 ```
@@ -186,5 +202,6 @@ git commit -m "bench: update baseline after reducing allocations"
 --n N             Runs to average (for avg mode)
 --fail-above PCT  Fail if regression exceeds threshold
 --focus SIZES     Focus on specific sizes (e.g., 100k,1m)
+--process NAME    bytes | read | stat (default: bytes)
 --json            Output as JSON
 ```

@@ -19,7 +19,7 @@ Options:
   --n N             For avg mode, number of runs to average (default: 5)
   --fail-above PCT  Exit with error if regression exceeds PCT percent
   --focus SIZES     Comma-separated sizes to focus on (e.g. 100k,1m)
-  --process NAME    Benchmark process to compare: frontmatter | noop
+  --process NAME    Benchmark process to compare: bytes | read | stat (default: bytes)
   --history FILE    Path to history.jsonl (default: .benchmarks/history.jsonl)
   --baseline FILE   Baseline file (default: .benchmarks/baseline.jsonl)
   --json            Output as JSON instead of table
@@ -45,16 +45,13 @@ Examples:
 `
 
 type CompareResult struct {
-	Name           string  `json:"name"`
-	LatestMeanMs   float64 `json:"latest_mean_ms"`
-	TargetMeanMs   float64 `json:"target_mean_ms"`
-	MeanChangePct  float64 `json:"mean_change_pct"`
-	LatestFPS      float64 `json:"latest_fps"`
-	TargetFPS      float64 `json:"target_fps"`
-	FPSChangePct   float64 `json:"fps_change_pct"`
-	LatestRatio    float64 `json:"latest_ratio"`
-	TargetRatio    float64 `json:"target_ratio"`
-	RatioChangePct float64 `json:"ratio_change_pct"`
+	Name          string  `json:"name"`
+	LatestMeanMs  float64 `json:"latest_mean_ms"`
+	TargetMeanMs  float64 `json:"target_mean_ms"`
+	MeanChangePct float64 `json:"mean_change_pct"`
+	LatestFPS     float64 `json:"latest_fps"`
+	TargetFPS     float64 `json:"target_fps"`
+	FPSChangePct  float64 `json:"fps_change_pct"`
 }
 
 type Comparison struct {
@@ -74,7 +71,7 @@ func runCompare(args []string) error {
 	n := fs.Int("n", 5, "number of runs for avg mode")
 	failAbove := fs.Float64("fail-above", 0, "fail if regression exceeds this percent")
 	focus := fs.String("focus", "", "comma-separated sizes to focus on")
-	process := fs.String("process", "frontmatter", "benchmark process to compare: frontmatter | noop")
+	process := fs.String("process", "bytes", "benchmark process to compare: bytes | read | stat")
 	historyFile := fs.String("history", ".benchmarks/history.jsonl", "path to history file")
 	baselineFile := fs.String("baseline", ".benchmarks/baseline.jsonl", "path to baseline file")
 	outputJSON := fs.Bool("json", false, "output as JSON")
@@ -267,34 +264,10 @@ func averageSummaries(summaries []Summary) Summary {
 		}
 	}
 
-	// Average ratios
-	ratioNames := []string{"flat_1k", "nested1_1k", "flat_5k", "nested1_5k", "flat_100k", "nested1_100k", "flat_1m", "nested1_1m"}
-	avgRatios := make(map[string]float64)
-
-	for _, name := range ratioNames {
-		var (
-			sum   float64
-			count int
-		)
-
-		for idx := range summaries {
-			summary := &summaries[idx]
-			if r, ok := summary.Ratios[name]; ok && r > 0 {
-				sum += r
-				count++
-			}
-		}
-
-		if count > 0 {
-			avgRatios[name] = sum / float64(count)
-		}
-	}
-
 	return Summary{
 		Timestamp: fmt.Sprintf("avg(%d runs)", len(summaries)),
 		Git:       GitInfo{Rev: "various"},
 		Results:   avgResults,
-		Ratios:    avgRatios,
 	}
 }
 
@@ -307,14 +280,14 @@ func buildComparison(latest, target *Summary, targetDesc string, focusSizes []st
 
 	process = strings.ToLower(strings.TrimSpace(process))
 	if process == "" {
-		process = "frontmatter"
+		process = "bytes"
 	}
 
-	if process != "frontmatter" && process != "noop" {
-		return Comparison{}, fmt.Errorf("invalid process: %s (expected: frontmatter | noop)", process)
+	if process != "bytes" && process != "read" && process != "stat" {
+		return Comparison{}, fmt.Errorf("invalid process: %s (expected: bytes | read | stat)", process)
 	}
 
-	orderedBenches, ratioSuffix := benchmarksForProcess(process)
+	orderedBenches := benchmarksForProcess(process)
 
 	for _, name := range orderedBenches {
 		// Apply focus filter
@@ -341,36 +314,21 @@ func buildComparison(latest, target *Summary, targetDesc string, focusSizes []st
 			continue
 		}
 
-		// Extract prefix for ratio lookup (e.g., "flat_1k")
-		prefix := strings.TrimSuffix(name, "_"+process)
-
-		ratioKey := prefix
-		if ratioSuffix != "" {
-			ratioKey = prefix + ratioSuffix
-		}
-
-		latestRatio := latest.Ratios[ratioKey]
-		targetRatio := target.Ratios[ratioKey]
-
 		meanChange := pctChange(latestR.MeanMs, targetR.MeanMs)
 		fpsChange := pctChange(latestR.FilesPerSec, targetR.FilesPerSec)
-		ratioChange := pctChange(latestRatio, targetRatio)
 
 		if meanChange > worstRegression {
 			worstRegression = meanChange
 		}
 
 		benchmarks = append(benchmarks, CompareResult{
-			Name:           name,
-			LatestMeanMs:   latestR.MeanMs,
-			TargetMeanMs:   targetR.MeanMs,
-			MeanChangePct:  meanChange,
-			LatestFPS:      latestR.FilesPerSec,
-			TargetFPS:      targetR.FilesPerSec,
-			FPSChangePct:   fpsChange,
-			LatestRatio:    latestRatio,
-			TargetRatio:    targetRatio,
-			RatioChangePct: ratioChange,
+			Name:          name,
+			LatestMeanMs:  latestR.MeanMs,
+			TargetMeanMs:  targetR.MeanMs,
+			MeanChangePct: meanChange,
+			LatestFPS:     latestR.FilesPerSec,
+			TargetFPS:     targetR.FilesPerSec,
+			FPSChangePct:  fpsChange,
 		})
 	}
 
@@ -394,7 +352,7 @@ func buildComparison(latest, target *Summary, targetDesc string, focusSizes []st
 	}, nil
 }
 
-func benchmarksForProcess(process string) ([]string, string) {
+func benchmarksForProcess(process string) []string {
 	suffix := "_" + process
 	ordered := []string{
 		"flat_1k" + suffix, "nested1_1k" + suffix,
@@ -403,7 +361,7 @@ func benchmarksForProcess(process string) ([]string, string) {
 		"flat_1m" + suffix, "nested1_1m" + suffix,
 	}
 
-	return ordered, ""
+	return ordered
 }
 
 func printComparison(c *Comparison) error {
@@ -417,19 +375,17 @@ func printComparison(c *Comparison) error {
 	fmt.Println()
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprint(w, "Benchmark\tMean(ms)\tBase(ms)\tΔ%%\tfiles/s\tΔ%%\tRatio\tΔ%%\n")
-	fmt.Fprint(w, "--------\t--------\t--------\t--\t-------\t--\t-----\t--\n")
+	fmt.Fprint(w, "Benchmark\tMean(ms)\tBase(ms)\tΔ%\tfiles/s\tΔ%\n")
+	fmt.Fprint(w, "--------\t--------\t--------\t--\t-------\t--\n")
 
 	for _, benchmark := range c.Benchmarks {
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n",
 			benchmark.Name,
 			fmtMs(benchmark.LatestMeanMs),
 			fmtMs(benchmark.TargetMeanMs),
 			fmtPct(benchmark.MeanChangePct),
 			fmtFPS(benchmark.LatestFPS),
 			fmtPct(benchmark.FPSChangePct),
-			fmtRatio(benchmark.LatestRatio),
-			fmtPct(benchmark.RatioChangePct),
 		)
 	}
 
@@ -440,7 +396,6 @@ func printComparison(c *Comparison) error {
 
 	fmt.Println()
 	fmt.Println("Legend: Δ% = change from target (positive = slower/regression)")
-	fmt.Println("        Ratio = frontmatter_mean / noop_mean (lower = better)")
 
 	return nil
 }
@@ -475,14 +430,6 @@ func fmtFPS(v float64) string {
 	}
 
 	return fmt.Sprintf("%.0f", v)
-}
-
-func fmtRatio(v float64) string {
-	if v == 0 {
-		return "N/A"
-	}
-
-	return fmt.Sprintf("%.3f", v)
 }
 
 func fmtPct(v float64) string {

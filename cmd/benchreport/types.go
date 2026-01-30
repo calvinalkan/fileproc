@@ -9,11 +9,8 @@ type Summary struct {
 	Env    EnvInfo    `json:"env"`
 	Config ConfigInfo `json:"config"`
 
-	// Results maps benchmark name (e.g. "flat_1k_frontmatter") to its metrics.
+	// Results maps benchmark name (e.g. "flat_1k_bytes") to its metrics.
 	Results map[string]BenchResult `json:"results"`
-
-	// Ratios maps dataset prefix (e.g. "flat_1k") to frontmatter_mean/noop_mean.
-	Ratios map[string]float64 `json:"ratios"`
 }
 
 type GitInfo struct {
@@ -46,6 +43,8 @@ type BenchResult struct {
 	MinMs       float64 `json:"min_ms"`
 	MaxMs       float64 `json:"max_ms"`
 	FilesPerSec float64 `json:"files_per_sec"`
+	BytesPerSec float64 `json:"bytes_per_sec,omitempty"`
+	MBPerSec    float64 `json:"mb_per_sec,omitempty"`
 	Runs        int     `json:"runs"`
 }
 

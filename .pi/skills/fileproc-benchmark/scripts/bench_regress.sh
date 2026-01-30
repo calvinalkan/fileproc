@@ -64,11 +64,6 @@ WORKERS="${WORKERS-}" # -workers
 READ="${READ-}"       # -read
 GC="${GC-}"           # -gc
 
-EXPECT_1K=1000
-EXPECT_5K=5000
-EXPECT_100K=100000
-EXPECT_1M=1000000
-
 # Optional: pin GOMAXPROCS for the benchmark process.
 GOMAXPROCS=""
 
@@ -98,11 +93,6 @@ while [[ $# -gt 0 ]]; do
     --nested-1m) NESTED_1M="$2"; shift 2 ;;
 
     --read) READ="$2"; shift 2 ;;
-
-    --expect-1k) EXPECT_1K="$2"; shift 2 ;;
-    --expect-5k) EXPECT_5K="$2"; shift 2 ;;
-    --expect-100k) EXPECT_100K="$2"; shift 2 ;;
-    --expect-1m) EXPECT_1M="$2"; shift 2 ;;
 
     --gc) GC="$2"; shift 2 ;;
     --gomaxprocs) GOMAXPROCS="$2"; shift 2 ;;
@@ -288,10 +278,6 @@ META="$RUN_DIR/meta.txt"
   echo "power_detail: $POWER_DETAIL"
   echo "cpu_governor: ${CPU_GOVERNOR:-<unknown>}"
   echo "energy_perf_pref: ${EPP:-<unknown>}"
-  echo "expect_1k: $EXPECT_1K"
-  echo "expect_5k: $EXPECT_5K"
-  echo "expect_100k: $EXPECT_100K"
-  echo "expect_1m: $EXPECT_1M"
 
   if command -v lscpu >/dev/null 2>&1; then
     echo
@@ -328,10 +314,9 @@ if [[ -n "$PREFIX" ]]; then
 fi
 
 cmd_for() {
-  # Args: dir tree expect
+  # Args: dir tree
   local dir="$1"; shift
   local tree="$1"; shift
-  local expect="$1"; shift
 
   local tree_flag=""
   if [[ "$tree" == "true" ]]; then
@@ -339,7 +324,8 @@ cmd_for() {
   fi
 
   # Omit flags we want to keep at fileprocbench defaults.
-  local cmd="${PREFIX}$BIN -dir $dir $tree_flag -process {process} -expect $expect"
+  # -expect is auto-derived from .data/meta.json
+  local cmd="${PREFIX}$BIN -dir $dir $tree_flag -process {process}"
 
   if [[ -n "$READ" ]]; then
     cmd+=" -read $READ"
@@ -354,14 +340,14 @@ cmd_for() {
   echo "$cmd"
 }
 
-CMD_FLAT_1K=$(cmd_for "$FLAT_1K" false "$EXPECT_1K")
-CMD_NESTED_1K=$(cmd_for "$NESTED_1K" true "$EXPECT_1K")
-CMD_FLAT_5K=$(cmd_for "$FLAT_5K" false "$EXPECT_5K")
-CMD_NESTED_5K=$(cmd_for "$NESTED_5K" true "$EXPECT_5K")
-CMD_FLAT_100K=$(cmd_for "$FLAT_100K" false "$EXPECT_100K")
-CMD_NESTED_100K=$(cmd_for "$NESTED_100K" true "$EXPECT_100K")
-CMD_FLAT_1M=$(cmd_for "$FLAT_1M" false "$EXPECT_1M")
-CMD_NESTED_1M=$(cmd_for "$NESTED_1M" true "$EXPECT_1M")
+CMD_FLAT_1K=$(cmd_for "$FLAT_1K" false)
+CMD_NESTED_1K=$(cmd_for "$NESTED_1K" true)
+CMD_FLAT_5K=$(cmd_for "$FLAT_5K" false)
+CMD_NESTED_5K=$(cmd_for "$NESTED_5K" true)
+CMD_FLAT_100K=$(cmd_for "$FLAT_100K" false)
+CMD_NESTED_100K=$(cmd_for "$NESTED_100K" true)
+CMD_FLAT_1M=$(cmd_for "$FLAT_1M" false)
+CMD_NESTED_1M=$(cmd_for "$NESTED_1M" true)
 
 # -----------------------------------------------------------------------------
 # Run hyperfine
@@ -390,21 +376,39 @@ echo "building..."
 make build
 echo
 
-# Display clean table from hyperfine JSON
+# Load dataset metadata
+META_JSON=".data/meta.json"
+if [[ ! -f "$META_JSON" ]]; then
+  echo "error: missing $META_JSON (regenerate datasets with ticketgen)" >&2
+  exit 1
+fi
+
+# Get file count and total bytes for a dataset
+get_dataset_info() {
+  local dataset="$1"
+  jq -r --arg d "$dataset" '.[$d] | "\(.files) \(.total_bytes)"' "$META_JSON"
+}
+
+# Display clean table from hyperfine JSON with derived metrics
 display_results() {
   local json_file="$1"
-  jq -r '
+  local files="$2"
+  local total_bytes="$3"
+  
+  jq -r --argjson files "$files" --argjson bytes "$total_bytes" '
     (.results | min_by(.mean).mean) as $best |
     (
-      ["Command", "Mean", "Min", "Max", "Relative", ""],
-      ["-------", "----", "---", "---", "--------", ""],
+      ["Command", "Mean", "files/s", "MB/s", "Rel", ""],
+      ["-------", "----", "-------", "----", "---", ""],
       (.results[] |
         (.mean / $best | . * 100 | round / 100) as $rel |
+        ($files / .mean | round) as $fps |
+        ($bytes / .mean / 1000000 | . * 10 | round / 10) as $mbps |
         [
           .command,
           "\(.mean * 1000 | . * 10 | round / 10) ms",
-          "\(.min * 1000 | . * 10 | round / 10) ms",
-          "\(.max * 1000 | . * 10 | round / 10) ms",
+          "\($fps)",
+          "\($mbps)",
           "\($rel)",
           (if $rel == 1 then "<== best" else "" end)
         ]
@@ -432,18 +436,21 @@ echo "$SEP"
 echo
 
 hyperfine "${HF_1K[@]}" \
-  -L process frontmatter,noop \
+  -L process bytes,read,stat \
   --export-json "$OUT_JSON_1K" \
   --export-markdown "$OUT_MD_1K" \
-  --command-name "flat_1k_frontmatter" \
-  --command-name "flat_1k_noop" \
-  --command-name "nested1_1k_frontmatter" \
-  --command-name "nested1_1k_noop" \
+  --command-name "flat_1k_bytes" \
+  --command-name "flat_1k_read" \
+  --command-name "flat_1k_stat" \
+  --command-name "nested1_1k_bytes" \
+  --command-name "nested1_1k_read" \
+  --command-name "nested1_1k_stat" \
   "$CMD_FLAT_1K" \
   "$CMD_NESTED_1K"
 
 if [[ "$VERBOSE" != "true" ]]; then
-  display_results "$OUT_JSON_1K"
+  read -r FILES_1K BYTES_1K <<< "$(get_dataset_info tickets_flat_1k)"
+  display_results "$OUT_JSON_1K" "$FILES_1K" "$BYTES_1K"
 fi
 echo
 
@@ -454,18 +461,21 @@ echo "$SEP"
 echo
 
 hyperfine "${HF_5K[@]}" \
-  -L process frontmatter,noop \
+  -L process bytes,read,stat \
   --export-json "$OUT_JSON_5K" \
   --export-markdown "$OUT_MD_5K" \
-  --command-name "flat_5k_frontmatter" \
-  --command-name "flat_5k_noop" \
-  --command-name "nested1_5k_frontmatter" \
-  --command-name "nested1_5k_noop" \
+  --command-name "flat_5k_bytes" \
+  --command-name "flat_5k_read" \
+  --command-name "flat_5k_stat" \
+  --command-name "nested1_5k_bytes" \
+  --command-name "nested1_5k_read" \
+  --command-name "nested1_5k_stat" \
   "$CMD_FLAT_5K" \
   "$CMD_NESTED_5K"
 
 if [[ "$VERBOSE" != "true" ]]; then
-  display_results "$OUT_JSON_5K"
+  read -r FILES_5K BYTES_5K <<< "$(get_dataset_info tickets_flat_5k)"
+  display_results "$OUT_JSON_5K" "$FILES_5K" "$BYTES_5K"
 fi
 echo
 
@@ -476,18 +486,21 @@ echo "$SEP"
 echo
 
 hyperfine "${HF_COMMON[@]}" \
-  -L process frontmatter,noop \
+  -L process bytes,read,stat \
   --export-json "$OUT_JSON_100K" \
   --export-markdown "$OUT_MD_100K" \
-  --command-name "flat_100k_frontmatter" \
-  --command-name "flat_100k_noop" \
-  --command-name "nested1_100k_frontmatter" \
-  --command-name "nested1_100k_noop" \
+  --command-name "flat_100k_bytes" \
+  --command-name "flat_100k_read" \
+  --command-name "flat_100k_stat" \
+  --command-name "nested1_100k_bytes" \
+  --command-name "nested1_100k_read" \
+  --command-name "nested1_100k_stat" \
   "$CMD_FLAT_100K" \
   "$CMD_NESTED_100K"
 
 if [[ "$VERBOSE" != "true" ]]; then
-  display_results "$OUT_JSON_100K"
+  read -r FILES_100K BYTES_100K <<< "$(get_dataset_info tickets_flat_100k)"
+  display_results "$OUT_JSON_100K" "$FILES_100K" "$BYTES_100K"
 fi
 echo
 
@@ -498,18 +511,21 @@ echo "$SEP"
 echo
 
 hyperfine "${HF_COMMON[@]}" \
-  -L process frontmatter,noop \
+  -L process bytes,read,stat \
   --export-json "$OUT_JSON_1M" \
   --export-markdown "$OUT_MD_1M" \
-  --command-name "flat_1m_frontmatter" \
-  --command-name "flat_1m_noop" \
-  --command-name "nested1_1m_frontmatter" \
-  --command-name "nested1_1m_noop" \
+  --command-name "flat_1m_bytes" \
+  --command-name "flat_1m_read" \
+  --command-name "flat_1m_stat" \
+  --command-name "nested1_1m_bytes" \
+  --command-name "nested1_1m_read" \
+  --command-name "nested1_1m_stat" \
   "$CMD_FLAT_1M" \
   "$CMD_NESTED_1M"
 
 if [[ "$VERBOSE" != "true" ]]; then
-  display_results "$OUT_JSON_1M"
+  read -r FILES_1M BYTES_1M <<< "$(get_dataset_info tickets_flat_1m)"
+  display_results "$OUT_JSON_1M" "$FILES_1M" "$BYTES_1M"
 fi
 echo
 

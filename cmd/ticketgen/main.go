@@ -15,6 +15,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -91,7 +92,10 @@ func run(args *Args) error {
 
 	start := time.Now()
 
-	var processedFiles atomic.Uint64
+	var (
+		processedFiles atomic.Uint64
+		totalBytes     atomic.Uint64
+	)
 
 	var waitGroup sync.WaitGroup
 
@@ -107,7 +111,7 @@ func run(args *Args) error {
 		endIdxCopy := endIdx
 
 		waitGroup.Go(func() {
-			workerErr := worker(args, startIdxCopy, endIdxCopy, &processedFiles)
+			workerErr := worker(args, startIdxCopy, endIdxCopy, &processedFiles, &totalBytes)
 			if workerErr != nil {
 				errCh <- workerErr
 			}
@@ -123,13 +127,68 @@ func run(args *Args) error {
 
 	elapsed := time.Since(start)
 	processedTotal := processedFiles.Load()
+	bytesTotal := totalBytes.Load()
 	perSec := float64(processedTotal) / elapsed.Seconds()
-	fmt.Fprintf(os.Stderr, "done: files=%d elapsed=%v throughput=%.0f files/sec\n", processedTotal, elapsed, perSec)
+	fmt.Fprintf(os.Stderr, "done: files=%d bytes=%d elapsed=%v throughput=%.0f files/sec\n", processedTotal, bytesTotal, elapsed, perSec)
+
+	// Write metadata file
+	metaErr := writeMetaFile(args.Out, processedTotal, bytesTotal)
+	if metaErr != nil {
+		return fmt.Errorf("write meta: %w", metaErr)
+	}
 
 	return nil
 }
 
-func worker(args *Args, startIdx, endIdx uint64, processedFiles *atomic.Uint64) error {
+// datasetMeta is the metadata for a single dataset.
+type datasetMeta struct {
+	Files      uint64 `json:"files"`
+	TotalBytes uint64 `json:"total_bytes"`
+	AvgBytes   uint64 `json:"avg_bytes"`
+}
+
+func writeMetaFile(dir string, files, totalBytes uint64) error {
+	avgBytes := uint64(0)
+	if files > 0 {
+		avgBytes = totalBytes / files
+	}
+
+	// meta.json is stored in parent directory, keyed by dataset directory name
+	parentDir := filepath.Dir(dir)
+	datasetName := filepath.Base(dir)
+	metaPath := filepath.Join(parentDir, "meta.json")
+
+	// Read existing meta.json if it exists
+	allMeta := make(map[string]datasetMeta)
+
+	existingData, readErr := os.ReadFile(metaPath)
+	if readErr == nil {
+		// Ignore unmarshal errors - just start fresh if corrupted
+		_ = json.Unmarshal(existingData, &allMeta)
+	}
+
+	// Update/add this dataset's entry
+	allMeta[datasetName] = datasetMeta{
+		Files:      files,
+		TotalBytes: totalBytes,
+		AvgBytes:   avgBytes,
+	}
+
+	// Write back
+	newData, marshalErr := json.MarshalIndent(allMeta, "", "  ")
+	if marshalErr != nil {
+		return fmt.Errorf("marshal meta: %w", marshalErr)
+	}
+
+	err := os.WriteFile(metaPath, newData, 0o644)
+	if err != nil {
+		return fmt.Errorf("write %s: %w", metaPath, err)
+	}
+
+	return nil
+}
+
+func worker(args *Args, startIdx, endIdx uint64, processedFiles, totalBytes *atomic.Uint64) error {
 	createdDirs := make(map[string]struct{})
 
 	seed := seedForThread(startIdx)
@@ -159,10 +218,14 @@ func worker(args *Args, startIdx, endIdx uint64, processedFiles *atomic.Uint64) 
 		buf.Reset()
 		writeTicket(buf, args, rng, i)
 
-		writeErr := os.WriteFile(filePath, buf.Bytes(), 0o600)
+		fileBytes := buf.Bytes()
+
+		writeErr := os.WriteFile(filePath, fileBytes, 0o600)
 		if writeErr != nil {
 			return fmt.Errorf("write %s: %w", filePath, writeErr)
 		}
+
+		totalBytes.Add(uint64(len(fileBytes)))
 
 		processedCount := processedFiles.Add(1)
 		if args.ProgressEvery != 0 && processedCount%args.ProgressEvery == 0 {

@@ -5,11 +5,10 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"os"
+	"path/filepath"
 	"runtime"
 	"runtime/debug"
 	"runtime/pprof"
@@ -18,6 +17,16 @@ import (
 
 	"github.com/calvinalkan/fileproc"
 )
+
+// datasetMeta is the structure of entries in meta.json written by ticketgen.
+type datasetMeta struct {
+	Files      uint64 `json:"files"`
+	TotalBytes uint64 `json:"total_bytes"`
+	AvgBytes   uint64 `json:"avg_bytes"`
+}
+
+// allDatasetMeta maps dataset directory name to its metadata.
+type allDatasetMeta map[string]datasetMeta
 
 type benchResult struct {
 	Timestamp time.Time `json:"ts"`
@@ -36,12 +45,15 @@ type benchResult struct {
 	GCPercent int   `json:"gc"`
 	Expect    int64 `json:"expect,omitempty"`
 
-	Visited   uint64        `json:"visited"`
-	Matched   uint64        `json:"matched"`
-	Errors    uint64        `json:"errors"`
-	Duration  time.Duration `json:"duration"`
-	PerSecond float64       `json:"files_per_sec"`
-	MatchRate float64       `json:"match_rate"`
+	Visited      uint64        `json:"visited"`
+	Matched      uint64        `json:"matched"`
+	Errors       uint64        `json:"errors"`
+	Duration     time.Duration `json:"duration"`
+	FilesPerSec  float64       `json:"files_per_sec"`
+	BytesTotal   uint64        `json:"bytes_total,omitempty"`
+	BytesPerSec  float64       `json:"bytes_per_sec,omitempty"`
+	AvgFileBytes uint64        `json:"avg_file_bytes,omitempty"`
+	MatchRate    float64       `json:"match_rate"`
 
 	GoVersion   string `json:"go"`
 	GOOS        string `json:"goos"`
@@ -53,11 +65,10 @@ type benchResult struct {
 	VCSModified bool   `json:"vcs_modified,omitempty"`
 }
 
-var errMissingFrontmatterID = errors.New("missing frontmatter/id")
-
 const (
-	processFrontmatter = "frontmatter"
-	processNoop        = "noop"
+	processBytes = "bytes"
+	processRead  = "read"
+	processStat  = "stat"
 )
 
 type benchFlags struct {
@@ -83,9 +94,9 @@ func parseFlags() *benchFlags {
 
 	flag.StringVar(&flags.dir, "dir", "", "directory to scan")
 	flag.BoolVar(&flags.tree, "tree", false, "scan recursively")
-	flag.StringVar(&flags.process, "process", "frontmatter", "process mode: frontmatter | noop")
+	flag.StringVar(&flags.process, "process", "bytes", "process mode: bytes | read | stat")
 	flag.StringVar(&flags.suffix, "suffix", ".md", "file suffix filter (empty = all files)")
-	flag.IntVar(&flags.readSize, "read", 2048, "bytes to read per file (frontmatter only)")
+	flag.IntVar(&flags.readSize, "read", 2048, "bytes to read per file (read mode only)")
 	flag.IntVar(&flags.workers, "workers", 0, "worker count (0=auto)")
 	flag.IntVar(&flags.repeat, "repeat", 1, "repeat the scan N times per invocation")
 	flag.IntVar(&flags.gcPercent, "gc", -1, "if >=0, call debug.SetGCPercent(gc)")
@@ -125,6 +136,17 @@ func run(flags *benchFlags) int {
 		fmt.Fprintln(os.Stderr, "-expect must be -1 or > 0")
 
 		return 2
+	}
+
+	// Load dataset metadata (for expect default and bytes stats)
+	meta, metaErr := loadDatasetMeta(flags.dir)
+	if metaErr != nil {
+		fmt.Fprintf(os.Stderr, "warning: %v\n", metaErr)
+	}
+
+	// Use meta.Files as expect default if not explicitly set
+	if flags.expect < 0 && meta != nil && meta.Files > 0 {
+		flags.expect = int64(meta.Files)
 	}
 
 	selectedProcess, err := parseProcess(flags.process)
@@ -255,7 +277,21 @@ func run(flags *benchFlags) int {
 		}
 	}
 
-	perSec := float64(visited) / duration.Seconds()
+	filesPerSec := float64(visited) / duration.Seconds()
+
+	// Calculate bytes stats from metadata loaded earlier
+	var (
+		bytesTotal   uint64
+		bytesPerSec  float64
+		avgFileBytes uint64
+	)
+
+	if meta != nil && meta.TotalBytes > 0 {
+		// Scale by repeat count since we processed the dataset multiple times
+		bytesTotal = meta.TotalBytes * uint64(flags.repeat)
+		bytesPerSec = float64(bytesTotal) / duration.Seconds()
+		avgFileBytes = meta.AvgBytes
+	}
 
 	matchRate := 0.0
 	if visited > 0 {
@@ -282,29 +318,32 @@ func run(flags *benchFlags) int {
 	}
 
 	res := benchResult{
-		Timestamp:  time.Now(),
-		Case:       flags.caseName,
-		Notes:      flags.notes,
-		Dir:        flags.dir,
-		Tree:       flags.tree,
-		Process:    selectedProcess,
-		Suffix:     flags.suffix,
-		ReadSize:   flags.readSize,
-		Workers:    flags.workers,
-		Repeat:     flags.repeat,
-		GCPercent:  flags.gcPercent,
-		Expect:     flags.expect,
-		Visited:    visited,
-		Matched:    visited,
-		Errors:     0,
-		Duration:   duration,
-		PerSecond:  perSec,
-		MatchRate:  matchRate,
-		GoVersion:  goVersion,
-		GOOS:       runtime.GOOS,
-		GOARCH:     runtime.GOARCH,
-		GOMAXPROCS: runtime.GOMAXPROCS(0),
-		NumCPU:     runtime.NumCPU(),
+		Timestamp:    time.Now(),
+		Case:         flags.caseName,
+		Notes:        flags.notes,
+		Dir:          flags.dir,
+		Tree:         flags.tree,
+		Process:      selectedProcess,
+		Suffix:       flags.suffix,
+		ReadSize:     flags.readSize,
+		Workers:      flags.workers,
+		Repeat:       flags.repeat,
+		GCPercent:    flags.gcPercent,
+		Expect:       flags.expect,
+		Visited:      visited,
+		Matched:      visited,
+		Errors:       0,
+		Duration:     duration,
+		FilesPerSec:  filesPerSec,
+		BytesTotal:   bytesTotal,
+		BytesPerSec:  bytesPerSec,
+		AvgFileBytes: avgFileBytes,
+		MatchRate:    matchRate,
+		GoVersion:    goVersion,
+		GOOS:         runtime.GOOS,
+		GOARCH:       runtime.GOARCH,
+		GOMAXPROCS:   runtime.GOMAXPROCS(0),
+		NumCPU:       runtime.NumCPU(),
 
 		VCSRevision: vcsRevision,
 		VCSTime:     vcsTime,
@@ -321,23 +360,55 @@ func run(flags *benchFlags) int {
 	}
 
 	if flags.quiet {
-		fmt.Printf("%.0f\n", perSec)
+		fmt.Printf("%.0f\n", filesPerSec)
 
 		return 0
 	}
 
-	fmt.Printf("visited=%d errors=%d repeat=%d duration=%v throughput=%.0f files/sec\n", visited, 0, flags.repeat, duration, perSec)
+	if bytesPerSec > 0 {
+		fmt.Printf("visited=%d errors=%d repeat=%d duration=%v files/sec=%.0f bytes/sec=%.0f MB/s=%.1f\n",
+			visited, 0, flags.repeat, duration, filesPerSec, bytesPerSec, bytesPerSec/1_000_000)
+	} else {
+		fmt.Printf("visited=%d errors=%d repeat=%d duration=%v files/sec=%.0f\n",
+			visited, 0, flags.repeat, duration, filesPerSec)
+	}
 
 	return 0
+}
+
+// loadDatasetMeta loads metadata for a dataset from parent's meta.json.
+func loadDatasetMeta(dir string) (*datasetMeta, error) {
+	parentDir := filepath.Dir(dir)
+	datasetName := filepath.Base(dir)
+	metaPath := filepath.Join(parentDir, "meta.json")
+
+	data, err := os.ReadFile(metaPath)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", metaPath, err)
+	}
+
+	var allMeta allDatasetMeta
+
+	unmarshalErr := json.Unmarshal(data, &allMeta)
+	if unmarshalErr != nil {
+		return nil, fmt.Errorf("parse %s: %w", metaPath, unmarshalErr)
+	}
+
+	meta, ok := allMeta[datasetName]
+	if !ok {
+		return nil, fmt.Errorf("dataset %q not found in %s", datasetName, metaPath)
+	}
+
+	return &meta, nil
 }
 
 func parseProcess(processFlag string) (string, error) {
 	processName := strings.ToLower(strings.TrimSpace(processFlag))
 	switch processName {
-	case processFrontmatter, processNoop:
+	case processBytes, processRead, processStat:
 		return processName, nil
 	default:
-		return "", fmt.Errorf("invalid -process %q (expected: frontmatter | noop)", processFlag)
+		return "", fmt.Errorf("invalid -process %q (expected: bytes | read | stat)", processFlag)
 	}
 }
 
@@ -345,100 +416,44 @@ func makeProcessFn(process string, readSize int) fileproc.ProcessFunc[struct{}] 
 	var one struct{}
 
 	switch process {
-	case processNoop:
-		return func(_ *fileproc.File, _ *fileproc.Worker) (*struct{}, error) {
+	case processStat:
+		return func(f *fileproc.File, _ *fileproc.Worker) (*struct{}, error) {
+			_, err := f.Stat()
+			if err != nil {
+				return nil, fmt.Errorf("stat: %w", err)
+			}
+
 			return &one, nil
 		}
-	case processFrontmatter:
-		return func(f *fileproc.File, scratch *fileproc.Worker) (*struct{}, error) {
-			buf := scratch.Buf(readSize)
+
+	case processRead:
+		return func(f *fileproc.File, w *fileproc.Worker) (*struct{}, error) {
+			buf := w.Buf(readSize)
 			buf = buf[:cap(buf)]
 
-			n, err := f.Read(buf)
-			if err != nil && !errors.Is(err, io.EOF) {
+			_, err := f.Read(buf)
+			if err != nil {
 				return nil, fmt.Errorf("read: %w", err)
 			}
 
-			data := buf[:n]
-			if !hasFrontMatterAndID(data) {
-				return nil, errMissingFrontmatterID
+			return &one, nil
+		}
+
+	case processBytes:
+		return func(f *fileproc.File, _ *fileproc.Worker) (*struct{}, error) {
+			_, err := f.Bytes()
+			if err != nil {
+				return nil, fmt.Errorf("bytes: %w", err)
 			}
 
 			return &one, nil
 		}
+
 	default:
-		// parseProcess guards against unexpected values; keep a clear error in case
-		// of internal misuse.
 		return func(_ *fileproc.File, _ *fileproc.Worker) (*struct{}, error) {
 			return nil, fmt.Errorf("unknown process mode: %s", process)
 		}
 	}
-}
-
-// hasFrontMatterAndID implements a small, allocation-free-ish frontmatter parser.
-//
-// Expected format:
-//
-//	---\n
-//	key: value\n
-//	...\n
-//	---\n
-func hasFrontMatterAndID(data []byte) bool {
-	if len(data) < 4 || data[0] != '-' || data[1] != '-' || data[2] != '-' {
-		return false
-	}
-
-	i := 3
-	if data[i] == '\r' {
-		i++
-	}
-
-	if i >= len(data) || data[i] != '\n' {
-		return false
-	}
-
-	i++
-
-	var sawID bool
-
-	for i < len(data) {
-		lineStart := i
-		for i < len(data) && data[i] != '\n' {
-			i++
-		}
-
-		lineEnd := i
-		if lineEnd > lineStart && data[lineEnd-1] == '\r' {
-			lineEnd--
-		}
-
-		line := data[lineStart:lineEnd]
-		if len(line) == 3 && line[0] == '-' && line[1] == '-' && line[2] == '-' {
-			return sawID
-		}
-
-		indentIdx := 0
-		for indentIdx < len(line) && (line[indentIdx] == ' ' || line[indentIdx] == '\t') {
-			indentIdx++
-		}
-
-		if len(line)-indentIdx >= 3 && line[indentIdx] == 'i' && line[indentIdx+1] == 'd' && line[indentIdx+2] == ':' {
-			valueStart := indentIdx + 3
-			for valueStart < len(line) && (line[valueStart] == ' ' || line[valueStart] == '\t') {
-				valueStart++
-			}
-
-			if valueStart < len(line) {
-				sawID = true
-			}
-		}
-
-		if i < len(data) {
-			i++
-		}
-	}
-
-	return false
 }
 
 func appendJSONL(path string, res *benchResult) error {
