@@ -75,21 +75,30 @@ type options struct {
 
 func applyOptions(opts []Option) options {
 	cfg := options{}
+
 	for _, opt := range opts {
 		if opt != nil {
 			opt(&cfg)
 		}
 	}
 
-	return cfg
-}
-
-func withDefaults(opts options) options {
-	if opts.SmallFileThreshold <= 0 {
-		opts.SmallFileThreshold = defaultSmallFileThreshold
+	if cfg.SmallFileThreshold <= 0 {
+		cfg.SmallFileThreshold = defaultSmallFileThreshold
 	}
 
-	return opts
+	if cfg.Recursive {
+		if cfg.Workers <= 0 {
+			cfg.Workers = defaultRecursiveWorkers()
+		}
+	} else if cfg.Workers <= 0 {
+		cfg.Workers = defaultWorkers()
+	}
+
+	if cfg.Workers > maxWorkers {
+		cfg.Workers = maxWorkers
+	}
+
+	return cfg
 }
 
 func defaultWorkers() int {
@@ -98,13 +107,13 @@ func defaultWorkers() int {
 	return w
 }
 
-// defaultTreeWorkers returns the default worker count for tree traversal.
+// defaultRecursiveWorkers returns the default worker count for tree traversal.
 //
 // Benchmarks on a 24-core machine showed 12 workers optimal for tree mode,
 // with regression at 16+ workers due to futex contention from goroutine
 // coordination (job queue + found channel for subdirectories).
 //
 // Formula: NumCPU/2, clamped to [4, 16].
-func defaultTreeWorkers() int {
+func defaultRecursiveWorkers() int {
 	return min(max(runtime.NumCPU()/2, 4), 16)
 }

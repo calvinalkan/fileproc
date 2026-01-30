@@ -14,3 +14,6 @@ cmd/benchreport/benchreport
 /fileprocbench
 /ticketgen
 /benchreport
+
+# symlinked from pi directory
+.codex/skills

@@ -153,12 +153,12 @@ var (
 	errSkipFile = errors.New("skip file")
 )
 
-// RelPath returns the file path relative to the root directory passed to
+// RelPathBorrowed returns the file path relative to the root directory passed to
 // Process.
 //
 // The returned slice is ephemeral and only valid during the callback.
 // Copy if you need to retain it.
-func (f *File) RelPath() []byte {
+func (f *File) RelPathBorrowed() []byte {
 	return f.relPath
 }
 
@@ -247,11 +247,11 @@ func (f *File) Bytes(opts ...BytesOption) ([]byte, error) {
 	}
 
 	// Buffer size priority: stat > sizeHint > default
-	const defaultBufSize = 512
 	maxInt := int(^uint(0) >> 1)
 	maxSize := maxInt - 1
 
 	var size int
+
 	if f.statDone && f.statErr == nil {
 		if f.st.Size > 0 {
 			if f.st.Size > int64(maxSize) {
@@ -261,16 +261,11 @@ func (f *File) Bytes(opts ...BytesOption) ([]byte, error) {
 			}
 		}
 	} else if len(opts) > 0 && opts[0].sizeHint > 0 {
-		if opts[0].sizeHint > maxSize {
-			size = maxSize
-		} else {
-			size = opts[0].sizeHint
-		}
+		size = min(opts[0].sizeHint, maxSize)
 	}
 
-	readSize := max(
-		// +1 to detect growth / read past expected size
-		size+1, defaultBufSize)
+	// +1 to detect growth / read past expected size
+	readSize := max(size+1, defaultReadBufSize)
 
 	// Ensure dataBuf capacity
 	if cap(*f.dataBuf) < readSize {
@@ -293,6 +288,7 @@ func (f *File) Bytes(opts ...BytesOption) ([]byte, error) {
 	// Buffer was filled - file may be larger, continue reading
 	if n == readSize {
 		var readErr error
+
 		for {
 			if n == len(buf) {
 				growBy := max(len(buf), 4096)
@@ -514,7 +510,7 @@ func (e *IOError) Unwrap() error {
 
 // ProcessError is returned when a user callback ([ProcessFunc]) returns an error.
 type ProcessError struct {
-	// Path is the relative file path.
+	// Path is the relative file path (owned, not borrowed).
 	Path string
 	// Err is the error returned by the callback.
 	Err error
@@ -540,9 +536,13 @@ const (
 	// pipeline workers) to avoid excessive goroutine/memory overhead.
 	maxWorkers = 256
 
+	// defaultReadBufSize is the initial buffer size for file reads and
+	// path buffer growth heuristics.
+	defaultReadBufSize = 512
+
 	// pathBufExtra is extra capacity for path buffers to reduce reallocs
 	// when joining directory prefix with filename.
-	pathBufExtra = 512
+	pathBufExtra = defaultReadBufSize
 
 	// defaultSmallFileThreshold is the default for WithSmallFileThreshold.
 	// Below this file count, sequential file processing beats pipelined workers.
@@ -653,7 +653,7 @@ func Process[T any](ctx context.Context, path string, fn ProcessFunc[T], opts ..
 		return nil, nil
 	}
 
-	cfg := withDefaults(applyOptions(opts))
+	cfg := applyOptions(opts)
 	if strings.IndexByte(cfg.Suffix, 0) >= 0 {
 		return nil, []error{fmt.Errorf("invalid suffix: %w", errContainsNUL)}
 	}
@@ -688,7 +688,7 @@ func (p processor[T]) processDir(
 ) ([]*T, []error) {
 	dirPath := pathWithNul(dir)
 
-	rh, err := openDirEnumerator(dirPath)
+	dirEnumerator, err := openDirEnumerator(dirPath)
 	if err != nil {
 		ioErr := &IOError{Path: ".", Op: "open", Err: err}
 		if notifier.ioErr(ioErr) {
@@ -698,7 +698,7 @@ func (p processor[T]) processDir(
 		return nil, nil
 	}
 
-	defer func() { _ = rh.closeHandle() }()
+	defer func() { _ = dirEnumerator.closeHandle() }()
 
 	dirBuf := make([]byte, 0, dirReadBufSize)
 	batch := &nameBatch{}
@@ -709,7 +709,7 @@ func (p processor[T]) processDir(
 			return nil, nil
 		}
 
-		err := readDirBatch(rh, dirBuf[:cap(dirBuf)], opts.Suffix, batch, nil)
+		err := readDirBatch(dirEnumerator, dirBuf[:cap(dirBuf)], opts.Suffix, batch, nil)
 		if err != nil && !errors.Is(err, io.EOF) {
 			// Best-effort: keep names already read, but surface the readdir error.
 			readErr := err
@@ -724,6 +724,7 @@ func (p processor[T]) processDir(
 			}
 
 			results, errs := p.processFilesSequential(ctx, dir, nil, batch.names, notifier)
+
 			ioErr := &IOError{Path: ".", Op: "readdir", Err: readErr}
 			if notifier.ioErr(ioErr) {
 				errs = append(errs, ioErr)
@@ -733,23 +734,15 @@ func (p processor[T]) processDir(
 		}
 
 		if len(batch.names) > opts.SmallFileThreshold {
-			if opts.Workers <= 0 {
-				opts.Workers = defaultWorkers()
-			}
-
-			if opts.Workers > maxWorkers {
-				opts.Workers = maxWorkers
-			}
-
 			return p.processDirPipelined(ctx, &dirPipelinedArgs{
-				dir:          dir,
-				relPrefix:    nil,
-				rh:           rh,
-				initial:      batch.names,
-				opts:         opts,
-				reportSubdir: nil,
-				notifier:     notifier,
-				dirBuf:       dirBuf[:cap(dirBuf)],
+				dir:           dir,
+				relPrefix:     nil,
+				dirEnumerator: dirEnumerator,
+				initialNames:  batch.names,
+				opts:          opts,
+				reportSubdir:  nil,
+				notifier:      notifier,
+				dirBuf:        dirBuf[:cap(dirBuf)],
 			})
 		}
 
@@ -783,14 +776,6 @@ func (p processor[T]) processRecursive(
 	opts options,
 	notifier *errNotifier,
 ) ([]*T, []error) {
-	if opts.Workers <= 0 {
-		opts.Workers = defaultTreeWorkers()
-	}
-
-	if opts.Workers > maxWorkers {
-		opts.Workers = maxWorkers
-	}
-
 	return p.processTree(ctx, root, opts, notifier)
 }
 
@@ -1090,7 +1075,7 @@ func (p processor[T]) processTree(
 					dirRel = string(job.rel)
 				}
 
-				rh, err := openDirEnumerator(job.abs)
+				dirEnumerator, err := openDirEnumerator(job.abs)
 				if err != nil {
 					ioErr := &IOError{Path: dirRel, Op: "open", Err: err}
 					if notifier.ioErr(ioErr) {
@@ -1100,7 +1085,7 @@ func (p processor[T]) processTree(
 					return
 				}
 
-				defer func() { _ = rh.closeHandle() }()
+				defer func() { _ = dirEnumerator.closeHandle() }()
 
 				// ============================================================
 				// SUBDIRECTORY DISCOVERY
@@ -1125,13 +1110,7 @@ func (p processor[T]) processTree(
 					}
 
 					rel := make([]byte, 0, relCap)
-					if len(job.rel) > 0 {
-						rel = append(rel, job.rel...)
-						if last := job.rel[len(job.rel)-1]; last != os.PathSeparator && last != '/' {
-							rel = append(rel, os.PathSeparator)
-						}
-					}
-
+					rel = appendPathPrefix(rel, job.rel)
 					rel = append(rel, name...)
 
 					select {
@@ -1156,7 +1135,7 @@ func (p processor[T]) processTree(
 				//
 				large, err := readDirUntilLargeOrEOF(
 					ctx,
-					rh,
+					dirEnumerator,
 					bufs.dirBuf[:cap(bufs.dirBuf)],
 					dirOpts.Suffix,
 					&bufs.batch,
@@ -1177,15 +1156,15 @@ func (p processor[T]) processTree(
 				// Large directory? Switch to pipelined processing.
 				if large {
 					dirResults, dirErrs := p.processDirPipelinedWithBatches(ctx, &treeDirPipelinedArgs{
-						dir:          job.abs,
-						relPrefix:    job.rel,
-						rh:           rh,
-						initial:      bufs.batch.names,
-						opts:         dirOpts,
-						reportSubdir: reportSubdir,
-						notifier:     notifier,
-						bufs:         bufs,
-						freeBatches:  freeBatches,
+						dir:           job.abs,
+						relPrefix:     job.rel,
+						dirEnumerator: dirEnumerator,
+						initialNames:  bufs.batch.names,
+						opts:          dirOpts,
+						reportSubdir:  reportSubdir,
+						notifier:      notifier,
+						bufs:          bufs,
+						freeBatches:   freeBatches,
 					})
 					if len(dirErrs) > 0 {
 						workerErrs[workerID] = append(workerErrs[workerID], dirErrs...)
@@ -1293,13 +1272,13 @@ func (p processor[T]) processTree(
 	return results, allErrs
 }
 
-func readDirUntilLargeOrEOF(ctx context.Context, rh readdirHandle, dirBuf []byte, suffix string, batch *nameBatch, reportSubdir func([]byte), threshold int) (bool, error) {
+func readDirUntilLargeOrEOF(ctx context.Context, dirEnumerator readdirHandle, dirBuf []byte, suffix string, batch *nameBatch, reportSubdir func([]byte), threshold int) (bool, error) {
 	for {
 		if ctx.Err() != nil {
 			return false, io.EOF
 		}
 
-		err := readDirBatch(rh, dirBuf, suffix, batch, reportSubdir)
+		err := readDirBatch(dirEnumerator, dirBuf, suffix, batch, reportSubdir)
 		if len(batch.names) > threshold {
 			if err != nil && !errors.Is(err, io.EOF) {
 				// Best-effort: signal error but keep already-read names.
@@ -1341,15 +1320,15 @@ func readDirUntilLargeOrEOF(ctx context.Context, rh readdirHandle, dirBuf []byte
 //  2. Workers=1 means single file processor, no concurrent buffer access
 //  3. freeBatches channel provides bounded, reusable batch storage
 type treeDirPipelinedArgs struct {
-	dir          []byte
-	relPrefix    []byte
-	rh           readdirHandle
-	initial      [][]byte
-	opts         options
-	reportSubdir func(name []byte)
-	notifier     *errNotifier
-	bufs         *workerBufs
-	freeBatches  chan *nameBatch
+	dir           []byte
+	relPrefix     []byte
+	dirEnumerator readdirHandle
+	initialNames  [][]byte
+	opts          options
+	reportSubdir  func(name []byte)
+	notifier      *errNotifier
+	bufs          *workerBufs
+	freeBatches   chan *nameBatch
 }
 
 func (p processor[T]) processDirPipelinedWithBatches(ctx context.Context, args *treeDirPipelinedArgs) ([]*T, []error) {
@@ -1358,7 +1337,7 @@ func (p processor[T]) processDirPipelinedWithBatches(ctx context.Context, args *
 		dirRel = string(args.relPrefix)
 	}
 
-	dh, err := openDirFromReaddir(args.rh, pathStr(args.dir))
+	dh, err := openDirFromReaddir(args.dirEnumerator, pathStr(args.dir))
 	if err != nil {
 		ioErr := &IOError{Path: dirRel, Op: "open", Err: err}
 		if args.notifier.ioErr(ioErr) {
@@ -1368,167 +1347,23 @@ func (p processor[T]) processDirPipelinedWithBatches(ctx context.Context, args *
 		return nil, nil
 	}
 
-	cfg := fileProcCfg[T]{
-		fn:       p.fn,
-		notifier: args.notifier,
-	}
-
-	nameCh := make(chan *nameBatch, 4)
-
-	var (
-		mu      sync.Mutex
-		results []*T
-		allErrs []error
-	)
-
-	addErr := func(err error) {
-		if err == nil {
-			return
-		}
-
-		mu.Lock()
-
-		allErrs = append(allErrs, err)
-
-		mu.Unlock()
-	}
-
-	workerDone := make(chan struct{})
-
-	getBatch := func(storageCap int) *nameBatch {
-		select {
-		case batch := <-args.freeBatches:
-			batch.reset(storageCap)
-
-			return batch
-		case <-ctx.Done():
-			return nil
-		case <-workerDone:
-			return nil
-		}
-	}
-
-	putBatch := func(batch *nameBatch) {
-		batch.reset(0)
-
-		select {
-		case args.freeBatches <- batch:
-		default:
-		}
-	}
-
-	sendBatch := func(batch *nameBatch) bool {
-		if batch == nil {
-			return false
-		}
-
-		if len(batch.names) == 0 {
-			putBatch(batch)
-
-			return true
-		}
-
-		select {
-		case nameCh <- batch:
-			return true
-		case <-ctx.Done():
-			putBatch(batch)
-
-			return false
-		case <-workerDone:
-			putBatch(batch)
-
-			return false
-		}
-	}
-
-	var producerWG sync.WaitGroup
-	producerWG.Go(func() {
-		defer close(nameCh)
-
-		storageCap := cap(args.bufs.dirBuf) * 2
-
-		if len(args.initial) > 0 {
-			batch := getBatch(storageCap)
-			if batch == nil {
-				return
-			}
-
-			for _, n := range args.initial {
-				batch.copyName(n)
-			}
-
-			if !sendBatch(batch) {
-				return
-			}
-		}
-
-		for {
-			if ctx.Err() != nil {
-				return
-			}
-
-			batch := getBatch(storageCap)
-			if batch == nil {
-				return
-			}
-
-			err := readDirBatch(args.rh, args.bufs.dirBuf[:cap(args.bufs.dirBuf)], args.opts.Suffix, batch, args.reportSubdir)
-
-			if !sendBatch(batch) {
-				return
-			}
-
-			if err == nil {
-				continue
-			}
-
-			if errors.Is(err, io.EOF) {
-				return
-			}
-
-			ioErr := &IOError{Path: dirRel, Op: "readdir", Err: err}
-			if args.notifier.ioErr(ioErr) {
-				addErr(ioErr)
-			}
-
-			return
-		}
+	// Tree workers already own buffers and a batch pool; reuse them here to
+	// avoid per-directory allocations. workerCount must stay 1 to keep this safe.
+	return p.runDirPipeline(ctx, &pipelineArgs{
+		dirEnumerator: args.dirEnumerator,
+		dirHandle:     dh,
+		relPrefix:     args.relPrefix,
+		dirRel:        dirRel,
+		initialNames:  args.initialNames,
+		suffix:        args.opts.Suffix,
+		reportSubdir:  args.reportSubdir,
+		notifier:      args.notifier,
+		dirBuf:        args.bufs.dirBuf,
+		workerCount:   1,
+		queueCapacity: 4,
+		freeBatches:   args.freeBatches,
+		sharedBufs:    args.bufs,
 	})
-
-	go func() {
-		localErrs := make([]error, 0, 64)
-
-		defer func() {
-			mu.Lock()
-
-			allErrs = append(allErrs, localErrs...)
-
-			mu.Unlock()
-			close(workerDone)
-		}()
-
-		out := fileProcOut[T]{results: &results, errs: &localErrs}
-
-		for batch := range nameCh {
-			if ctx.Err() != nil {
-				putBatch(batch)
-
-				continue
-			}
-
-			func() {
-				defer putBatch(batch)
-
-				processFilesInto(ctx, dh, args.relPrefix, batch.names, cfg, args.bufs, out)
-			}()
-		}
-	}()
-
-	producerWG.Wait()
-	<-workerDone
-
-	return results, allErrs
 }
 
 // ============================================================================
@@ -1704,16 +1539,6 @@ func (b *nameBatch) appendBytes(name []byte) {
 	b.names = append(b.names, b.storage[start:len(b.storage)])
 }
 
-// appendString copies a filename into the batch, appending a NUL terminator.
-//
-// name must NOT include a NUL terminator (it is added here).
-func (b *nameBatch) appendString(name string) {
-	start := len(b.storage)
-	b.storage = append(b.storage, name...)
-	b.storage = append(b.storage, 0)
-	b.names = append(b.names, b.storage[start:len(b.storage)])
-}
-
 // copyName copies a name that already includes its NUL terminator.
 // Used when transferring names between batches (e.g., pipelining).
 func (b *nameBatch) copyName(name []byte) {
@@ -1740,16 +1565,26 @@ func nameLen(name []byte) int {
 // Returns a slice WITHOUT NUL terminator (for display/string conversion).
 func appendPathBytesPrefix(buf []byte, prefix []byte, name []byte) []byte {
 	buf = buf[:0]
-	if len(prefix) > 0 {
-		buf = append(buf, prefix...)
-
-		last := prefix[len(prefix)-1]
-		if last != os.PathSeparator && last != '/' {
-			buf = append(buf, os.PathSeparator)
-		}
-	}
+	buf = appendPathPrefix(buf, prefix)
 
 	buf = append(buf, name[:nameLen(name)]...)
+
+	return buf
+}
+
+// appendPathPrefix appends prefix and a separator (if needed) to buf.
+// Caller controls buf capacity and initial length.
+func appendPathPrefix(buf []byte, prefix []byte) []byte {
+	if len(prefix) == 0 {
+		return buf
+	}
+
+	buf = append(buf, prefix...)
+
+	last := prefix[len(prefix)-1]
+	if last != os.PathSeparator && last != '/' {
+		buf = append(buf, os.PathSeparator)
+	}
 
 	return buf
 }

@@ -57,7 +57,7 @@ func Test_File_RelPath_Returns_Correct_Path_When_NonRecursive(t *testing.T) {
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, _ *fileproc.Worker) (*struct{}, error) {
 		mu.Lock()
 
-		seen[string(f.RelPath())] = true
+		seen[string(f.RelPathBorrowed())] = true
 
 		mu.Unlock()
 
@@ -99,7 +99,7 @@ func Test_File_RelPath_Returns_Correct_Path_When_Recursive(t *testing.T) {
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, _ *fileproc.Worker) (*struct{}, error) {
 		mu.Lock()
 
-		seen[string(f.RelPath())] = true
+		seen[string(f.RelPathBorrowed())] = true
 
 		mu.Unlock()
 
@@ -135,7 +135,7 @@ func Test_File_RelPath_Copy_Remains_Valid_When_Process_Returns(t *testing.T) {
 	}
 
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, _ *fileproc.Worker) (*pathHolder, error) {
-		return &pathHolder{path: string(f.RelPath())}, nil
+		return &pathHolder{path: string(f.RelPathBorrowed())}, nil
 	}, opts...)
 
 	if len(errs) != 0 {
@@ -1117,7 +1117,7 @@ func Test_Arena_Multiple_Files_Dont_Interfere_When_Sequential(t *testing.T) {
 			return nil, fmt.Errorf("test: %w", err)
 		}
 
-		return &fileData{path: string(f.RelPath()), data: data}, nil
+		return &fileData{path: string(f.RelPathBorrowed()), data: data}, nil
 	}, opts...)
 
 	if len(errs) != 0 {
@@ -1324,7 +1324,7 @@ func Test_Concurrency_Multiple_Workers_Have_Independent_WorkerBuf_When_Parallel(
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, scratch *fileproc.Worker) (*scratchResult, error) {
 		// Write file path into scratch buffer
 		buf := scratch.Buf(256)
-		buf = append(buf, f.RelPath()...)
+		buf = append(buf, f.RelPathBorrowed()...)
 
 		// Copy to result (scratch only valid during callback)
 		return &scratchResult{data: append([]byte(nil), buf...)}, nil
@@ -1348,7 +1348,6 @@ func Test_Concurrency_Multiple_Workers_Have_Independent_WorkerBuf_When_Parallel(
 		}
 
 		seen[path] = true
-
 	}
 }
 
@@ -1715,7 +1714,8 @@ func Test_Process_Returns_TopLevel_Files_And_Skips_Symlinks_When_NonRecursive(t 
 			return nil, fmt.Errorf("stat: %w", statErr)
 		}
 
-		path := string(f.RelPath())
+		path := string(f.RelPathBorrowed())
+
 		mu.Lock()
 
 		got[path] = st
@@ -1796,7 +1796,8 @@ func Test_Process_Applies_Suffix_Filter_And_Skips_Symlink_Dirs_When_Recursive(t 
 	)
 
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, _ *fileproc.Worker) (*string, error) {
-		path := string(f.RelPath())
+		path := string(f.RelPathBorrowed())
+
 		mu.Lock()
 
 		got[path] = struct{}{}
@@ -1973,7 +1974,7 @@ func Test_Process_Closes_File_Handle_When_Callback_Errors_After_Read(t *testing.
 			return nil, fmt.Errorf("read file: %w", err)
 		}
 
-		relPath := string(f.RelPath())
+		relPath := string(f.RelPathBorrowed())
 
 		exp, ok := expected[relPath]
 		if !ok {
@@ -2039,7 +2040,7 @@ func Test_Process_Silently_Skips_When_File_Becomes_Directory(t *testing.T) {
 		callCount++
 
 		// On first call for the racy file, replace it with a directory
-		if string(f.RelPath()) == "will_become_dir.txt" {
+		if string(f.RelPathBorrowed()) == "will_become_dir.txt" {
 			// Remove file and create directory with same name before reading
 			err := os.Remove(racePath)
 			if err != nil {
@@ -2103,7 +2104,7 @@ func Test_Process_Silently_Skips_When_File_Becomes_Symlink(t *testing.T) {
 		callCount++
 
 		// On the racy file, replace it with a symlink before reading
-		if string(f.RelPath()) == "will_become_symlink.txt" {
+		if string(f.RelPathBorrowed()) == "will_become_symlink.txt" {
 			// Remove file and create symlink with same name
 			err := os.Remove(racePath)
 			if err != nil {
@@ -2154,6 +2155,7 @@ func Test_Process_Returns_No_Results_When_Context_Already_Canceled(t *testing.T)
 
 	results, errs := fileproc.Process(ctx, root, func(_ *fileproc.File, _ *fileproc.Worker) (*struct{}, error) {
 		count++
+
 		return &struct{}{}, nil
 	}, fileproc.WithWorkers(1))
 
@@ -2179,6 +2181,7 @@ func Test_Process_Returns_No_Results_When_Directory_Empty(t *testing.T) {
 
 	results, errs := fileproc.Process(t.Context(), root, func(_ *fileproc.File, _ *fileproc.Worker) (*struct{}, error) {
 		count++
+
 		return &struct{}{}, nil
 	}, fileproc.WithWorkers(1))
 
@@ -2222,6 +2225,7 @@ func Test_Process_Returns_IOError_When_Path_Contains_Nul(t *testing.T) {
 
 	results, errs := fileproc.Process(t.Context(), "bad\x00path", func(_ *fileproc.File, _ *fileproc.Worker) (*struct{}, error) {
 		count++
+
 		return &struct{}{}, nil
 	})
 
@@ -2266,6 +2270,7 @@ func Test_Process_Returns_IOError_When_Path_Is_File(t *testing.T) {
 
 	results, errs := fileproc.Process(t.Context(), filePath, func(_ *fileproc.File, _ *fileproc.Worker) (*struct{}, error) {
 		count++
+
 		return &struct{}{}, nil
 	})
 
@@ -2312,6 +2317,7 @@ func Test_Process_Returns_IOError_When_Path_Is_Symlink(t *testing.T) {
 
 	results, errs := fileproc.Process(t.Context(), symPath, func(_ *fileproc.File, _ *fileproc.Worker) (*struct{}, error) {
 		count++
+
 		return &struct{}{}, nil
 	})
 
@@ -2356,7 +2362,9 @@ func Test_Process_Reports_Dot_Path_When_Root_Open_Fails(t *testing.T) {
 		return &struct{}{}, nil
 	}, fileproc.WithOnError(func(_ error, ioErrs, procErrs int) bool {
 		mu.Lock()
+
 		counts = append(counts, struct{ ioErrs, procErrs int }{ioErrs: ioErrs, procErrs: procErrs})
+
 		mu.Unlock()
 
 		return true
@@ -2423,7 +2431,9 @@ func Test_Process_Skips_Result_When_Callback_Returns_Nil(t *testing.T) {
 
 	results, errs := fileproc.Process(t.Context(), root, func(_ *fileproc.File, _ *fileproc.Worker) (*struct{}, error) {
 		count++
+
 		var result *struct{}
+
 		return result, nil
 	}, fileproc.WithWorkers(1))
 
@@ -2457,7 +2467,8 @@ func Test_Process_Processes_All_Files_When_Pipelined_Workers(t *testing.T) {
 	}
 
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, _ *fileproc.Worker) (*string, error) {
-		path := string(f.RelPath())
+		path := string(f.RelPathBorrowed())
+
 		return &path, nil
 	}, fileproc.WithWorkers(4), fileproc.WithSmallFileThreshold(1))
 
@@ -2495,10 +2506,14 @@ func Test_Process_Processes_All_Files_When_Pipelined_With_Multiple_ReadDirBatche
 	)
 
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, _ *fileproc.Worker) (*string, error) {
-		path := string(f.RelPath())
+		path := string(f.RelPathBorrowed())
+
 		mu.Lock()
+
 		seen[path]++
+
 		mu.Unlock()
+
 		return &path, nil
 	}, opts...)
 
@@ -2553,12 +2568,15 @@ func Test_Process_Reads_Content_When_Pipelined(t *testing.T) {
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, _ *fileproc.Worker) (*string, error) {
 		data, err := io.ReadAll(f)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("read: %w", err)
 		}
 
-		path := string(f.RelPath())
+		path := string(f.RelPathBorrowed())
+
 		mu.Lock()
+
 		seen[path] = string(data)
+
 		mu.Unlock()
 
 		return &path, nil
@@ -2599,8 +2617,11 @@ func Test_Process_Drops_Errors_When_OnError_Returns_False(t *testing.T) {
 		return nil, errors.New("fail")
 	}, fileproc.WithWorkers(1), fileproc.WithOnError(func(_ error, ioErrs, procErrs int) bool {
 		mu.Lock()
+
 		counts = append(counts, struct{ ioErrs, procErrs int }{ioErrs: ioErrs, procErrs: procErrs})
+
 		mu.Unlock()
+
 		return false
 	}))
 
@@ -2638,18 +2659,21 @@ func Test_Process_Continues_When_OnError_Drops_Errors(t *testing.T) {
 	)
 
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, _ *fileproc.Worker) (*string, error) {
-		path := string(f.RelPath())
+		path := string(f.RelPathBorrowed())
 		if path == "bad.txt" {
 			return nil, errors.New("fail")
 		}
 
 		mu.Lock()
+
 		paths = append(paths, path)
+
 		mu.Unlock()
 
 		return &path, nil
 	}, fileproc.WithWorkers(1), fileproc.WithOnError(func(_ error, _, _ int) bool {
 		seenErrs++
+
 		return false
 	}))
 
@@ -2681,8 +2705,11 @@ func Test_Process_OnError_Counts_Are_Cumulative_When_Multiple_Errors(t *testing.
 		return nil, errors.New("fail")
 	}, fileproc.WithWorkers(1), fileproc.WithOnError(func(_ error, ioErrs, procErrs int) bool {
 		mu.Lock()
+
 		counts = append(counts, struct{ ioErrs, procErrs int }{ioErrs: ioErrs, procErrs: procErrs})
+
 		mu.Unlock()
+
 		return true
 	}))
 
@@ -2749,7 +2776,8 @@ func Test_Process_Skips_NonRegular_When_Fifo_Present(t *testing.T) {
 	}
 
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, _ *fileproc.Worker) (*string, error) {
-		path := string(f.RelPath())
+		path := string(f.RelPathBorrowed())
+
 		return &path, nil
 	}, fileproc.WithWorkers(1))
 
@@ -2826,7 +2854,8 @@ func Test_Process_Reports_IOError_When_Subdir_Not_Readable_Recursive(t *testing.
 	})
 
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, _ *fileproc.Worker) (*string, error) {
-		path := string(f.RelPath())
+		path := string(f.RelPathBorrowed())
+
 		return &path, nil
 	}, fileproc.WithRecursive(), fileproc.WithWorkers(1), fileproc.WithSmallFileThreshold(1000))
 
@@ -3186,7 +3215,7 @@ func Test_Process_Counts_Errors_Correctly_When_Mixed_IO_And_Process_Errors_Concu
 	}
 
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, _ *fileproc.Worker) (*string, error) {
-		path := string(f.RelPath())
+		path := string(f.RelPathBorrowed())
 		if path == testBadFile {
 			return nil, sentinel
 		}
@@ -3349,7 +3378,8 @@ func Test_Process_Drops_IOErrors_When_OnError_Returns_False(t *testing.T) {
 	}
 
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, _ *fileproc.Worker) (*string, error) {
-		path := string(f.RelPath())
+		path := string(f.RelPathBorrowed())
+
 		return &path, nil
 	}, opts...)
 
@@ -3420,7 +3450,8 @@ func Test_Process_Processes_All_Files_When_Using_Recursive_Concurrent_Workers(t 
 	)
 
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, _ *fileproc.Worker) (*string, error) {
-		path := string(f.RelPath())
+		path := string(f.RelPathBorrowed())
+
 		mu.Lock()
 
 		seen[path]++
@@ -3476,7 +3507,8 @@ func Test_Process_Traverses_Subdirs_When_Using_Recursive_LargeDir_Pipelined(t *t
 	}
 
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, _ *fileproc.Worker) (*string, error) {
-		path := string(f.RelPath())
+		path := string(f.RelPathBorrowed())
+
 		return &path, nil
 	}, opts...)
 
@@ -3521,6 +3553,7 @@ func Test_Process_Does_Not_Share_DataBuffers_When_Using_Concurrent_Tree_Workers(
 	go func() {
 		_, errs = fileproc.Process(t.Context(), root, func(_ *fileproc.File, w *fileproc.Worker) (*struct{}, error) {
 			buf := w.Buf(1)
+
 			buf = buf[:cap(buf)]
 			if len(buf) == 0 {
 				return nil, errors.New("unexpected empty buffer")
@@ -3604,6 +3637,7 @@ func Test_Process_Does_Not_Share_DataBuffers_When_Using_Pipelined_Workers(t *tes
 	go func() {
 		results, errs = fileproc.Process(t.Context(), root, func(_ *fileproc.File, w *fileproc.Worker) (*struct{}, error) {
 			buf := w.Buf(1)
+
 			buf = buf[:cap(buf)]
 			if len(buf) == 0 {
 				return nil, errors.New("unexpected empty buffer")
@@ -3698,6 +3732,7 @@ func resultPaths(results []*string) []string {
 		if r == nil {
 			continue
 		}
+
 		out = append(out, *r)
 	}
 

@@ -51,14 +51,14 @@ type fileProcOut[T any] struct {
 }
 
 type dirPipelinedArgs struct {
-	dir          string
-	relPrefix    []byte
-	rh           readdirHandle
-	initial      [][]byte
-	opts         options
-	reportSubdir func(name []byte)
-	notifier     *errNotifier
-	dirBuf       []byte
+	dir           string
+	relPrefix     []byte
+	dirEnumerator readdirHandle
+	initialNames  [][]byte
+	opts          options
+	reportSubdir  func(name []byte)
+	notifier      *errNotifier
+	dirBuf        []byte
 }
 
 // ============================================================================
@@ -127,8 +127,6 @@ func processFilesInto[T any](
 	bufs *workerBufs,
 	out fileProcOut[T],
 ) {
-	getPathStr := func(relPath []byte) string { return string(relPath) }
-
 	var (
 		openFH fileHandle
 		fhOpen bool
@@ -145,6 +143,30 @@ func processFilesInto[T any](
 			panic(recovered)
 		}
 	}()
+
+	// closeIfOpen closes the current file handle and reports close errors.
+	// Converts path to string only when reporting an error.
+	closeIfOpen := func(relPath []byte) bool {
+		if !fhOpen {
+			return false
+		}
+
+		closeErr := openFH.closeHandle()
+		fhOpen = false
+
+		if closeErr != nil {
+			ioErr := &IOError{Path: string(relPath), Op: "close", Err: closeErr}
+			if cfg.notifier.ioErr(ioErr) {
+				*out.errs = append(*out.errs, ioErr)
+			}
+
+			if ctx.Err() != nil {
+				return true
+			}
+		}
+
+		return false
+	}
 
 	for _, name := range names {
 		if ctx.Err() != nil {
@@ -189,26 +211,14 @@ func processFilesInto[T any](
 				continue
 			}
 
-			procErr := &ProcessError{Path: getPathStr(relPath), Err: fnErr}
+			procErr := &ProcessError{Path: string(relPath), Err: fnErr}
 			if cfg.notifier.callbackErr(procErr) {
 				*out.errs = append(*out.errs, procErr)
 			}
 
 			// Callback may have opened file; ensure handle closed on error.
-			if fhOpen {
-				closeErr := openFH.closeHandle()
-				fhOpen = false
-
-				if closeErr != nil {
-					ioErr := &IOError{Path: getPathStr(relPath), Op: "close", Err: closeErr}
-					if cfg.notifier.ioErr(ioErr) {
-						*out.errs = append(*out.errs, ioErr)
-					}
-
-					if ctx.Err() != nil {
-						return
-					}
-				}
+			if closeIfOpen(relPath) {
+				return
 			}
 
 			if ctx.Err() != nil {
@@ -218,20 +228,8 @@ func processFilesInto[T any](
 			continue
 		}
 
-		if fhOpen {
-			closeErr := openFH.closeHandle()
-			fhOpen = false
-
-			if closeErr != nil {
-				ioErr := &IOError{Path: getPathStr(relPath), Op: "close", Err: closeErr}
-				if cfg.notifier.ioErr(ioErr) {
-					*out.errs = append(*out.errs, ioErr)
-				}
-
-				if ctx.Err() != nil {
-					return
-				}
-			}
+		if closeIfOpen(relPath) {
+			return
 		}
 
 		if val != nil {
@@ -244,89 +242,84 @@ func processFilesInto[T any](
 // PIPELINED PROCESSING (large directories)
 // ============================================================================
 
-func (p processor[T]) processDirPipelined(ctx context.Context, args *dirPipelinedArgs) ([]*T, []error) {
-	dirRel := "."
-	if len(args.relPrefix) > 0 {
-		dirRel = string(args.relPrefix)
+// pipelineArgs controls the shared pipeline runner.
+//
+// Invariants:
+//   - sharedBufs is only set when workerCount==1 (tree pipeline).
+//   - initialNames entries include a trailing NUL terminator.
+//   - queueCapacity/freeBatches sizing must be coordinated to avoid leaks.
+type pipelineArgs struct {
+	dirEnumerator readdirHandle
+	dirHandle     dirHandle
+	relPrefix     []byte
+	dirRel        string
+	initialNames  [][]byte
+	suffix        string
+	reportSubdir  func(name []byte)
+	notifier      *errNotifier
+	dirBuf        []byte
+	workerCount   int
+	queueCapacity int
+	freeBatches   chan *nameBatch
+	sharedBufs    *workerBufs
+}
+
+func pipelineSizing(workerCount int) (int, int) {
+	// Bound buffering so high worker counts can't over-allocate batches.
+	queueCap := min(workerCount*4, maxPipelineQueue)
+
+	// Needed batches: 1 (producer) + queueCap (channel buffer) + workers (in-flight).
+	numBatches := workerCount + queueCap + 1
+
+	return queueCap, numBatches
+}
+
+// batchPool wraps a free-list channel with cancellation awareness.
+type batchPool struct {
+	freeBatches chan *nameBatch
+	done        <-chan struct{}
+}
+
+func (p batchPool) get(ctx context.Context, storageCap int) *nameBatch {
+	select {
+	case batch := <-p.freeBatches:
+		batch.reset(storageCap)
+
+		return batch
+	case <-ctx.Done():
+		return nil
+	case <-p.done:
+		return nil
 	}
+}
 
-	dh, err := openDirFromReaddir(args.rh, args.dir)
-	if err != nil {
-		ioErr := &IOError{Path: dirRel, Op: "open", Err: err}
-		if args.notifier.ioErr(ioErr) {
-			return nil, []error{ioErr}
-		}
+func (p batchPool) put(batch *nameBatch) {
+	batch.reset(0)
 
-		return nil, nil
+	select {
+	case p.freeBatches <- batch:
+	default:
 	}
+}
 
-	relPrefix := args.relPrefix
-	rh := args.rh
-	initial := args.initial
-	opts := args.opts
-	reportSubdir := args.reportSubdir
-	notifier := args.notifier
-	dirBuf := args.dirBuf
-
+func (p processor[T]) runDirPipeline(ctx context.Context, args *pipelineArgs) ([]*T, []error) {
+	// Shared pipeline runner for large directories.
+	// Producer enumerates entries into batches; workers drain batches.
+	// freeBatches provides bounded batch reuse to avoid allocations.
 	cfg := fileProcCfg[T]{
 		fn:       p.fn,
-		notifier: notifier,
+		notifier: args.notifier,
 	}
 
-	// Buffering between the readdir producer and workers is bounded to avoid
-	// excessive memory usage when Workers is set very high.
-	queueCap := min(opts.Workers*4, maxPipelineQueue)
+	batchCh := make(chan *nameBatch, args.queueCapacity)
+	// Producer errors are collected by the producer goroutine and merged later.
+	producerErrs := make([]error, 0, 1)
 
-	// Needed batches: 1 (producer) + queueCap (channel buffer) + Workers (in-flight).
-	numBatches := opts.Workers + queueCap + 1
-
-	freeBatches := make(chan *nameBatch, numBatches)
-	for range numBatches {
-		freeBatches <- &nameBatch{}
-	}
-
-	nameCh := make(chan *nameBatch, queueCap)
-
-	var (
-		mu      sync.Mutex
-		results []*T
-		allErrs []error
-	)
-
-	addErr := func(err error) {
-		if err == nil {
-			return
-		}
-
-		mu.Lock()
-
-		allErrs = append(allErrs, err)
-
-		mu.Unlock()
-	}
-
+	// workersDone lets producer/batch-pool exit cleanly when workers stop.
 	workersDone := make(chan struct{})
-
-	getBatch := func(storageCap int) *nameBatch {
-		select {
-		case batch := <-freeBatches:
-			batch.reset(storageCap)
-
-			return batch
-		case <-ctx.Done():
-			return nil
-		case <-workersDone:
-			return nil
-		}
-	}
-
-	putBatch := func(batch *nameBatch) {
-		batch.reset(0)
-
-		select {
-		case freeBatches <- batch:
-		default:
-		}
+	pool := batchPool{
+		freeBatches: args.freeBatches,
+		done:        workersDone,
 	}
 
 	sendBatch := func(batch *nameBatch) bool {
@@ -335,20 +328,20 @@ func (p processor[T]) processDirPipelined(ctx context.Context, args *dirPipeline
 		}
 
 		if len(batch.names) == 0 {
-			putBatch(batch)
+			pool.put(batch)
 
 			return true
 		}
 
 		select {
-		case nameCh <- batch:
+		case batchCh <- batch:
 			return true
 		case <-ctx.Done():
-			putBatch(batch)
+			pool.put(batch)
 
 			return false
 		case <-workersDone:
-			putBatch(batch)
+			pool.put(batch)
 
 			return false
 		}
@@ -357,17 +350,17 @@ func (p processor[T]) processDirPipelined(ctx context.Context, args *dirPipeline
 	var producerWG sync.WaitGroup
 
 	producerWG.Go(func() {
-		defer close(nameCh)
+		defer close(batchCh)
 
-		storageCap := cap(dirBuf) * 2
+		storageCap := cap(args.dirBuf) * 2
 
-		if len(initial) > 0 {
-			batch := getBatch(storageCap)
+		if len(args.initialNames) > 0 {
+			batch := pool.get(ctx, storageCap)
 			if batch == nil {
 				return
 			}
 
-			for _, n := range initial {
+			for _, n := range args.initialNames {
 				batch.copyName(n)
 			}
 
@@ -381,12 +374,12 @@ func (p processor[T]) processDirPipelined(ctx context.Context, args *dirPipeline
 				return
 			}
 
-			batch := getBatch(storageCap)
+			batch := pool.get(ctx, storageCap)
 			if batch == nil {
 				return
 			}
 
-			err := readDirBatch(rh, dirBuf[:cap(dirBuf)], opts.Suffix, batch, reportSubdir)
+			err := readDirBatch(args.dirEnumerator, args.dirBuf[:cap(args.dirBuf)], args.suffix, batch, args.reportSubdir)
 
 			if !sendBatch(batch) {
 				return
@@ -400,65 +393,68 @@ func (p processor[T]) processDirPipelined(ctx context.Context, args *dirPipeline
 				return
 			}
 
-			ioErr := &IOError{Path: dirRel, Op: "readdir", Err: err}
-			if notifier.ioErr(ioErr) {
-				addErr(ioErr)
+			ioErr := &IOError{Path: args.dirRel, Op: "readdir", Err: err}
+			if args.notifier.ioErr(ioErr) {
+				// Producer errors are single-threaded; collect and merge after wait.
+				producerErrs = append(producerErrs, ioErr)
 			}
 
 			return
 		}
 	})
 
-	worker := func() {
-		pathBufCap := len(relPrefix) + pathBufExtra
+	// Per-worker slices avoid lock contention on hot paths.
+	workerResults := make([][]*T, 0, args.workerCount)
 
-		bufs := &workerBufs{
-			pathBuf: make([]byte, 0, pathBufCap),
-			// dataBuf, dataArena, worker.buf start zero-valued, grow as needed.
+	workerErrs := make([][]error, 0, args.workerCount)
+	for range args.workerCount {
+		workerResults = append(workerResults, nil)
+		workerErrs = append(workerErrs, nil)
+	}
+
+	worker := func(workerID int) {
+		// sharedBufs is only safe when workerCount==1 (tree pipeline).
+		bufs := args.sharedBufs
+		if bufs == nil {
+			pathBufCap := len(args.relPrefix) + pathBufExtra
+			bufs = &workerBufs{
+				pathBuf: make([]byte, 0, pathBufCap),
+				// dataBuf, dataArena, worker.buf start zero-valued, grow as needed.
+			}
 		}
 
 		localResults := make([]*T, 0, 64)
-
-		var localErrs []error
-
-		defer func() {
-			mu.Lock()
-
-			results = append(results, localResults...)
-			allErrs = append(allErrs, localErrs...)
-
-			mu.Unlock()
-		}()
-
+		localErrs := make([]error, 0, 32)
 		out := fileProcOut[T]{results: &localResults, errs: &localErrs}
 
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case batch, ok := <-nameCh:
-				if !ok {
-					return
-				}
+		// Drain batches even after cancellation to return them to the pool.
+		for batch := range batchCh {
+			if ctx.Err() != nil {
+				pool.put(batch)
 
-				func() {
-					defer putBatch(batch)
-
-					processFilesInto(ctx, dh, relPrefix, batch.names, cfg, bufs, out)
-				}()
+				continue
 			}
+
+			func() {
+				defer pool.put(batch)
+
+				processFilesInto(ctx, args.dirHandle, args.relPrefix, batch.names, cfg, bufs, out)
+			}()
 		}
+
+		workerResults[workerID] = localResults
+		workerErrs[workerID] = localErrs
 	}
 
 	var wg sync.WaitGroup
-	wg.Add(opts.Workers)
+	wg.Add(args.workerCount)
 
-	for range opts.Workers {
-		go func() {
+	for workerID := range args.workerCount {
+		go func(id int) {
 			defer wg.Done()
 
-			worker()
-		}()
+			worker(id)
+		}(workerID)
 	}
 
 	go func() {
@@ -469,5 +465,79 @@ func (p processor[T]) processDirPipelined(ctx context.Context, args *dirPipeline
 	producerWG.Wait()
 	wg.Wait()
 
+	// Merge per-worker results/errors without lock contention.
+	totalResults := 0
+	for i := range args.workerCount {
+		totalResults += len(workerResults[i])
+	}
+
+	results := make([]*T, 0, totalResults)
+	for i := range args.workerCount {
+		results = append(results, workerResults[i]...)
+	}
+
+	totalErrs := 0
+	for i := range args.workerCount {
+		totalErrs += len(workerErrs[i])
+	}
+
+	totalErrs += len(producerErrs)
+
+	allErrs := make([]error, 0, totalErrs)
+	for i := range args.workerCount {
+		allErrs = append(allErrs, workerErrs[i]...)
+	}
+
+	if len(producerErrs) > 0 {
+		allErrs = append(allErrs, producerErrs...)
+	}
+
 	return results, allErrs
+}
+
+func (p processor[T]) processDirPipelined(ctx context.Context, args *dirPipelinedArgs) ([]*T, []error) {
+	dirRel := "."
+	if len(args.relPrefix) > 0 {
+		dirRel = string(args.relPrefix)
+	}
+
+	dh, err := openDirFromReaddir(args.dirEnumerator, args.dir)
+	if err != nil {
+		ioErr := &IOError{Path: dirRel, Op: "open", Err: err}
+		if args.notifier.ioErr(ioErr) {
+			return nil, []error{ioErr}
+		}
+
+		return nil, nil
+	}
+
+	relPrefix := args.relPrefix
+	dirEnumerator := args.dirEnumerator
+	initialNames := args.initialNames
+	opts := args.opts
+	reportSubdir := args.reportSubdir
+	notifier := args.notifier
+	dirBuf := args.dirBuf
+
+	queueCap, numBatches := pipelineSizing(opts.Workers)
+
+	freeBatches := make(chan *nameBatch, numBatches)
+	for range numBatches {
+		freeBatches <- &nameBatch{}
+	}
+
+	return p.runDirPipeline(ctx, &pipelineArgs{
+		dirEnumerator: dirEnumerator,
+		dirHandle:     dh,
+		relPrefix:     relPrefix,
+		dirRel:        dirRel,
+		initialNames:  initialNames,
+		suffix:        opts.Suffix,
+		reportSubdir:  reportSubdir,
+		notifier:      notifier,
+		dirBuf:        dirBuf,
+		workerCount:   opts.Workers,
+		queueCapacity: queueCap,
+		freeBatches:   freeBatches,
+	})
 }

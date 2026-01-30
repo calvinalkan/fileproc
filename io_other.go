@@ -25,6 +25,15 @@ import (
 	"syscall"
 )
 
+// appendString copies a filename into the batch, appending a NUL terminator.
+// Non-Linux backends use string names from os.File.ReadDir.
+func (b *nameBatch) appendString(name string) {
+	start := len(b.storage)
+	b.storage = append(b.storage, name...)
+	b.storage = append(b.storage, 0)
+	b.names = append(b.names, b.storage[start:len(b.storage)])
+}
+
 const readDirBatchSize = 4096
 
 // ============================================================================
