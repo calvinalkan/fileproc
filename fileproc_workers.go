@@ -50,15 +50,29 @@ type fileProcOut[T any] struct {
 	errs    *[]error
 }
 
-type dirPipelinedArgs struct {
-	dir           string
+type dirPipelineArgs struct {
+	// One of dirPath or dirPathBytes must be set for openDirFromReaddir.
+	// dirPathBytes is NUL-terminated (tree traversal).
+	dirPath      string
+	dirPathBytes []byte
+
 	relPrefix     []byte
 	dirEnumerator readdirHandle
 	initialNames  [][]byte
-	opts          options
+	suffix        string
 	reportSubdir  func(name []byte)
 	notifier      *errNotifier
 	dirBuf        []byte
+
+	// workerCount/queueCapacity define pipeline sizing.
+	// If queueCapacity is zero and freeBatches is nil, we compute sizing from workerCount.
+	workerCount   int
+	queueCapacity int
+
+	// Optional: reuse pre-allocated batches/buffers (tree pipeline).
+	// sharedBufs requires workerCount==1 and an exclusive caller (tree worker).
+	freeBatches chan *nameBatch
+	sharedBufs  *workerBufs
 }
 
 // ============================================================================
@@ -495,13 +509,25 @@ func (p processor[T]) runDirPipeline(ctx context.Context, args *pipelineArgs) ([
 	return results, allErrs
 }
 
-func (p processor[T]) processDirPipelined(ctx context.Context, args *dirPipelinedArgs) ([]*T, []error) {
+func (args *dirPipelineArgs) openDirPath() string {
+	if args.dirPath != "" {
+		return args.dirPath
+	}
+
+	if len(args.dirPathBytes) > 0 {
+		return pathStr(args.dirPathBytes)
+	}
+
+	return ""
+}
+
+func (p processor[T]) processDirPipelined(ctx context.Context, args *dirPipelineArgs) ([]*T, []error) {
 	dirRel := "."
 	if len(args.relPrefix) > 0 {
 		dirRel = string(args.relPrefix)
 	}
 
-	dh, err := openDirFromReaddir(args.dirEnumerator, args.dir)
+	dh, err := openDirFromReaddir(args.dirEnumerator, args.openDirPath())
 	if err != nil {
 		ioErr := &IOError{Path: dirRel, Op: "open", Err: err}
 		if args.notifier.ioErr(ioErr) {
@@ -511,33 +537,49 @@ func (p processor[T]) processDirPipelined(ctx context.Context, args *dirPipeline
 		return nil, nil
 	}
 
-	relPrefix := args.relPrefix
-	dirEnumerator := args.dirEnumerator
-	initialNames := args.initialNames
-	opts := args.opts
-	reportSubdir := args.reportSubdir
-	notifier := args.notifier
-	dirBuf := args.dirBuf
+	workerCount := args.workerCount
+	if workerCount <= 0 {
+		// Defensive: callers should always set this (opts.Workers or 1 for tree).
+		workerCount = 1
+	}
 
-	queueCap, numBatches := pipelineSizing(opts.Workers)
+	queueCap := args.queueCapacity
+	freeBatches := args.freeBatches
 
-	freeBatches := make(chan *nameBatch, numBatches)
-	for range numBatches {
-		freeBatches <- &nameBatch{}
+	// If caller didn't supply a batch pool, allocate a new one sized for this pipeline.
+	if freeBatches == nil {
+		var numBatches int
+		if queueCap == 0 {
+			queueCap, numBatches = pipelineSizing(workerCount)
+		} else {
+			numBatches = workerCount + queueCap + 1
+		}
+
+		freeBatches = make(chan *nameBatch, numBatches)
+		for range numBatches {
+			freeBatches <- &nameBatch{}
+		}
+	} else if queueCap == 0 {
+		// Derive queue capacity from the provided pool size.
+		// This keeps queue sizing and pool sizing consistent.
+		queueCap = max(cap(freeBatches)-workerCount-1, 0)
 	}
 
 	return p.runDirPipeline(ctx, &pipelineArgs{
-		dirEnumerator: dirEnumerator,
+		dirEnumerator: args.dirEnumerator,
 		dirHandle:     dh,
-		relPrefix:     relPrefix,
+		relPrefix:     args.relPrefix,
 		dirRel:        dirRel,
-		initialNames:  initialNames,
-		suffix:        opts.Suffix,
-		reportSubdir:  reportSubdir,
-		notifier:      notifier,
-		dirBuf:        dirBuf,
-		workerCount:   opts.Workers,
+		initialNames:  args.initialNames,
+		suffix:        args.suffix,
+		reportSubdir:  args.reportSubdir,
+		notifier:      args.notifier,
+		dirBuf:        args.dirBuf,
+		workerCount:   workerCount,
 		queueCapacity: queueCap,
 		freeBatches:   freeBatches,
+		// sharedBufs is only set by tree traversal where the worker is blocked
+		// on this call and workerCount==1, so reuse is safe.
+		sharedBufs: args.sharedBufs,
 	})
 }

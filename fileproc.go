@@ -107,7 +107,7 @@ type Stat struct {
 	Inode   uint64
 }
 
-// File provides access to a file being processed by Process.
+// File provides access to a file being processed by [Process].
 //
 // All methods are lazy: the underlying file is opened on first content access
 // (Bytes, Read, or Fd). The handle is owned by fileproc and closed after the
@@ -662,7 +662,7 @@ func Process[T any](ctx context.Context, path string, fn ProcessFunc[T], opts ..
 	proc := processor[T]{fn: fn}
 
 	if cfg.Recursive {
-		return proc.processRecursive(ctx, path, cfg, notifier)
+		return proc.processTree(ctx, path, cfg, notifier)
 	}
 
 	return proc.processDir(ctx, path, cfg, notifier)
@@ -719,15 +719,16 @@ func (p processor[T]) processDir(
 	}
 
 	if exceedsSmallFileTreshold {
-		return p.processDirPipelined(ctx, &dirPipelinedArgs{
-			dir:           dir,
+		return p.processDirPipelined(ctx, &dirPipelineArgs{
+			dirPath:       dir,
 			relPrefix:     nil,
 			dirEnumerator: dirEnumerator,
 			initialNames:  batch.names,
-			opts:          opts,
+			suffix:        opts.Suffix,
 			reportSubdir:  nil,
 			notifier:      notifier,
 			dirBuf:        dirBuf[:cap(dirBuf)],
+			workerCount:   opts.Workers,
 		})
 	}
 
@@ -750,23 +751,6 @@ func (p processor[T]) processDir(
 	}
 
 	return results, errs
-}
-
-// ============================================================================
-// RECURSIVE: TREE PROCESSING
-// ============================================================================
-
-// processRecursive processes files in a directory tree.
-//
-// Entry point for recursive mode. The root directory is processed like any
-// other directory job by the tree workers.
-func (p processor[T]) processRecursive(
-	ctx context.Context,
-	root string,
-	opts options,
-	notifier *errNotifier,
-) ([]*T, []error) {
-	return p.processTree(ctx, root, opts, notifier)
 }
 
 // processTree processes a directory tree with parallel workers.
@@ -1021,6 +1005,13 @@ func (p processor[T]) processTree(
 			// dataBuf, dataArena, worker.buf start zero-valued, grow as needed.
 		}
 
+		// Workers=1: parallelism is across directories, not within each one.
+		dirOpts := options{
+			Workers:            1,
+			SmallFileThreshold: opts.SmallFileThreshold,
+			Suffix:             opts.Suffix,
+			OnError:            opts.OnError,
+		}
 		// Pre-allocate batches for pipelining large directories.
 		// Uses channel-as-freelist pattern (see fileproc_workers.go).
 		//
@@ -1032,14 +1023,8 @@ func (p processor[T]) processTree(
 		for range pipelineBatchCount {
 			freeBatches <- &nameBatch{}
 		}
-
-		// Workers=1: parallelism is across directories, not within each one.
-		dirOpts := options{
-			Workers:            1,
-			SmallFileThreshold: opts.SmallFileThreshold,
-			Suffix:             opts.Suffix,
-			OnError:            opts.OnError,
-		}
+		// Keep queue capacity in sync with pipelineBatchCount sizing.
+		pipelineQueueCap := pipelineBatchCount - dirOpts.Workers - 1
 
 		// ====================================================================
 		// MAIN WORK LOOP: Process directories until coordinator closes jobs
@@ -1145,16 +1130,20 @@ func (p processor[T]) processTree(
 
 				// Large directory? Switch to pipelined processing.
 				if large {
-					dirResults, dirErrs := p.processDirPipelinedWithBatches(ctx, &treeDirPipelinedArgs{
-						dir:           job.abs,
+					// Reuse the tree worker's buffers and batch pool to avoid allocations.
+					dirResults, dirErrs := p.processDirPipelined(ctx, &dirPipelineArgs{
+						dirPathBytes:  job.abs,
 						relPrefix:     job.rel,
 						dirEnumerator: dirEnumerator,
 						initialNames:  bufs.batch.names,
-						opts:          dirOpts,
+						suffix:        dirOpts.Suffix,
 						reportSubdir:  reportSubdir,
 						notifier:      notifier,
-						bufs:          bufs,
+						dirBuf:        bufs.dirBuf,
+						workerCount:   dirOpts.Workers,
+						queueCapacity: pipelineQueueCap,
 						freeBatches:   freeBatches,
+						sharedBufs:    bufs,
 					})
 					if len(dirErrs) > 0 {
 						workerErrs[workerID] = append(workerErrs[workerID], dirErrs...)
@@ -1291,72 +1280,6 @@ func readDirUntilThresholdOrEOF(ctx context.Context, dirEnumerator readdirHandle
 	}
 }
 
-// processDirPipelinedWithBatches handles large directories within tree traversal.
-//
-// WHY A SEPARATE FUNCTION FROM processDirPipelined?
-//
-// In tree traversal, each tree worker already owns buffers. When that worker
-// encounters a large directory (>1500 files), we want to pipeline within
-// that directory without allocating new buffers.
-//
-// This function borrows the tree worker's buffers and freeBatches channel.
-// Since we use Workers=1 for within-directory processing (parallelism is
-// across directories, not within), there's no conflict - the tree worker
-// is blocked waiting for this function to return.
-//
-// BUFFER REUSE GUARANTEE:
-//
-// The tree worker's buffers are safe to reuse here because:
-//  1. Tree worker is blocked on this call (synchronous from its perspective)
-//  2. Workers=1 means single file processor, no concurrent buffer access
-//  3. freeBatches channel provides bounded, reusable batch storage
-type treeDirPipelinedArgs struct {
-	dir           []byte
-	relPrefix     []byte
-	dirEnumerator readdirHandle
-	initialNames  [][]byte
-	opts          options
-	reportSubdir  func(name []byte)
-	notifier      *errNotifier
-	bufs          *workerBufs
-	freeBatches   chan *nameBatch
-}
-
-func (p processor[T]) processDirPipelinedWithBatches(ctx context.Context, args *treeDirPipelinedArgs) ([]*T, []error) {
-	dirRel := "."
-	if len(args.relPrefix) > 0 {
-		dirRel = string(args.relPrefix)
-	}
-
-	dh, err := openDirFromReaddir(args.dirEnumerator, pathStr(args.dir))
-	if err != nil {
-		ioErr := &IOError{Path: dirRel, Op: "open", Err: err}
-		if args.notifier.ioErr(ioErr) {
-			return nil, []error{ioErr}
-		}
-
-		return nil, nil
-	}
-
-	// Tree workers already own buffers and a batch pool; reuse them here to
-	// avoid per-directory allocations. workerCount must stay 1 to keep this safe.
-	return p.runDirPipeline(ctx, &pipelineArgs{
-		dirEnumerator: args.dirEnumerator,
-		dirHandle:     dh,
-		relPrefix:     args.relPrefix,
-		dirRel:        dirRel,
-		initialNames:  args.initialNames,
-		suffix:        args.opts.Suffix,
-		reportSubdir:  args.reportSubdir,
-		notifier:      args.notifier,
-		dirBuf:        args.bufs.dirBuf,
-		workerCount:   1,
-		queueCapacity: 4,
-		freeBatches:   args.freeBatches,
-		sharedBufs:    args.bufs,
-	})
-}
-
 // ============================================================================
 // nameBatch: Arena-Style Allocation for Directory Entries
 // ============================================================================
@@ -1372,7 +1295,7 @@ func (p processor[T]) processDirPipelinedWithBatches(ctx context.Context, args *
 //	for _, entry := range dirEntries {
 //	    names = append(names, entry.Name())  // ALLOCATES for each file!
 //	}
-//
+
 // For a directory with 1000 files, this causes 1000+ allocations. When
 // processing thousands of directories, allocation overhead dominates.
 //
