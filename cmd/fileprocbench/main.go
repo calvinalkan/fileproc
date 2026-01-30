@@ -8,6 +8,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"runtime"
 	"runtime/debug"
@@ -57,7 +58,6 @@ var errMissingFrontmatterID = errors.New("missing frontmatter/id")
 const (
 	processFrontmatter = "frontmatter"
 	processNoop        = "noop"
-	processLazy        = "lazy"
 )
 
 type benchFlags struct {
@@ -83,9 +83,9 @@ func parseFlags() *benchFlags {
 
 	flag.StringVar(&flags.dir, "dir", "", "directory to scan")
 	flag.BoolVar(&flags.tree, "tree", false, "scan recursively")
-	flag.StringVar(&flags.process, "process", "frontmatter", "process mode: frontmatter | noop | lazy")
+	flag.StringVar(&flags.process, "process", "frontmatter", "process mode: frontmatter | noop")
 	flag.StringVar(&flags.suffix, "suffix", ".md", "file suffix filter (empty = all files)")
-	flag.IntVar(&flags.readSize, "read", 2048, "bytes to read per file (prefix only)")
+	flag.IntVar(&flags.readSize, "read", 2048, "bytes to read per file (frontmatter only)")
 	flag.IntVar(&flags.workers, "workers", 0, "worker count (0=auto)")
 	flag.IntVar(&flags.repeat, "repeat", 1, "repeat the scan N times per invocation")
 	flag.IntVar(&flags.gcPercent, "gc", -1, "if >=0, call debug.SetGCPercent(gc)")
@@ -165,21 +165,25 @@ func run(flags *benchFlags) int {
 	ctx, cancel := context.WithCancelCause(context.Background())
 	defer cancel(nil)
 
-	opts := fileproc.Options{
-		Workers:   flags.workers,
-		ReadSize:  flags.readSize,
-		Suffix:    flags.suffix,
-		Recursive: flags.tree,
-		OnError: func(err error, _, _ int) bool {
+	opts := []fileproc.Option{
+		fileproc.WithSuffix(flags.suffix),
+		fileproc.WithOnError(func(err error, _, _ int) bool {
 			// Benchmarks should never error; stop as quickly as possible.
 			cancel(err)
 
 			return true
-		},
+		}),
 	}
 
-	processFn := makeProcessFn(selectedProcess)
-	lazyFn := makeLazyFn(selectedProcess, flags.readSize)
+	if flags.tree {
+		opts = append(opts, fileproc.WithRecursive())
+	}
+
+	if flags.workers != 0 {
+		opts = append(opts, fileproc.WithWorkers(flags.workers))
+	}
+
+	processFn := makeProcessFn(selectedProcess, flags.readSize)
 
 	var visited uint64
 
@@ -187,16 +191,11 @@ func run(flags *benchFlags) int {
 
 	for range flags.repeat {
 		var (
-			results []fileproc.Result[struct{}]
+			results []*struct{}
 			errs    []error
 		)
 
-		switch selectedProcess {
-		case processLazy:
-			results, errs = fileproc.ProcessLazy(ctx, flags.dir, lazyFn, opts)
-		default:
-			results, errs = fileproc.Process(ctx, flags.dir, processFn, opts)
-		}
+		results, errs = fileproc.Process(ctx, flags.dir, processFn, opts...)
 
 		// In benchmarks we never expect errors.
 		if len(errs) > 0 {
@@ -335,53 +334,28 @@ func run(flags *benchFlags) int {
 func parseProcess(processFlag string) (string, error) {
 	processName := strings.ToLower(strings.TrimSpace(processFlag))
 	switch processName {
-	case processFrontmatter, processNoop, processLazy:
+	case processFrontmatter, processNoop:
 		return processName, nil
 	default:
-		return "", fmt.Errorf("invalid -process %q (expected: frontmatter | noop | lazy)", processFlag)
+		return "", fmt.Errorf("invalid -process %q (expected: frontmatter | noop)", processFlag)
 	}
 }
 
-func makeProcessFn(process string) fileproc.ProcessFunc[struct{}] {
+func makeProcessFn(process string, readSize int) fileproc.ProcessFunc[struct{}] {
 	var one struct{}
 
 	switch process {
 	case processNoop:
-		return func(_ []byte, _ []byte) (*struct{}, error) {
+		return func(_ *fileproc.File, _ *fileproc.Worker) (*struct{}, error) {
 			return &one, nil
 		}
 	case processFrontmatter:
-		return func(_ []byte, data []byte) (*struct{}, error) {
-			if !hasFrontMatterAndID(data) {
-				return nil, errMissingFrontmatterID
-			}
-
-			return &one, nil
-		}
-	default:
-		// parseProcess guards against unexpected values; keep a clear error in case
-		// of internal misuse.
-		return func(_ []byte, _ []byte) (*struct{}, error) {
-			return nil, fmt.Errorf("unknown process mode: %s", process)
-		}
-	}
-}
-
-func makeLazyFn(process string, readSize int) fileproc.ProcessLazyFunc[struct{}] {
-	var one struct{}
-
-	switch process {
-	case processLazy:
-		// Pre-allocate buffer outside callback - reused across files per worker
-		// Note: ProcessLazy provides Scratch for this, but we use a simple buffer
-		// here to match frontmatter's prefix-read behavior exactly.
-		return func(f *fileproc.File, scratch *fileproc.Scratch) (*struct{}, error) {
-			// Read same prefix as frontmatter mode (no stat syscall)
-			buf := scratch.Get(readSize)
+		return func(f *fileproc.File, scratch *fileproc.Worker) (*struct{}, error) {
+			buf := scratch.Buf(readSize)
 			buf = buf[:cap(buf)]
 
 			n, err := f.Read(buf)
-			if err != nil && err.Error() != "EOF" {
+			if err != nil && !errors.Is(err, io.EOF) {
 				return nil, fmt.Errorf("read: %w", err)
 			}
 
@@ -393,7 +367,9 @@ func makeLazyFn(process string, readSize int) fileproc.ProcessLazyFunc[struct{}]
 			return &one, nil
 		}
 	default:
-		return func(_ *fileproc.File, _ *fileproc.Scratch) (*struct{}, error) {
+		// parseProcess guards against unexpected values; keep a clear error in case
+		// of internal misuse.
+		return func(_ *fileproc.File, _ *fileproc.Worker) (*struct{}, error) {
 			return nil, fmt.Errorf("unknown process mode: %s", process)
 		}
 	}

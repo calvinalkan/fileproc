@@ -1,9 +1,7 @@
 package fileproc
 
-// fileproc_workers.go contains the worker pool and pipeline orchestration shared
-// by both public APIs:
-//   - [Process]       (prefix-bytes API)
-//   - [ProcessReader] (streaming reader API)
+// fileproc_workers.go contains the worker pool and pipeline orchestration
+// used by [Process].
 //
 // This file has no build tags - it works on all platforms by calling into
 // platform-specific I/O functions (openDir, openFile, etc.).
@@ -17,19 +15,18 @@ package fileproc
 //	│ ALLOCATION HIERARCHY                                                    │
 //	├─────────────────────────────────────────────────────────────────────────┤
 //	│                                                                         │
-//	│  Process()/ProcessReader()           ← Entry points                      │
+//	│  Process()                      ← Entry point                           │
 //	│    │                                                                    │
-//	│    ├─► processDir()                  ← Allocates: dirBuf, batch          │
+//	│    ├─► processDir()                  ← Allocates: dirBuf, batch         │
 //	│    │     │                                                              │
-//	│    │     ├─► processFilesSequential() ← Allocates: pathBuf + (readBuf OR │
-//	│    │     │                                probeBuf)                     │
+//	│    │     ├─► processFilesSequential() ← Allocates: pathBuf              │
 //	│    │     │     └─► processFilesInto()   ← Uses passed buffers           │
 //	│    │     │                                                              │
 //	│    │     └─► processDirPipelined()   ← Allocates: freeBatches channel   │
 //	│    │           ├─► producer            ← Uses passed dirBuf             │
 //	│    │           └─► workers             ← Each allocates per-worker bufs │
 //	│    │                                                                    │
-//	│    └─► processTree()                 ← Allocates: per-worker result slices│
+//	│    └─► processTree()                 ← Allocates: per-worker bufs slices│
 //	│          │                                                              │
 //	│          └─► [N tree workers]        ← Each allocates ALL buffers once  │
 //	│                └─► processFilesInto()  ← Uses worker's buffers          │
@@ -41,22 +38,15 @@ import (
 	"errors"
 	"io"
 	"sync"
-	"syscall"
 )
 
 type fileProcCfg[T any] struct {
-	kind procKind
-
-	fnBytes  ProcessFunc[T]
-	fnReader ProcessReaderFunc[T]
-	fnLazy   ProcessLazyFunc[T]
-
-	notifier       *errNotifier
-	copyResultPath bool
+	fn       ProcessFunc[T]
+	notifier *errNotifier
 }
 
 type fileProcOut[T any] struct {
-	results *[]Result[T]
+	results *[]*T
 	errs    *[]error
 }
 
@@ -65,7 +55,7 @@ type dirPipelinedArgs struct {
 	relPrefix    []byte
 	rh           readdirHandle
 	initial      [][]byte
-	opts         Options
+	opts         options
 	reportSubdir func(name []byte)
 	notifier     *errNotifier
 	dirBuf       []byte
@@ -80,9 +70,8 @@ func (p processor[T]) processFilesSequential(
 	dir string,
 	relPrefix []byte,
 	names [][]byte,
-	opts Options,
 	notifier *errNotifier,
-) ([]Result[T], []error) {
+) ([]*T, []error) {
 	dirPath := pathWithNul(dir)
 
 	dh, err := openDir(dirPath)
@@ -103,42 +92,18 @@ func (p processor[T]) processFilesSequential(
 	defer func() { _ = dh.closeHandle() }()
 
 	pathBufCap := len(relPrefix) + pathBufExtra
-	pathArenaCap := len(names) * 30
-
-	var bufs *workerBufs
-
-	switch p.kind {
-	case procKindBytes:
-		bufs = &workerBufs{
-			readBuf:   make([]byte, opts.ReadSize),
-			pathBuf:   make([]byte, 0, pathBufCap),
-			pathArena: make([]byte, 0, pathArenaCap),
-		}
-	case procKindReader:
-		bufs = &workerBufs{
-			probeBuf:  make([]byte, readerProbeSize),
-			pathBuf:   make([]byte, 0, pathBufCap),
-			pathArena: make([]byte, 0, pathArenaCap),
-		}
-	case procKindLazy:
-		bufs = &workerBufs{
-			pathBuf:   make([]byte, 0, pathBufCap),
-			pathArena: make([]byte, 0, pathArenaCap),
-			// dataBuf, dataArena, scratchBuf start zero-valued, grow as needed.
-		}
+	bufs := &workerBufs{
+		pathBuf: make([]byte, 0, pathBufCap),
+		// dataBuf, dataArena, worker.buf start zero-valued, grow as needed.
 	}
 
-	results := make([]Result[T], 0, len(names))
+	results := make([]*T, 0, len(names))
 
 	var allErrs []error
 
 	cfg := fileProcCfg[T]{
-		kind:           p.kind,
-		fnBytes:        p.fnBytes,
-		fnReader:       p.fnReader,
-		fnLazy:         p.fnLazy,
-		notifier:       notifier,
-		copyResultPath: opts.CopyResultPath,
+		fn:       p.fn,
+		notifier: notifier,
 	}
 
 	out := fileProcOut[T]{results: &results, errs: &allErrs}
@@ -153,8 +118,6 @@ func (p processor[T]) processFilesSequential(
 // ============================================================================
 
 // processFilesInto is the innermost processing loop.
-// It is shared by both APIs; the only behavioral difference is selected by
-// cfg.kind (prefix-bytes vs streaming reader).
 func processFilesInto[T any](
 	ctx context.Context,
 	dh dirHandle,
@@ -164,36 +127,6 @@ func processFilesInto[T any](
 	bufs *workerBufs,
 	out fileProcOut[T],
 ) {
-	appendToArena := func(path []byte) []byte {
-		start := len(bufs.pathArena)
-		bufs.pathArena = append(bufs.pathArena, path...)
-
-		return bufs.pathArena[start:len(bufs.pathArena)]
-	}
-
-	var storedPath []byte
-
-	getPath := func(relPath []byte, name []byte) []byte {
-		if storedPath != nil {
-			return storedPath
-		}
-
-		var src []byte
-		if len(relPrefix) > 0 {
-			src = relPath
-		} else {
-			src = name[:nameLen(name)]
-		}
-
-		if cfg.copyResultPath {
-			storedPath = append([]byte(nil), src...)
-		} else {
-			storedPath = appendToArena(src)
-		}
-
-		return storedPath
-	}
-
 	getPathStr := func(relPath []byte) string { return string(relPath) }
 
 	var (
@@ -222,8 +155,6 @@ func processFilesInto[T any](
 			continue
 		}
 
-		storedPath = nil
-
 		var relPath []byte
 
 		if len(relPrefix) > 0 {
@@ -233,66 +164,37 @@ func processFilesInto[T any](
 			relPath = name[:nameLen(name)]
 		}
 
-		if cfg.kind == procKindLazy {
-			// Reset scratch buffer for this file (len=0, preserve capacity).
-			bufs.scratchBuf = bufs.scratchBuf[:0]
+		bufs.worker.buf = bufs.worker.buf[:0]
 
-			// Store relPath in arena for File.RelPath() to return.
-			arenaRelPath := appendToArena(relPath)
+		// Reuse File struct from workerBufs to avoid per-file heap allocation.
+		bufs.file = File{
+			dh:        dh,
+			name:      name,
+			relPath:   relPath,
+			fh:        &openFH,
+			fhOpen:    &fhOpen,
+			dataBuf:   &bufs.dataBuf,
+			dataArena: &bufs.dataArena,
+		}
 
-			// Reuse File struct from workerBufs to avoid per-file heap allocation.
-			bufs.file = File{
-				dh:        dh,
-				name:      name,
-				relPath:   arenaRelPath,
-				fh:        &openFH,
-				fhOpen:    &fhOpen,
-				dataBuf:   &bufs.dataBuf,
-				dataArena: &bufs.dataArena,
-			}
-			bufs.scratch.buf = &bufs.scratchBuf
-
-			val, fnErr := cfg.fnLazy(&bufs.file, &bufs.scratch)
-			if fnErr != nil {
-				// Silent skip for race conditions (file became dir/symlink)
-				if errors.Is(fnErr, errSkipFile) {
-					if fhOpen {
-						_ = openFH.closeHandle()
-						fhOpen = false
-					}
-
-					continue
-				}
-
-				procErr := &ProcessError{Path: getPathStr(relPath), Err: fnErr}
-				if cfg.notifier.callbackErr(procErr) {
-					*out.errs = append(*out.errs, procErr)
-				}
-
-				// Callback may have opened file; ensure handle closed on error.
+		val, fnErr := cfg.fn(&bufs.file, &bufs.worker)
+		if fnErr != nil {
+			// Silent skip for race conditions (file became dir/symlink)
+			if errors.Is(fnErr, errSkipFile) {
 				if fhOpen {
-					closeErr := openFH.closeHandle()
+					_ = openFH.closeHandle()
 					fhOpen = false
-
-					if closeErr != nil {
-						ioErr := &IOError{Path: getPathStr(relPath), Op: "close", Err: closeErr}
-						if cfg.notifier.ioErr(ioErr) {
-							*out.errs = append(*out.errs, ioErr)
-						}
-
-						if ctx.Err() != nil {
-							return
-						}
-					}
-				}
-
-				if ctx.Err() != nil {
-					return
 				}
 
 				continue
 			}
 
+			procErr := &ProcessError{Path: getPathStr(relPath), Err: fnErr}
+			if cfg.notifier.callbackErr(procErr) {
+				*out.errs = append(*out.errs, procErr)
+			}
+
+			// Callback may have opened file; ensure handle closed on error.
 			if fhOpen {
 				closeErr := openFH.closeHandle()
 				fhOpen = false
@@ -309,26 +211,6 @@ func processFilesInto[T any](
 				}
 			}
 
-			if val != nil {
-				// For lazy mode, Result.Path uses arena-stored relPath (already stored above).
-				*out.results = append(*out.results, Result[T]{Path: arenaRelPath, Value: val})
-			}
-
-			continue
-		}
-
-		fh, err := dh.openFile(name)
-		if err != nil {
-			// Ignore symlinks entirely (best-effort; should be filtered at readdir already).
-			if errors.Is(err, syscall.ELOOP) {
-				continue
-			}
-
-			ioErr := &IOError{Path: getPathStr(relPath), Op: "open", Err: err}
-			if cfg.notifier.ioErr(ioErr) {
-				*out.errs = append(*out.errs, ioErr)
-			}
-
 			if ctx.Err() != nil {
 				return
 			}
@@ -336,92 +218,7 @@ func processFilesInto[T any](
 			continue
 		}
 
-		openFH = fh
-		fhOpen = true
-
-		switch cfg.kind {
-		case procKindBytes:
-			bytesRead, isDir, readErr := openFH.readInto(bufs.readBuf)
-			closeErr := openFH.closeHandle()
-			fhOpen = false
-
-			// Skip directories (races).
-			if isDir {
-				continue
-			}
-
-			if readErr != nil {
-				ioErr := &IOError{Path: getPathStr(relPath), Op: "read", Err: readErr}
-				if cfg.notifier.ioErr(ioErr) {
-					*out.errs = append(*out.errs, ioErr)
-				}
-
-				if ctx.Err() != nil {
-					return
-				}
-
-				continue
-			}
-
-			if closeErr != nil {
-				ioErr := &IOError{Path: getPathStr(relPath), Op: "close", Err: closeErr}
-				if cfg.notifier.ioErr(ioErr) {
-					*out.errs = append(*out.errs, ioErr)
-				}
-
-				if ctx.Err() != nil {
-					return
-				}
-			}
-
-			val, fnErr := cfg.fnBytes(relPath, bufs.readBuf[:bytesRead])
-			if fnErr != nil {
-				procErr := &ProcessError{Path: getPathStr(relPath), Err: fnErr}
-				if cfg.notifier.callbackErr(procErr) {
-					*out.errs = append(*out.errs, procErr)
-				}
-
-				if ctx.Err() != nil {
-					return
-				}
-
-				continue
-			}
-
-			if val != nil {
-				*out.results = append(*out.results, Result[T]{Path: getPath(relPath, name), Value: val})
-			}
-
-		case procKindReader:
-			probeN, isDir, readErr := openFH.readInto(bufs.probeBuf)
-
-			if isDir {
-				_ = openFH.closeHandle()
-				fhOpen = false
-
-				continue
-			}
-
-			if readErr != nil {
-				_ = openFH.closeHandle()
-				fhOpen = false
-
-				ioErr := &IOError{Path: getPathStr(relPath), Op: "read", Err: readErr}
-				if cfg.notifier.ioErr(ioErr) {
-					*out.errs = append(*out.errs, ioErr)
-				}
-
-				if ctx.Err() != nil {
-					return
-				}
-
-				continue
-			}
-
-			bufs.replay.reset(openFH, bufs.probeBuf[:probeN], nil)
-
-			val, fnErr := cfg.fnReader(relPath, &bufs.replay)
-
+		if fhOpen {
 			closeErr := openFH.closeHandle()
 			fhOpen = false
 
@@ -435,30 +232,10 @@ func processFilesInto[T any](
 					return
 				}
 			}
+		}
 
-			if fnErr != nil {
-				procErr := &ProcessError{Path: getPathStr(relPath), Err: fnErr}
-				if cfg.notifier.callbackErr(procErr) {
-					*out.errs = append(*out.errs, procErr)
-				}
-
-				if ctx.Err() != nil {
-					return
-				}
-
-				continue
-			}
-
-			if val != nil {
-				*out.results = append(*out.results, Result[T]{Path: getPath(relPath, name), Value: val})
-			}
-
-		case procKindLazy:
-			// Lazy path is handled before openFile; this should be unreachable.
-			if fhOpen {
-				_ = openFH.closeHandle()
-				fhOpen = false
-			}
+		if val != nil {
+			*out.results = append(*out.results, val)
 		}
 	}
 }
@@ -467,7 +244,7 @@ func processFilesInto[T any](
 // PIPELINED PROCESSING (large directories)
 // ============================================================================
 
-func (p processor[T]) processDirPipelined(ctx context.Context, args *dirPipelinedArgs) ([]Result[T], []error) {
+func (p processor[T]) processDirPipelined(ctx context.Context, args *dirPipelinedArgs) ([]*T, []error) {
 	dirRel := "."
 	if len(args.relPrefix) > 0 {
 		dirRel = string(args.relPrefix)
@@ -492,12 +269,8 @@ func (p processor[T]) processDirPipelined(ctx context.Context, args *dirPipeline
 	dirBuf := args.dirBuf
 
 	cfg := fileProcCfg[T]{
-		kind:           p.kind,
-		fnBytes:        p.fnBytes,
-		fnReader:       p.fnReader,
-		fnLazy:         p.fnLazy,
-		notifier:       notifier,
-		copyResultPath: opts.CopyResultPath,
+		fn:       p.fn,
+		notifier: notifier,
 	}
 
 	// Buffering between the readdir producer and workers is bounded to avoid
@@ -516,7 +289,7 @@ func (p processor[T]) processDirPipelined(ctx context.Context, args *dirPipeline
 
 	var (
 		mu      sync.Mutex
-		results []Result[T]
+		results []*T
 		allErrs []error
 	)
 
@@ -639,27 +412,12 @@ func (p processor[T]) processDirPipelined(ctx context.Context, args *dirPipeline
 	worker := func() {
 		pathBufCap := len(relPrefix) + pathBufExtra
 
-		var bufs *workerBufs
-
-		switch cfg.kind {
-		case procKindBytes:
-			bufs = &workerBufs{
-				readBuf: make([]byte, opts.ReadSize),
-				pathBuf: make([]byte, 0, pathBufCap),
-			}
-		case procKindReader:
-			bufs = &workerBufs{
-				probeBuf: make([]byte, readerProbeSize),
-				pathBuf:  make([]byte, 0, pathBufCap),
-			}
-		case procKindLazy:
-			bufs = &workerBufs{
-				pathBuf: make([]byte, 0, pathBufCap),
-				// dataBuf, dataArena, scratchBuf start zero-valued, grow as needed.
-			}
+		bufs := &workerBufs{
+			pathBuf: make([]byte, 0, pathBufCap),
+			// dataBuf, dataArena, worker.buf start zero-valued, grow as needed.
 		}
 
-		localResults := make([]Result[T], 0, 64)
+		localResults := make([]*T, 0, 64)
 
 		var localErrs []error
 

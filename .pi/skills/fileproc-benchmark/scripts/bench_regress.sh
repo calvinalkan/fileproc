@@ -432,15 +432,13 @@ echo "$SEP"
 echo
 
 hyperfine "${HF_1K[@]}" \
-  -L process frontmatter,noop,lazy \
+  -L process frontmatter,noop \
   --export-json "$OUT_JSON_1K" \
   --export-markdown "$OUT_MD_1K" \
   --command-name "flat_1k_frontmatter" \
   --command-name "flat_1k_noop" \
-  --command-name "flat_1k_lazy" \
   --command-name "nested1_1k_frontmatter" \
   --command-name "nested1_1k_noop" \
-  --command-name "nested1_1k_lazy" \
   "$CMD_FLAT_1K" \
   "$CMD_NESTED_1K"
 
@@ -456,15 +454,13 @@ echo "$SEP"
 echo
 
 hyperfine "${HF_5K[@]}" \
-  -L process frontmatter,noop,lazy \
+  -L process frontmatter,noop \
   --export-json "$OUT_JSON_5K" \
   --export-markdown "$OUT_MD_5K" \
   --command-name "flat_5k_frontmatter" \
   --command-name "flat_5k_noop" \
-  --command-name "flat_5k_lazy" \
   --command-name "nested1_5k_frontmatter" \
   --command-name "nested1_5k_noop" \
-  --command-name "nested1_5k_lazy" \
   "$CMD_FLAT_5K" \
   "$CMD_NESTED_5K"
 
@@ -480,15 +476,13 @@ echo "$SEP"
 echo
 
 hyperfine "${HF_COMMON[@]}" \
-  -L process frontmatter,noop,lazy \
+  -L process frontmatter,noop \
   --export-json "$OUT_JSON_100K" \
   --export-markdown "$OUT_MD_100K" \
   --command-name "flat_100k_frontmatter" \
   --command-name "flat_100k_noop" \
-  --command-name "flat_100k_lazy" \
   --command-name "nested1_100k_frontmatter" \
   --command-name "nested1_100k_noop" \
-  --command-name "nested1_100k_lazy" \
   "$CMD_FLAT_100K" \
   "$CMD_NESTED_100K"
 
@@ -504,15 +498,13 @@ echo "$SEP"
 echo
 
 hyperfine "${HF_COMMON[@]}" \
-  -L process frontmatter,noop,lazy \
+  -L process frontmatter,noop \
   --export-json "$OUT_JSON_1M" \
   --export-markdown "$OUT_MD_1M" \
   --command-name "flat_1m_frontmatter" \
   --command-name "flat_1m_noop" \
-  --command-name "flat_1m_lazy" \
   --command-name "nested1_1m_frontmatter" \
   --command-name "nested1_1m_noop" \
-  --command-name "nested1_1m_lazy" \
   "$CMD_FLAT_1M" \
   "$CMD_NESTED_1M"
 

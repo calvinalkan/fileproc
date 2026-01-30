@@ -122,14 +122,14 @@ func (h readdirHandle) closeHandle() error {
 	return nil
 }
 
-// readDirBatch reads directory entries using getdents64 (syscall.ReadDirent)
+// readDirBatchImpl reads directory entries using getdents64 (syscall.ReadDirent)
 // and appends matching file names to batch.
 //
 // Names appended to batch include a trailing NUL terminator.
 //
 // If reportSubdir is non-nil, it is called for each discovered subdirectory
 // entry name (without a trailing NUL).
-func readDirBatch(rh readdirHandle, buf []byte, suffix string, batch *nameBatch, reportSubdir func(name []byte)) error {
+func readDirBatchImpl(rh readdirHandle, buf []byte, suffix string, batch *nameBatch, reportSubdir func(name []byte)) error {
 	// Retry ReadDirent on EINTR without an upper bound, matching Go's stdlib.
 	var (
 		read int

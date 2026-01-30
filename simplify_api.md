@@ -94,7 +94,7 @@ Syscall counts (strace):
 | 328 | Test_Process_Reports_Dot_Path_When_Root_Open_Fails | MIGRATE | Error path |
 | 391 | Test_Process_Returns_Error_When_Suffix_Has_Nul | MIGRATE | Input validation |
 | 417 | Test_Process_Stops_Early_When_Context_Canceled | MIGRATE | Cancellation |
-| 460 | Test_Process_Returns_Same_Paths_When_CopyResultPath_Set | MIGRATE | CopyResultPath option |
+| 460 | Test_Process_Returns_Same_Paths_When_CopyResultPath_Set | DELETE | CopyResultPath removed |
 | 484 | Test_Process_Processes_All_Files_When_Pipelined_Workers | DUPLICATE | Covered by lazy:1248 |
 | 530 | Test_Process_Skips_Result_When_Callback_Returns_Nil | MIGRATE | Nil result handling |
 | 560 | Test_ProcessReader_Collects_ProcessError_When_Callback_Returns_Error | DUPLICATE | Covered by lazy:1902 |
@@ -136,8 +136,8 @@ Syscall counts (strace):
 | Category | Count | Action |
 |----------|-------|--------|
 | DUPLICATE | 23 | Delete (already covered) |
-| MIGRATE | 18 | Port to ProcessLazy |
-| DELETE | 3 | API-specific, no longer needed |
+| MIGRATE | 17 | Port to ProcessLazy |
+| DELETE | 4 | API-specific, no longer needed |
 | **Total** | 44 | |
 
 ### Other test files

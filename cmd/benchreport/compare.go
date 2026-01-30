@@ -19,7 +19,7 @@ Options:
   --n N             For avg mode, number of runs to average (default: 5)
   --fail-above PCT  Exit with error if regression exceeds PCT percent
   --focus SIZES     Comma-separated sizes to focus on (e.g. 100k,1m)
-  --process NAME    Benchmark process to compare: frontmatter | lazy | noop
+  --process NAME    Benchmark process to compare: frontmatter | noop
   --history FILE    Path to history.jsonl (default: .benchmarks/history.jsonl)
   --baseline FILE   Baseline file (default: .benchmarks/baseline.jsonl)
   --json            Output as JSON instead of table
@@ -74,7 +74,7 @@ func runCompare(args []string) error {
 	n := fs.Int("n", 5, "number of runs for avg mode")
 	failAbove := fs.Float64("fail-above", 0, "fail if regression exceeds this percent")
 	focus := fs.String("focus", "", "comma-separated sizes to focus on")
-	process := fs.String("process", "frontmatter", "benchmark process to compare: frontmatter | lazy | noop")
+	process := fs.String("process", "frontmatter", "benchmark process to compare: frontmatter | noop")
 	historyFile := fs.String("history", ".benchmarks/history.jsonl", "path to history file")
 	baselineFile := fs.String("baseline", ".benchmarks/baseline.jsonl", "path to baseline file")
 	outputJSON := fs.Bool("json", false, "output as JSON")
@@ -310,8 +310,8 @@ func buildComparison(latest, target *Summary, targetDesc string, focusSizes []st
 		process = "frontmatter"
 	}
 
-	if process != "frontmatter" && process != "lazy" && process != "noop" {
-		return Comparison{}, fmt.Errorf("invalid process: %s (expected: frontmatter | lazy | noop)", process)
+	if process != "frontmatter" && process != "noop" {
+		return Comparison{}, fmt.Errorf("invalid process: %s (expected: frontmatter | noop)", process)
 	}
 
 	orderedBenches, ratioSuffix := benchmarksForProcess(process)
@@ -403,12 +403,7 @@ func benchmarksForProcess(process string) ([]string, string) {
 		"flat_1m" + suffix, "nested1_1m" + suffix,
 	}
 
-	ratioSuffix := ""
-	if process == "lazy" {
-		ratioSuffix = "_lazy"
-	}
-
-	return ordered, ratioSuffix
+	return ordered, ""
 }
 
 func printComparison(c *Comparison) error {

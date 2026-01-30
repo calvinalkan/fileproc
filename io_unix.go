@@ -72,13 +72,13 @@ func (h readdirHandle) closeHandle() error {
 	return nil
 }
 
-// readDirBatch enumerates directory entries using (*os.File).ReadDir.
+// readDirBatchImpl enumerates directory entries using (*os.File).ReadDir.
 //
 // Names appended to batch include their trailing NUL terminator.
 //
 // If reportSubdir is non-nil, it is called for each discovered subdirectory
 // entry name (without a trailing NUL).
-func readDirBatch(rh readdirHandle, _ []byte, suffix string, batch *nameBatch, reportSubdir func(name []byte)) error {
+func readDirBatchImpl(rh readdirHandle, _ []byte, suffix string, batch *nameBatch, reportSubdir func(name []byte)) error {
 	entries, err := rh.f.ReadDir(readDirBatchSize)
 	for _, e := range entries {
 		// Use Type() instead of IsDir() to avoid following symlinks.
@@ -94,6 +94,35 @@ func readDirBatch(rh readdirHandle, _ []byte, suffix string, batch *nameBatch, r
 			if reportSubdir != nil {
 				reportSubdir([]byte(e.Name()))
 			}
+			continue
+		}
+
+		// When Type() is unknown (common on some filesystems), we must lstat to
+		// enforce "skip symlinks and non-regular files" semantics.
+		if typ&fs.ModeType == 0 {
+			name := e.Name()
+			if reportSubdir == nil && !hasSuffix(name, suffix) {
+				continue
+			}
+
+			kind, statErr := classifyAt(rh.fd, name)
+			if statErr != nil {
+				continue
+			}
+
+			switch kind {
+			case statKindDir:
+				if reportSubdir != nil {
+					reportSubdir([]byte(name))
+				}
+			case statKindReg:
+				if hasSuffix(name, suffix) {
+					batch.appendString(name)
+				}
+			default:
+				// Skip symlinks and special file types.
+			}
+
 			continue
 		}
 
@@ -117,6 +146,31 @@ func readDirBatch(rh readdirHandle, _ []byte, suffix string, batch *nameBatch, r
 		return io.EOF
 	}
 	return err
+}
+
+func classifyAt(dirfd int, name string) (statKind, error) {
+	var st unix.Stat_t
+	for {
+		err := unix.Fstatat(dirfd, name, &st, unix.AT_SYMLINK_NOFOLLOW)
+		if err == syscall.EINTR {
+			continue
+		}
+		if err != nil {
+			return statKindOther, err
+		}
+		break
+	}
+
+	switch st.Mode & unix.S_IFMT {
+	case unix.S_IFDIR:
+		return statKindDir, nil
+	case unix.S_IFREG:
+		return statKindReg, nil
+	case unix.S_IFLNK:
+		return statKindSymlink, nil
+	default:
+		return statKindOther, nil
+	}
 }
 
 // ============================================================================
@@ -238,7 +292,7 @@ func (d dirHandle) statFile(name []byte) (Stat, statKind, error) {
 
 	return Stat{
 		Size:    st.Size,
-		ModTime: st.Mtimespec.Nano(),
+		ModTime: st.Mtim.Nano(),
 		Mode:    uint32(st.Mode),
 		Inode:   st.Ino,
 	}, kind, nil

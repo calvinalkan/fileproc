@@ -25,7 +25,7 @@ import "io"
 //
 // Naming:
 //
-//   - readDirBatch is the backend hook that streams directory entries into a
+//   - readDirBatchImpl is the backend hook that streams directory entries into a
 //     nameBatch and optionally reports discovered subdirectories.
 //
 // Semantics notes (expected by the pipeline):
@@ -58,7 +58,7 @@ import "io"
 // Function signatures required by the pipeline.
 var (
 	_ func([]byte) (readdirHandle, error)                                 = openDirEnumerator
-	_ func(readdirHandle, []byte, string, *nameBatch, func([]byte)) error = readDirBatch
+	_ func(readdirHandle, []byte, string, *nameBatch, func([]byte)) error = readDirBatchImpl
 	_ func([]byte) (dirHandle, error)                                     = openDir
 	_ func(readdirHandle, string) (dirHandle, error)                      = openDirFromReaddir
 )

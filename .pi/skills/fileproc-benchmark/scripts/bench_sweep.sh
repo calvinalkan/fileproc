@@ -51,7 +51,7 @@ usage() {
   echo "  --workers LIST    Comma-separated worker counts (overrides defaults)"
   echo "  --runs N          Base runs per combination (default: $RUNS)"
   echo "  --warmup N        Warmup runs (default: $WARMUP)"
-  echo "  --process NAME    Process mode (default: $PROCESS)"
+  echo "  --process NAME    Process mode: frontmatter | noop (default: $PROCESS)"
   echo "  --verbose, -v     Show full hyperfine output (default: summary table only)"
   echo ""
   echo "Defaults per case size:"

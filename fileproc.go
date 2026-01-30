@@ -16,29 +16,23 @@
 //
 // # Panics
 //
-// Panics in user-defined callbacks ([ProcessFunc] and [ProcessReaderFunc]) are
-// not recovered by this package.
+// Panics in user-defined callbacks ([ProcessFunc]) are not recovered by this
+// package.
 //
 // A callback panic will unwind the goroutine executing it; in concurrent modes
 // this will crash the process. If you need to guard against panics, recover
 // inside your callback.
 //
-// # Choosing an API
+// # Usage
 //
-// Use [Process] when you only need a small prefix of each file (headers,
-// metadata, magic bytes) and you can decide validity from the first N bytes.
-// [Process] reads up to [Options.ReadSize] bytes per file with a single read and
-// passes the prefix as a borrowed []byte.
-//
-// Use [ProcessReader] when you need to stream or fully consume file contents
-// (e.g. hashing, decompression, parsing large files). The callback receives an
-// [io.Reader] and controls how much to read.
+// [Process] provides a *File for lazy access to stat/content and a *Worker for
+// reusable temporary buffers. Use [File.Bytes] for full-content reads or
+// [File.Read] for streaming access.
 //
 // # Architecture
 //
-// The package provides two entry points: [Process] (prefix-bytes API) and
-// [ProcessReader] (streaming reader API). Both support single-directory and
-// recursive tree processing based on [Options.Recursive].
+// The package provides a single entry point: [Process]. It supports
+// single-directory and recursive tree processing based on [WithRecursive].
 //
 // Processing uses a tiered strategy based on file count:
 //
@@ -59,30 +53,25 @@
 //	│   - dirBuf: 32KB directory-entry buffer on Linux (also used as a        │
 //	│     sizing heuristic on other platforms)                                │
 //	│   - batch: nameBatch for collecting filenames                           │
-//	│   - Pipeline workers allocate their own pathBuf/pathArena and either:   │
-//	│       • readBuf  (Process, prefix-bytes API), or                         │
-//	│       • probeBuf (ProcessReader, streaming API)                         │
+//	│   - Pipeline workers allocate their own pathBuf and buffers for:        │
+//	│       • Worker.Buf (callback scratch space)                             │
+//	│       • File.Bytes arena (when used)                                   │
 //	│                                                                         │
-//	│ Recursive (processTree, shared by both APIs):                          │
+//	│ Recursive (processTree):                                               │
 //	│   - per-worker results/errors slices (merged at the end)                │
 //	│   - Per tree worker (allocated once, reused for ALL directories):       │
 //	│       • dirBuf  (32KB): Linux dirent buffer / sizing heuristic          │
-//	│       • readBuf (Process): reading a prefix of file contents            │
-//	│       • probeBuf (ProcessReader): initial probe read + replay           │
+//	│       • Worker.Buf (callback scratch space)                             │
 //	│       • pathBuf (512B): building relative paths                         │
 //	│       • batch: collecting filenames                                     │
 //	│       • freeBatches: channel-as-freelist for pipeline batches           │
 //	│                                                                         │
 //	└─────────────────────────────────────────────────────────────────────────┘
 //
-// Rough memory budget for recursive mode with 8 workers (excluding results,
-// path arenas, and other overhead), assuming the defaults:
+// Rough memory budget for recursive mode with 8 workers (excluding results
+// and other overhead), assuming defaults:
 //
-//   - ReadSize = 2KB
-//
-//   - readerProbeSize = 4KB
-//
-//     8 × (32KB dirBuf + (2KB readBuf or 4KB probeBuf) + 512B pathBuf + 6×(≈64KB batch storage + ≈75KB name headers)) ≈ 7–8MB
+//	8 × (32KB dirBuf + 512B pathBuf + 6×(≈64KB batch storage + ≈75KB name headers)) ≈ 6–7MB
 package fileproc
 
 import (
@@ -92,9 +81,9 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 )
 
 // Internal stat classification used by stat-only processing.
@@ -107,7 +96,7 @@ const (
 	statKindOther
 )
 
-// Stat holds metadata for a file discovered by [ProcessLazy].
+// Stat holds metadata for a file discovered by [Process].
 //
 // ModTime is expressed as Unix nanoseconds to avoid time.Time allocations
 // in hot paths. Use time.Unix(0, st.ModTime) to convert when needed.
@@ -118,18 +107,379 @@ type Stat struct {
 	Inode   uint64
 }
 
-// ProcessFunc is called for each file with a prefix of its contents.
+// File provides access to a file being processed by Process.
+//
+// All methods are lazy: the underlying file is opened on first content access
+// (Bytes, Read, or Fd). The handle is owned by fileproc and closed after the
+// callback returns. File must not be retained beyond the callback.
+//
+// Bytes() and Read() are mutually exclusive per file. Calling one after
+// the other returns an error.
+type File struct {
+	dh   dirHandle
+	name []byte // NUL-terminated filename
+
+	relPath  []byte // ephemeral relative path (no NUL)
+	st       Stat
+	statDone bool
+
+	fh     *fileHandle
+	fhOpen *bool
+
+	dataBuf   *[]byte // temporary read buffer (reused across files)
+	dataArena *[]byte // append-only arena for Bytes() results
+
+	mode    fileMode
+	openErr error
+	statErr error
+}
+
+type fileMode uint8
+
+const (
+	fileModeNone fileMode = iota
+	fileModeBytes
+	fileModeReader
+)
+
+var (
+	errBytesAfterRead     = errors.New("Bytes: cannot call after Read")
+	errBytesAlreadyCalled = errors.New("Bytes: already called")
+	errReadAfterBytes     = errors.New("Read: cannot call after Bytes")
+
+	// errSkipFile is an internal sentinel indicating the file should be
+	// silently skipped (e.g., became a directory due to race condition).
+	// Not reported as an error to the user.
+	errSkipFile = errors.New("skip file")
+)
+
+// RelPath returns the file path relative to the root directory passed to
+// Process.
+//
+// The returned slice is ephemeral and only valid during the callback.
+// Copy if you need to retain it.
+func (f *File) RelPath() []byte {
+	return f.relPath
+}
+
+// Stat returns file metadata.
+//
+// Lazy: the stat syscall is made on first call and cached. Subsequent calls
+// return the cached value with no additional I/O.
+//
+// Returns zero Stat and an error if the stat syscall fails (e.g., file was
+// deleted or became a non-regular file).
+func (f *File) Stat() (Stat, error) {
+	if !f.statDone {
+		f.lazyStat()
+	}
+
+	return f.st, f.statErr
+}
+
+// BytesOption configures the behavior of [File.Bytes].
+type BytesOption struct {
+	sizeHint int
+}
+
+// WithSizeHint provides an expected file size to optimize buffer allocation.
+//
+// Use when file sizes are known or predictable (e.g., uniform log entries,
+// fixed-format records) to avoid buffer resizing without a stat syscall.
+//
+// The hint is a suggestion, not a limit. Files larger than the hint are
+// read completely; smaller files don't waste the extra space (only the
+// actual content is stored in the arena).
+//
+// The hint is ignored if [File.Stat] was called previously, since the
+// actual size is already known.
+//
+// Example:
+//
+//	// Pre-create option outside the processing loop (zero allocation)
+//	opt := fileproc.WithSizeHint(4096)
+//
+//	fileproc.Process(ctx, dir, func(f *fileproc.File, _ *fileproc.Worker) (*T, error) {
+//	    data, err := f.Bytes(opt)
+//	    // ...
+//	}, opts)
+func WithSizeHint(size int) BytesOption {
+	return BytesOption{sizeHint: size}
+}
+
+// Bytes reads and returns the full file content.
+//
+// The returned slice points into an internal arena and remains valid until
+// Process returns. Subslices share the same lifetime.
+//
+// Empty files return a non-nil empty slice ([]byte{}, nil).
+//
+// Single-use: Bytes can only be called once per File.
+// Returns error if called after [File.Read], or on I/O failure.
+//
+// Memory: content is retained in the arena until Process returns.
+// For large files or memory-constrained use cases, consider [File.Read]
+// with streaming processing instead.
+//
+// Buffer sizing: Bytes does not call stat internally. The buffer size is
+// determined by (in priority order):
+//  1. The actual size from [File.Stat], if it was called previously
+//  2. The hint from [WithSizeHint], if provided
+//  3. A default 512-byte buffer, grown as needed
+//
+// For workloads with known/uniform file sizes, use [WithSizeHint] to avoid
+// buffer resizing without the overhead of a stat syscall.
+func (f *File) Bytes(opts ...BytesOption) ([]byte, error) {
+	if f.mode == fileModeReader {
+		return nil, errBytesAfterRead
+	}
+
+	if f.mode == fileModeBytes {
+		return nil, errBytesAlreadyCalled
+	}
+
+	f.mode = fileModeBytes
+
+	// Open file if needed
+	openErr := f.open()
+	if openErr != nil {
+		return nil, openErr
+	}
+
+	// Buffer size priority: stat > sizeHint > default
+	const defaultBufSize = 512
+	maxInt := int(^uint(0) >> 1)
+	maxSize := maxInt - 1
+
+	var size int
+	if f.statDone && f.statErr == nil {
+		if f.st.Size > 0 {
+			if f.st.Size > int64(maxSize) {
+				size = maxSize
+			} else {
+				size = int(f.st.Size)
+			}
+		}
+	} else if len(opts) > 0 && opts[0].sizeHint > 0 {
+		if opts[0].sizeHint > maxSize {
+			size = maxSize
+		} else {
+			size = opts[0].sizeHint
+		}
+	}
+
+	readSize := max(
+		// +1 to detect growth / read past expected size
+		size+1, defaultBufSize)
+
+	// Ensure dataBuf capacity
+	if cap(*f.dataBuf) < readSize {
+		*f.dataBuf = make([]byte, 0, readSize)
+	}
+
+	*f.dataBuf = (*f.dataBuf)[:readSize]
+	buf := *f.dataBuf
+
+	// Single read syscall using backend
+	n, isDir, err := f.fh.readInto(buf)
+	if isDir {
+		return nil, errSkipFile
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	// Buffer was filled - file may be larger, continue reading
+	if n == readSize {
+		var readErr error
+		for {
+			if n == len(buf) {
+				growBy := max(len(buf), 4096)
+				*f.dataBuf = append(*f.dataBuf, make([]byte, growBy)...)
+				buf = *f.dataBuf
+			}
+
+			m, isDir, err := f.fh.readInto(buf[n:])
+			if isDir {
+				return nil, errSkipFile
+			}
+
+			if err != nil {
+				readErr = err
+			}
+
+			n += m
+
+			if m == 0 || readErr != nil {
+				break
+			}
+		}
+
+		if readErr != nil {
+			return nil, readErr
+		}
+	}
+
+	// Empty file
+	if n == 0 {
+		return []byte{}, nil
+	}
+
+	// Copy to arena, return subslice
+	start := len(*f.dataArena)
+	*f.dataArena = append(*f.dataArena, buf[:n]...)
+
+	return (*f.dataArena)[start:], nil
+}
+
+// Read implements io.Reader for streaming access.
+//
+// Use when you need only a prefix or want to process in chunks without
+// retaining the full content. Data read via Read() is NOT arena-allocated;
+// caller provides and manages the buffer.
+//
+// Returns error if called after Bytes().
+//
+// Lazy: file is opened on first Read() call.
+func (f *File) Read(p []byte) (int, error) {
+	if f.mode == fileModeBytes {
+		return 0, errReadAfterBytes
+	}
+
+	f.mode = fileModeReader
+
+	err := f.open()
+	if err != nil {
+		return 0, err
+	}
+
+	n, err := f.fh.Read(p)
+	if err != nil {
+		if errors.Is(err, syscall.EISDIR) || errors.Is(err, syscall.ELOOP) {
+			return 0, errSkipFile
+		}
+	}
+
+	return n, err
+}
+
+// Fd returns the underlying file descriptor.
+//
+// Lazy: file is opened if not already open.
+//
+// Use for low-level operations (sendfile, mmap, etc.). The fd is owned by
+// fileproc and will be closed after the callback returns.
+//
+// Returns ^uintptr(0) (i.e., -1) if the file cannot be opened.
+func (f *File) Fd() uintptr {
+	err := f.open()
+	if err != nil {
+		return ^uintptr(0)
+	}
+
+	return f.fh.fdValue()
+}
+
+func (f *File) lazyStat() {
+	st, kind, err := f.dh.statFile(f.name)
+	f.statDone = true
+
+	if err != nil {
+		if errors.Is(err, syscall.ELOOP) || kind == statKindSymlink {
+			f.statErr = errSkipFile
+		} else {
+			f.statErr = err
+		}
+
+		return
+	}
+
+	if kind != statKindReg {
+		f.statErr = errSkipFile
+
+		return
+	}
+
+	f.st = st
+}
+
+func (f *File) open() error {
+	if f.fhOpen != nil && *f.fhOpen {
+		return nil // already open
+	}
+
+	if f.openErr != nil {
+		return f.openErr // previous attempt failed
+	}
+
+	fh, err := f.dh.openFile(f.name)
+	if err != nil {
+		// Symlink detected (race: was regular file during scan)
+		if errors.Is(err, syscall.ELOOP) || errors.Is(err, syscall.EISDIR) {
+			f.openErr = errSkipFile
+
+			return errSkipFile
+		}
+
+		f.openErr = err
+
+		return err
+	}
+
+	*f.fh = fh
+	*f.fhOpen = true
+
+	return nil
+}
+
+// Worker provides reusable temporary buffer space for callback processing.
+//
+// The buffer is reused across files within a worker. It is only valid during
+// the current callback and will be overwritten for the next file.
+//
+// Use for temporary parsing work, not for data that must survive the callback.
+type Worker struct {
+	buf []byte
+}
+
+// Buf returns a reusable buffer with at least the requested capacity.
+//
+// Returns a slice with len=0 and cap>=size, ready for append:
+//
+//	buf := w.Buf(4096)
+//	buf = append(buf, data...)  // no alloc if fits in capacity
+//
+// For use as a fixed-size read target, expand to full capacity:
+//
+//	buf := w.Buf(4096)
+//	buf = buf[:cap(buf)]
+//	n, _ := io.ReadFull(r, buf)
+//
+// The capacity grows to accommodate the largest request seen across all
+// files processed by this worker, then stabilizes.
+//
+// The returned slice is only valid during the current callback.
+func (w *Worker) Buf(size int) []byte {
+	if cap(w.buf) < size {
+		w.buf = make([]byte, 0, size)
+	}
+
+	return w.buf[:0]
+}
+
+// ProcessFunc is called for each file.
 //
 // ProcessFunc may be called concurrently and must be safe for concurrent use.
 //
-// path is relative to the directory passed to [Process]. The path and data
-// slices alias internal reusable buffers; they are only valid until
-// ProcessFunc returns. Copy them if needed.
+// f provides access to file metadata and content. f.RelPath() is ephemeral and
+// only valid during the callback.
+//
+// w provides reusable temporary buffer space. w.Buf() returns a slice that is
+// only valid during the callback.
 //
 // Callbacks are not invoked for directories, symlinks, or other non-regular
 // files.
-//
-// Empty files are passed to ProcessFunc with a zero-length data slice.
 //
 // Return values:
 //   - (*T, nil): emit the result
@@ -137,35 +487,16 @@ type Stat struct {
 //   - (_, error): skip and report the error as a [ProcessError]
 //
 // Whether [ProcessError]s (and [IOError]s) are included in the returned error
-// slice depends on [Options.OnError]. If OnError is nil, all errors are
-// collected.
+// slice depends on [WithOnError]. If OnError is nil, all errors are collected.
 //
 // Panics are not recovered by this package. Callbacks must not panic; if you
 // need to guard against panics, recover inside the callback.
-type ProcessFunc[T any] func(path, data []byte) (*T, error)
-
-// Result holds a successfully processed item.
-// Uses value type (not pointer) to avoid per-result heap allocation.
-type Result[T any] struct {
-	// Path is the relative file path as a byte slice.
-	//
-	// The slice points into internal storage managed by the processor (unless
-	// [Options.CopyResultPath] is true).
-	//
-	// It remains valid as long as the Result itself remains reachable (for
-	// example as long as you keep the returned results slice).
-	//
-	// To convert to string: string(r.Path)
-	// Many operations work directly with []byte, avoiding allocation.
-	Path []byte
-	// Value is the pointer returned by the user callback (not copied).
-	Value *T
-}
+type ProcessFunc[T any] func(f *File, w *Worker) (*T, error)
 
 // IOError is returned when a file system operation fails.
 type IOError struct {
-	// Path is the path relative to the root directory passed to [Process] or
-	// [ProcessReader]. The root directory itself is reported as ".".
+	// Path is the path relative to the root directory passed to [Process].
+	// The root directory itself is reported as ".".
 	Path string
 	// Op is the operation that failed: "open", "read", "close", or "readdir".
 	Op string
@@ -181,8 +512,7 @@ func (e *IOError) Unwrap() error {
 	return e.Err
 }
 
-// ProcessError is returned when a user callback ([ProcessFunc] or
-// [ProcessReaderFunc]) returns an error.
+// ProcessError is returned when a user callback ([ProcessFunc]) returns an error.
 type ProcessError struct {
 	// Path is the relative file path.
 	Path string
@@ -196,101 +526,6 @@ func (e *ProcessError) Error() string {
 
 func (e *ProcessError) Unwrap() error {
 	return e.Err
-}
-
-// Options configures the file processor.
-type Options struct {
-	// Workers controls concurrency.
-	//   - Non-recursive: pipeline worker count for large directories.
-	//     Default: ~2/3 GOMAXPROCS (min 4).
-	//   - Recursive: number of concurrent directory workers.
-	//     Default: NumCPU()/2 clamped to [4, 16].
-	//
-	// Worker counts are capped at maxWorkers to prevent extreme memory usage when
-	// misconfigured.
-	//
-	// In non-recursive pipelined mode, internal buffering between the directory
-	// reader and the workers is also capped (see maxPipelineQueue).
-	Workers int
-
-	// ReadSize is the maximum number of bytes read per file by [Process]
-	// (default: 2048).
-	//
-	// A single read is performed; files larger than ReadSize are truncated.
-	// Reads may return fewer bytes than ReadSize.
-	//
-	// ReadSize is ignored by [ProcessReader], where the callback reads from an
-	// [io.Reader] and controls how much data to consume.
-	ReadSize int
-
-	// Suffix is the file suffix filter, e.g. ".md" (empty = all files).
-	Suffix string
-
-	// Recursive enables recursive processing of subdirectories.
-	// When false (default), only the specified directory is processed.
-	// Symlinks are ignored (not recursed into, not processed).
-	Recursive bool
-
-	// SmallFileThreshold is the file-count cutoff below which simple
-	// sequential file processing is used instead of pipelined workers
-	// (default: 1500).
-	// Below this threshold, worker setup overhead exceeds parallelism gains.
-	SmallFileThreshold int
-
-	// OnError is called when an error occurs ([IOError] or [ProcessError]).
-	// ioErrs and procErrs are cumulative counts including the current error.
-	// May be called concurrently from multiple goroutines (including internal
-	// orchestration code) - must be safe for concurrent use.
-	//
-	// Return value controls error collection:
-	//   - true:  collect the error in the returned []error slice
-	//   - false: discard the error (not added to returned slice)
-	//
-	// To stop processing, cancel the context. Use [context.WithCancelCause]
-	// to provide a custom stop reason retrievable via [context.Cause].
-	//
-	// If nil, all errors are collected (equivalent to always returning true).
-	//
-	// Example use cases:
-	//
-	//	// Collect all errors, stop after 100 total:
-	//	OnError: func(err error, ioErrs, procErrs int) bool {
-	//	    if ioErrs+procErrs >= 100 {
-	//	        cancel(fmt.Errorf("too many errors: %d", ioErrs+procErrs))
-	//	    }
-	//	    return true
-	//	}
-	//
-	//	// Log errors, don't buffer in memory:
-	//	OnError: func(err error, _, _ int) bool {
-	//	    slog.Error("file error", "err", err)
-	//	    return false
-	//	}
-	//
-	//	// Collect first 10 errors only:
-	//	OnError: func(err error, ioErrs, procErrs int) bool {
-	//	    return ioErrs+procErrs <= 10
-	//	}
-	//
-	//	// Stop on first ProcessError, ignore IOErrors:
-	//	OnError: func(err error, _, procErrs int) bool {
-	//	    if procErrs > 0 {
-	//	        cancel(err)
-	//	    }
-	//	    return true
-	//	}
-	OnError func(err error, ioErrs, procErrs int) (collect bool)
-
-	// CopyResultPath controls how Result.Path is stored.
-	//
-	// When false (default), Result.Path slices point into an internal arena.
-	// This is allocation-free per result, but retaining many results also
-	// retains the arena backing storage.
-	//
-	// When true, each Result.Path is copied into its own allocation.
-	// This is safer/easier for consumers who retain results long-term, at the
-	// cost of one allocation per emitted result.
-	CopyResultPath bool
 }
 
 // Internal constants for buffer sizes and limits.
@@ -309,10 +544,7 @@ const (
 	// when joining directory prefix with filename.
 	pathBufExtra = 512
 
-	// defaultReadSize is the default for Options.ReadSize.
-	defaultReadSize = 2048
-
-	// defaultSmallFileThreshold is the default for Options.SmallFileThreshold.
+	// defaultSmallFileThreshold is the default for WithSmallFileThreshold.
 	// Below this file count, sequential file processing beats pipelined workers.
 	defaultSmallFileThreshold = 1500
 
@@ -334,11 +566,9 @@ var errContainsNUL = errors.New("contains NUL byte")
 
 // workerBufs holds pre-allocated buffers that a worker reuses across all
 // files and directories it processes. Passed by pointer to avoid copying
-// and to allow growable fields (pathArena, batch) to expand.
+// and to allow growable fields (batch) to expand.
 //
 // Lifetime: created once per worker goroutine, lives until worker exits.
-// All Result.Path slices point into pathArena, so the arena stays alive
-// (via GC) as long as any Result from this worker exists.
 type workerBufs struct {
 	// dirBuf holds raw directory-entry bytes on Linux (getdents64/ReadDirent
 	// parsing). On other platforms directory reading uses os.File.ReadDir and
@@ -349,130 +579,51 @@ type workerBufs struct {
 	// Reused: reset for each directory.
 	dirBuf []byte
 
-	// readBuf holds file content read from disk (used by [Process]).
-	// Sized from Options.ReadSize (default 2KB) - only reads file prefix.
-	// Reused: overwritten for each file, never grows.
-	readBuf []byte
-
-	// probeBuf holds an initial chunk read from a file before invoking a reader
-	// callback (used by ProcessReader).
-	// The chunk is then replayed to the user via a small wrapper reader.
-	// Reused: overwritten for each file.
-	probeBuf []byte
-
 	// pathBuf is scratch space for building "prefix/filename" paths.
 	// Reused: reset (len=0) for each file, capacity preserved.
-	// The built path is then copied into pathArena if needed for Result.
 	pathBuf []byte
-
-	// pathArena is append-only storage for Result.Path byte slices.
-	// Each Result.Path is a slice pointing into this arena.
-	// Grows: starts nil, expands as results are added across all directories.
-	// Never shrinks or resets - paths must remain valid for caller.
-	pathArena []byte
 
 	// batch collects filenames read from a directory (arena-style storage).
 	// Reused: reset for each directory, internal capacity preserved.
 	// See nameBatch comments for the arena allocation pattern.
 	batch nameBatch
 
-	// replay is a reusable wrapper reader used by ProcessReader to replay the
-	// initial probe read (stored in probeBuf) before continuing with the
-	// underlying file handle.
-	replay replayReader
-
-	// dataBuf is temporary buffer for File.Bytes() read syscall (used by ProcessLazy).
+	// dataBuf is temporary buffer for File.Bytes() read syscall.
 	// Sized to st.Size+1, grows to max file size seen. Reused across files.
 	dataBuf []byte
 
-	// dataArena is append-only storage for File.Bytes() results (used by ProcessLazy).
+	// dataArena is append-only storage for File.Bytes() results.
 	// Each Bytes() result is a subslice. Grows across all files, never
 	// shrinks. GC'd when results are released.
 	dataArena []byte
 
-	// scratchBuf backs Scratch.Get() (used by ProcessLazy). Reset to len=0 for each file,
-	// capacity preserved across files.
-	scratchBuf []byte
-
-	// file is a reusable File struct for ProcessLazy callbacks.
+	// file is a reusable File struct for callbacks.
 	// Reset for each file to avoid per-file heap allocation.
 	file File
 
-	// scratch is a reusable Scratch struct for ProcessLazy callbacks.
-	scratch Scratch
+	// worker is a reusable Worker struct for callbacks.
+	worker Worker
 }
-
-type procKind uint8
-
-const (
-	procKindBytes procKind = iota
-	procKindReader
-	procKindLazy
-)
 
 type processor[T any] struct {
-	kind procKind
-
-	fnBytes  ProcessFunc[T]
-	fnReader ProcessReaderFunc[T]
-	fnLazy   ProcessLazyFunc[T]
-}
-
-func (p processor[T]) run(ctx context.Context, path string, opts Options, notifier *errNotifier) ([]Result[T], []error) {
-	if opts.Recursive {
-		return p.processRecursive(ctx, path, opts, notifier)
-	}
-
-	return p.processDir(ctx, path, opts, notifier)
-}
-
-// processEntry contains the shared entry-point orchestration for both Process
-// and ProcessReader.
-func processEntry[T any](
-	ctx context.Context,
-	path string,
-	opts Options,
-	run func(ctx context.Context, path string, opts Options, notifier *errNotifier) ([]Result[T], []error),
-) ([]Result[T], []error) {
-	path = filepath.Clean(path)
-
-	if strings.IndexByte(path, 0) >= 0 {
-		return nil, []error{&IOError{Path: ".", Op: "open", Err: errContainsNUL}}
-	}
-
-	if ctx.Err() != nil {
-		return nil, nil
-	}
-
-	opts = withDefaults(opts)
-	if strings.IndexByte(opts.Suffix, 0) >= 0 {
-		return nil, []error{fmt.Errorf("invalid suffix: %w", errContainsNUL)}
-	}
-
-	notifier := newErrNotifier(opts.OnError)
-
-	return run(ctx, path, opts, notifier)
+	fn ProcessFunc[T]
 }
 
 // Process processes files in a directory.
 //
-// By default, only the specified directory is processed. Set opts.Recursive
-// to true to process subdirectories recursively.
+// By default, only the specified directory is processed. Use [WithRecursive]
+// to process subdirectories recursively.
 //
-// Paths passed to ProcessFunc are relative to path. Results are unordered
+// f.RelPath() returns the path relative to the root. Results are unordered
 // when processed with multiple workers.
 //
-// For streaming/full-content processing, see [ProcessReader].
-//
-// To stop processing on error, use [Options.OnError] with a cancelable context:
+// To stop processing on error, use [WithOnError] with a cancelable context:
 //
 //	ctx, cancel := context.WithCancelCause(ctx)
-//	opts := Options{
-//	    OnError: func(err error, _, _ int) bool {
+//	results, errs := Process(ctx, path, fn, WithOnError(func(err error, _, _ int) bool {
 //	        cancel(err)
 //	        return true
-//	    },
-//	}
+//	}))
 //
 // Returns collected results and any errors ([IOError] or [ProcessError]).
 //
@@ -491,10 +642,30 @@ func processEntry[T any](
 // Files or directories created during processing (e.g., by a callback) may or
 // may not be seen depending on timing. Do not rely on newly created entries
 // being processed in the same call.
-func Process[T any](ctx context.Context, path string, fn ProcessFunc[T], opts Options) ([]Result[T], []error) {
-	proc := processor[T]{kind: procKindBytes, fnBytes: fn}
+func Process[T any](ctx context.Context, path string, fn ProcessFunc[T], opts ...Option) ([]*T, []error) {
+	path = filepath.Clean(path)
 
-	return processEntry[T](ctx, path, opts, proc.run)
+	if strings.IndexByte(path, 0) >= 0 {
+		return nil, []error{&IOError{Path: ".", Op: "open", Err: errContainsNUL}}
+	}
+
+	if ctx.Err() != nil {
+		return nil, nil
+	}
+
+	cfg := withDefaults(applyOptions(opts))
+	if strings.IndexByte(cfg.Suffix, 0) >= 0 {
+		return nil, []error{fmt.Errorf("invalid suffix: %w", errContainsNUL)}
+	}
+
+	notifier := newErrNotifier(cfg.OnError)
+	proc := processor[T]{fn: fn}
+
+	if cfg.Recursive {
+		return proc.processRecursive(ctx, path, cfg, notifier)
+	}
+
+	return proc.processDir(ctx, path, cfg, notifier)
 }
 
 // ============================================================================
@@ -512,9 +683,9 @@ func Process[T any](ctx context.Context, path string, fn ProcessFunc[T], opts Op
 func (p processor[T]) processDir(
 	ctx context.Context,
 	dir string,
-	opts Options,
+	opts options,
 	notifier *errNotifier,
-) ([]Result[T], []error) {
+) ([]*T, []error) {
 	dirPath := pathWithNul(dir)
 
 	rh, err := openDirEnumerator(dirPath)
@@ -539,6 +710,27 @@ func (p processor[T]) processDir(
 		}
 
 		err := readDirBatch(rh, dirBuf[:cap(dirBuf)], opts.Suffix, batch, nil)
+		if err != nil && !errors.Is(err, io.EOF) {
+			// Best-effort: keep names already read, but surface the readdir error.
+			readErr := err
+
+			if len(batch.names) == 0 {
+				ioErr := &IOError{Path: ".", Op: "readdir", Err: readErr}
+				if notifier.ioErr(ioErr) {
+					return nil, []error{ioErr}
+				}
+
+				return nil, nil
+			}
+
+			results, errs := p.processFilesSequential(ctx, dir, nil, batch.names, notifier)
+			ioErr := &IOError{Path: ".", Op: "readdir", Err: readErr}
+			if notifier.ioErr(ioErr) {
+				errs = append(errs, ioErr)
+			}
+
+			return results, errs
+		}
 
 		if len(batch.names) > opts.SmallFileThreshold {
 			if opts.Workers <= 0 {
@@ -568,20 +760,13 @@ func (p processor[T]) processDir(
 		if errors.Is(err, io.EOF) {
 			break
 		}
-
-		ioErr := &IOError{Path: ".", Op: "readdir", Err: err}
-		if notifier.ioErr(ioErr) {
-			return nil, []error{ioErr}
-		}
-
-		return nil, nil
 	}
 
 	if len(batch.names) == 0 {
 		return nil, nil
 	}
 
-	return p.processFilesSequential(ctx, dir, nil, batch.names, opts, notifier)
+	return p.processFilesSequential(ctx, dir, nil, batch.names, notifier)
 }
 
 // ============================================================================
@@ -595,9 +780,9 @@ func (p processor[T]) processDir(
 func (p processor[T]) processRecursive(
 	ctx context.Context,
 	root string,
-	opts Options,
+	opts options,
 	notifier *errNotifier,
-) ([]Result[T], []error) {
+) ([]*T, []error) {
 	if opts.Workers <= 0 {
 		opts.Workers = defaultTreeWorkers()
 	}
@@ -610,8 +795,6 @@ func (p processor[T]) processRecursive(
 }
 
 // processTree processes a directory tree with parallel workers.
-//
-// Shared by both [Process] and [ProcessReader].
 //
 // Each tree worker:
 //   - Owns all its buffers (allocated once at goroutine start)
@@ -629,7 +812,7 @@ func (p processor[T]) processRecursive(
 //	│   └─► [N tree workers] each owns:                                       │
 //	│         │                                                               │
 //	│         │ dirBuf  [32KB]  ← reused for ALL directories                  │
-//	│         │ readBuf [ReadSize] / probeBuf [4KB]  ← reused for ALL files   │
+//	│         │ Worker.Buf  ← reused for ALL files                            │
 //	│         │ pathBuf [512B]  ← reused for ALL paths                        │
 //	│         │ batch           ← reused for ALL directories                  │
 //	│         │ freeBatches     ← channel-as-freelist for large dirs          │
@@ -642,9 +825,9 @@ func (p processor[T]) processRecursive(
 func (p processor[T]) processTree(
 	ctx context.Context,
 	root string,
-	opts Options,
+	opts options,
 	notifier *errNotifier,
-) ([]Result[T], []error) {
+) ([]*T, []error) {
 	// Convert root path to NUL-terminated []byte for syscalls.
 	rootPath := pathWithNul(root)
 
@@ -653,7 +836,7 @@ func (p processor[T]) processTree(
 	//
 	// We build these via append (instead of make(len=opts.Workers)) to keep
 	// golangci-lint's makezero happy while still allowing workerID indexing.
-	workerResults := make([][]Result[T], 0, opts.Workers)
+	workerResults := make([][]*T, 0, opts.Workers)
 	workerErrs := make([][]error, 0, opts.Workers)
 
 	for range opts.Workers {
@@ -857,29 +1040,10 @@ func (p processor[T]) processTree(
 	// instead of O(files).
 	//
 	worker := func(workerID int) {
-		var bufs *workerBufs
-
-		switch p.kind {
-		case procKindBytes:
-			bufs = &workerBufs{
-				dirBuf:  make([]byte, 0, dirReadBufSize),
-				readBuf: make([]byte, opts.ReadSize),
-				pathBuf: make([]byte, 0, pathBufExtra),
-				// pathArena and batch start zero-valued, grow as needed.
-			}
-		case procKindReader:
-			bufs = &workerBufs{
-				dirBuf:   make([]byte, 0, dirReadBufSize),
-				probeBuf: make([]byte, readerProbeSize),
-				pathBuf:  make([]byte, 0, pathBufExtra),
-				// pathArena and batch start zero-valued, grow as needed.
-			}
-		case procKindLazy:
-			bufs = &workerBufs{
-				dirBuf:  make([]byte, 0, dirReadBufSize),
-				pathBuf: make([]byte, 0, pathBufExtra),
-				// dataBuf, dataArena, scratchBuf start zero-valued, grow as needed.
-			}
+		bufs := &workerBufs{
+			dirBuf:  make([]byte, 0, dirReadBufSize),
+			pathBuf: make([]byte, 0, pathBufExtra),
+			// dataBuf, dataArena, worker.buf start zero-valued, grow as needed.
 		}
 
 		// Pre-allocate batches for pipelining large directories.
@@ -895,12 +1059,11 @@ func (p processor[T]) processTree(
 		}
 
 		// Workers=1: parallelism is across directories, not within each one.
-		dirOpts := Options{
+		dirOpts := options{
 			Workers:            1,
-			ReadSize:           opts.ReadSize,
 			SmallFileThreshold: opts.SmallFileThreshold,
 			Suffix:             opts.Suffix,
-			CopyResultPath:     opts.CopyResultPath,
+			OnError:            opts.OnError,
 		}
 
 		// ====================================================================
@@ -1005,6 +1168,12 @@ func (p processor[T]) processTree(
 					return
 				}
 
+				var readErr error
+				if err != nil && !errors.Is(err, io.EOF) {
+					// Best-effort: process already-read names, but surface the readdir error.
+					readErr = err
+				}
+
 				// Large directory? Switch to pipelined processing.
 				if large {
 					dirResults, dirErrs := p.processDirPipelinedWithBatches(ctx, &treeDirPipelinedArgs{
@@ -1029,15 +1198,6 @@ func (p processor[T]) processTree(
 					return
 				}
 
-				if err != nil && !errors.Is(err, io.EOF) {
-					ioErr := &IOError{Path: dirRel, Op: "readdir", Err: err}
-					if notifier.ioErr(ioErr) {
-						workerErrs[workerID] = append(workerErrs[workerID], ioErr)
-					}
-
-					return
-				}
-
 				// Small/medium directory: process files directly.
 				if ctx.Err() == nil && len(bufs.batch.names) > 0 {
 					dh, err := openDir(job.abs)
@@ -1047,21 +1207,24 @@ func (p processor[T]) processTree(
 							workerErrs[workerID] = append(workerErrs[workerID], ioErr)
 						}
 
+						if readErr != nil {
+							readErrIO := &IOError{Path: dirRel, Op: "readdir", Err: readErr}
+							if notifier.ioErr(readErrIO) {
+								workerErrs[workerID] = append(workerErrs[workerID], readErrIO)
+							}
+						}
+
 						return
 					}
 
 					var (
-						dirResults []Result[T]
+						dirResults []*T
 						dirErrs    []error
 					)
 
 					cfg := fileProcCfg[T]{
-						kind:           p.kind,
-						fnBytes:        p.fnBytes,
-						fnReader:       p.fnReader,
-						fnLazy:         p.fnLazy,
-						notifier:       notifier,
-						copyResultPath: opts.CopyResultPath,
+						fn:       p.fn,
+						notifier: notifier,
 					}
 					out := fileProcOut[T]{results: &dirResults, errs: &dirErrs}
 
@@ -1074,6 +1237,13 @@ func (p processor[T]) processTree(
 
 					if len(dirResults) > 0 {
 						workerResults[workerID] = append(workerResults[workerID], dirResults...)
+					}
+				}
+
+				if readErr != nil {
+					readErrIO := &IOError{Path: dirRel, Op: "readdir", Err: readErr}
+					if notifier.ioErr(readErrIO) {
+						workerErrs[workerID] = append(workerErrs[workerID], readErrIO)
 					}
 				}
 			}()
@@ -1104,7 +1274,7 @@ func (p processor[T]) processTree(
 		totalResults += len(workerResults[i])
 	}
 
-	results := make([]Result[T], 0, totalResults)
+	results := make([]*T, 0, totalResults)
 	for i := range opts.Workers {
 		results = append(results, workerResults[i]...)
 	}
@@ -1131,6 +1301,11 @@ func readDirUntilLargeOrEOF(ctx context.Context, rh readdirHandle, dirBuf []byte
 
 		err := readDirBatch(rh, dirBuf, suffix, batch, reportSubdir)
 		if len(batch.names) > threshold {
+			if err != nil && !errors.Is(err, io.EOF) {
+				// Best-effort: signal error but keep already-read names.
+				return false, err
+			}
+
 			return true, nil
 		}
 
@@ -1170,14 +1345,14 @@ type treeDirPipelinedArgs struct {
 	relPrefix    []byte
 	rh           readdirHandle
 	initial      [][]byte
-	opts         Options
+	opts         options
 	reportSubdir func(name []byte)
 	notifier     *errNotifier
 	bufs         *workerBufs
 	freeBatches  chan *nameBatch
 }
 
-func (p processor[T]) processDirPipelinedWithBatches(ctx context.Context, args *treeDirPipelinedArgs) ([]Result[T], []error) {
+func (p processor[T]) processDirPipelinedWithBatches(ctx context.Context, args *treeDirPipelinedArgs) ([]*T, []error) {
 	dirRel := "."
 	if len(args.relPrefix) > 0 {
 		dirRel = string(args.relPrefix)
@@ -1194,19 +1369,15 @@ func (p processor[T]) processDirPipelinedWithBatches(ctx context.Context, args *
 	}
 
 	cfg := fileProcCfg[T]{
-		kind:           p.kind,
-		fnBytes:        p.fnBytes,
-		fnReader:       p.fnReader,
-		fnLazy:         p.fnLazy,
-		notifier:       args.notifier,
-		copyResultPath: args.opts.CopyResultPath,
+		fn:       p.fn,
+		notifier: args.notifier,
 	}
 
 	nameCh := make(chan *nameBatch, 4)
 
 	var (
 		mu      sync.Mutex
-		results []Result[T]
+		results []*T
 		allErrs []error
 	)
 
@@ -1361,39 +1532,6 @@ func (p processor[T]) processDirPipelinedWithBatches(ctx context.Context, args *
 }
 
 // ============================================================================
-// HELPERS
-// ============================================================================
-
-func withDefaults(opts Options) Options {
-	if opts.ReadSize <= 0 {
-		opts.ReadSize = defaultReadSize
-	}
-
-	if opts.SmallFileThreshold <= 0 {
-		opts.SmallFileThreshold = defaultSmallFileThreshold
-	}
-
-	return opts
-}
-
-func defaultWorkers() int {
-	w := max((runtime.GOMAXPROCS(0)*2)/3, 4)
-
-	return w
-}
-
-// defaultTreeWorkers returns the default worker count for tree traversal.
-//
-// Benchmarks on a 24-core machine showed 12 workers optimal for tree mode,
-// with regression at 16+ workers due to futex contention from goroutine
-// coordination (job queue + found channel for subdirectories).
-//
-// Formula: NumCPU/2, clamped to [4, 16].
-func defaultTreeWorkers() int {
-	return min(max(runtime.NumCPU()/2, 4), 16)
-}
-
-// ============================================================================
 // nameBatch: Arena-Style Allocation for Directory Entries
 // ============================================================================
 //
@@ -1487,6 +1625,38 @@ type nameBatch struct {
 	names [][]byte
 }
 
+// byteSeq is a small constraint used for shared helper functions that work on
+// both string directory entry names (non-Linux/Windows ReadDir) and []byte
+// directory entry names (Linux getdents64 parsing).
+//
+// Keeping these helpers in one place avoids drift across platform-specific
+// files.
+type byteSeq interface {
+	~string | ~[]byte
+}
+
+// hasSuffix reports whether name ends with suffix. Empty suffix matches all.
+//
+// Implemented once for both string and []byte names.
+func hasSuffix[S byteSeq](name S, suffix string) bool {
+	if suffix == "" {
+		return true
+	}
+
+	if len(name) < len(suffix) {
+		return false
+	}
+
+	start := len(name) - len(suffix)
+	for i := range len(suffix) {
+		if name[start+i] != suffix[i] {
+			return false
+		}
+	}
+
+	return true
+}
+
 // reset prepares the batch for reuse, preserving allocated capacity.
 //
 // The storageCap parameter hints at expected total bytes for all filenames.
@@ -1521,8 +1691,28 @@ func (b *nameBatch) reset(storageCap int) {
 	}
 }
 
-// appendBytes (Linux) / appendString (non-Linux) add a filename to the batch,
-// appending a NUL terminator. Implemented in fileproc_batch_helpers.go.
+// appendBytes / appendString add a filename to the batch, appending a NUL
+// terminator. Both variants avoid conversions in hot paths.
+
+// appendBytes adds a filename to the batch, appending a NUL terminator.
+//
+// name must NOT include a NUL terminator (it is added here).
+func (b *nameBatch) appendBytes(name []byte) {
+	start := len(b.storage)
+	b.storage = append(b.storage, name...) // copy filename bytes into arena
+	b.storage = append(b.storage, 0)       // append NUL terminator for syscalls
+	b.names = append(b.names, b.storage[start:len(b.storage)])
+}
+
+// appendString copies a filename into the batch, appending a NUL terminator.
+//
+// name must NOT include a NUL terminator (it is added here).
+func (b *nameBatch) appendString(name string) {
+	start := len(b.storage)
+	b.storage = append(b.storage, name...)
+	b.storage = append(b.storage, 0)
+	b.names = append(b.names, b.storage[start:len(b.storage)])
+}
 
 // copyName copies a name that already includes its NUL terminator.
 // Used when transferring names between batches (e.g., pipelining).

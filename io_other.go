@@ -35,8 +35,9 @@ const readDirBatchSize = 4096
 //
 // Part of the internal I/O backend contract (see io_contract.go).
 type readdirHandle struct {
-	fd int // kept for cross-platform symmetry; unused by this backend
-	f  *os.File
+	fd   int // kept for cross-platform symmetry; unused by this backend
+	f    *os.File
+	path string
 }
 
 // openDirEnumerator opens a directory for entry enumeration.
@@ -59,7 +60,7 @@ func openDirEnumerator(path []byte) (readdirHandle, error) {
 	if err != nil {
 		return readdirHandle{fd: -1}, err
 	}
-	return readdirHandle{fd: 0, f: f}, nil
+	return readdirHandle{fd: 0, f: f, path: p}, nil
 }
 
 func (h readdirHandle) closeHandle() error {
@@ -75,13 +76,13 @@ func (h readdirHandle) closeHandle() error {
 	return nil
 }
 
-// readDirBatch enumerates directory entries using (*os.File).ReadDir.
+// readDirBatchImpl enumerates directory entries using (*os.File).ReadDir.
 //
 // Names appended to batch include their trailing NUL terminator.
 //
 // If reportSubdir is non-nil, it is called for each discovered subdirectory
 // entry name (without a trailing NUL).
-func readDirBatch(rh readdirHandle, _ []byte, suffix string, batch *nameBatch, reportSubdir func(name []byte)) error {
+func readDirBatchImpl(rh readdirHandle, _ []byte, suffix string, batch *nameBatch, reportSubdir func(name []byte)) error {
 	entries, err := rh.f.ReadDir(readDirBatchSize)
 	for _, e := range entries {
 		// Use Type() instead of IsDir() to avoid following symlinks.
@@ -97,6 +98,37 @@ func readDirBatch(rh readdirHandle, _ []byte, suffix string, batch *nameBatch, r
 			if reportSubdir != nil {
 				reportSubdir([]byte(e.Name()))
 			}
+			continue
+		}
+
+		// When Type() is unknown, lstat to avoid following symlinks and to
+		// reliably detect directories and regular files.
+		if typ&fs.ModeType == 0 {
+			name := e.Name()
+			if reportSubdir == nil && !hasSuffix(name, suffix) {
+				continue
+			}
+
+			info, statErr := os.Lstat(filepath.Join(rh.path, name))
+			if statErr != nil {
+				continue
+			}
+
+			if info.Mode()&fs.ModeSymlink != 0 {
+				continue
+			}
+
+			if info.IsDir() {
+				if reportSubdir != nil {
+					reportSubdir([]byte(name))
+				}
+				continue
+			}
+
+			if info.Mode().IsRegular() && hasSuffix(name, suffix) {
+				batch.appendString(name)
+			}
+
 			continue
 		}
 
@@ -243,6 +275,11 @@ func (f fileHandle) Read(buf []byte) (int, error) {
 	}
 	if errors.Is(err, io.EOF) {
 		return n, io.EOF
+	}
+
+	// If the file became a directory, surface EISDIR so File.Read can skip it.
+	if info, statErr := f.f.Stat(); statErr == nil && info.IsDir() {
+		return 0, syscall.EISDIR
 	}
 
 	return n, fmt.Errorf("read: %w", err)
