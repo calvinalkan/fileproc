@@ -232,6 +232,10 @@ func loadSummaryFromPath(path string) (Summary, error) {
 
 func loadBaselineSet(path string) ([]Summary, error) {
 	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return []Summary{}, nil
+	}
+
 	if err != nil {
 		return nil, fmt.Errorf("read baseline file: %w", err)
 	}
