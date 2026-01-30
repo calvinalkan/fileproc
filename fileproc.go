@@ -785,7 +785,7 @@ func (p processor[T]) processRecursive(
 //   - Owns all its buffers (allocated once at goroutine start)
 //   - Processes directories from the jobs channel
 //   - Reuses buffers across ALL directories it processes
-//   - Discovers subdirectories and adds them to the found channel
+//   - Discovers subdirectories and reports them via the events channel
 //
 // Memory architecture:
 //
@@ -834,6 +834,11 @@ func (p processor[T]) processTree(
 		rel []byte // relative path for results (nil for root)
 	}
 
+	type treeEvent struct {
+		job  dirJob
+		done bool
+	}
+
 	// ========================================================================
 	// COORDINATOR GOROUTINE: Dynamic Work Distribution
 	// ========================================================================
@@ -853,30 +858,20 @@ func (p processor[T]) processTree(
 	//
 	// CHANNEL ROLES:
 	//
-	//   jobs  ←── coordinator sends directories for workers to process
-	//   found ──► workers send newly-discovered subdirectories back
-	//   doneDir ──► workers signal "I finished processing a directory"
+	//   jobs   ←── coordinator sends directories for workers to process
+	//   events ──► workers send newly-discovered subdirs or completion signals
 	//
-	// WHY THREE CHANNELS?
+	// WHY EVENTS?
 	//
-	// The tricky part is knowing when we're done. We can't just close `jobs`
-	// when the queue is empty - a worker might be about to discover more
-	// subdirectories. We need to track directories that are "in flight"
-	// (dispatched to workers but not yet fully processed).
+	// We need both "found subdir" and "done directory" signals to keep an
+	// accurate pending count. An event channel carries both kinds of signals,
+	// reducing channel count while keeping the same coordinator semantics.
 	//
-	// `pending` counts both queued AND in-flight directories. Only when
-	// pending hits zero do we know the entire tree has been processed.
+	// `pending` counts queued + in-flight directories. Only when pending hits
+	// zero do we know the entire tree has been processed.
 	//
-	// TERMINATION GUARANTEE:
-	//
-	// Every directory dispatched via `jobs` will eventually produce exactly
-	// one signal on `doneDir`. This one-to-one correspondence ensures
-	// `pending` accurately reflects outstanding work, preventing both
-	// premature termination and deadlock.
-	//
-	jobs := make(chan dirJob)                      // workers pull from here
-	found := make(chan dirJob, opts.Workers*64)    // workers push discovered subdirs here
-	doneDir := make(chan struct{}, opts.Workers*4) // workers signal completion here
+	jobs := make(chan dirJob)                       // workers pull from here
+	events := make(chan treeEvent, opts.Workers*64) // workers push discovered subdirs/completions here
 
 	var coordWG sync.WaitGroup
 
@@ -888,6 +883,24 @@ func (p processor[T]) processTree(
 
 		pending := len(queue)
 		jobsClosed := false
+
+		// Drain buffered events to avoid premature termination when pending hits zero.
+		drainEvents := func(pending int, queue []dirJob) (int, []dirJob) {
+			for {
+				select {
+				case ev := <-events:
+					if ev.done {
+						continue
+					}
+
+					pending++
+
+					queue = append(queue, ev.job)
+				default:
+					return pending, queue
+				}
+			}
+		}
 
 		// ====================================================================
 		// MAIN COORDINATION LOOP
@@ -941,34 +954,21 @@ func (p processor[T]) processTree(
 			}
 
 			select {
-			case job := <-found:
-				if stopping {
-					continue
+			case ev := <-events:
+				if ev.done {
+					pending--
+				} else if !stopping {
+					pending++
+
+					queue = append(queue, ev.job)
 				}
-
-				pending++
-
-				queue = append(queue, job)
-
-			case <-doneDir:
-				pending--
 
 				if pending == 0 && !stopping {
-					// found is buffered. Drain any already-discovered work before deciding
+					// events is buffered. Drain any already-discovered work before deciding
 					// that we're done, otherwise pending accounting can terminate early.
-					for {
-						select {
-						case job := <-found:
-							pending++
-
-							queue = append(queue, job)
-						default:
-							goto drained
-						}
-					}
+					pending, queue = drainEvents(pending, queue)
 				}
 
-			drained:
 				if pending == 0 && !jobsClosed {
 					close(jobs)
 
@@ -1114,7 +1114,7 @@ func (p processor[T]) processTree(
 					rel = append(rel, name...)
 
 					select {
-					case found <- dirJob{abs: joinPathWithNul(job.abs, name), rel: rel}:
+					case events <- treeEvent{job: dirJob{abs: joinPathWithNul(job.abs, name), rel: rel}}:
 					case <-ctx.Done():
 					}
 				}
@@ -1133,7 +1133,7 @@ func (p processor[T]) processTree(
 				// This avoids pipeline setup overhead for small directories
 				// while still benefiting from overlap in large ones.
 				//
-				large, err := readDirUntilLargeOrEOF(
+				large, err := readDirUntilFileThresholdOrEOF(
 					ctx,
 					dirEnumerator,
 					bufs.dirBuf[:cap(bufs.dirBuf)],
@@ -1228,7 +1228,8 @@ func (p processor[T]) processTree(
 			}()
 
 			// Signal coordinator that this directory is done.
-			doneDir <- struct{}{}
+			// Always report completion to avoid pending-count leaks on cancel.
+			events <- treeEvent{done: true}
 		}
 	}
 
@@ -1272,7 +1273,7 @@ func (p processor[T]) processTree(
 	return results, allErrs
 }
 
-func readDirUntilLargeOrEOF(ctx context.Context, dirEnumerator readdirHandle, dirBuf []byte, suffix string, batch *nameBatch, reportSubdir func([]byte), threshold int) (bool, error) {
+func readDirUntilFileThresholdOrEOF(ctx context.Context, dirEnumerator readdirHandle, dirBuf []byte, suffix string, batch *nameBatch, reportSubdir func([]byte), threshold int) (bool, error) {
 	for {
 		if ctx.Err() != nil {
 			return false, io.EOF
