@@ -160,12 +160,13 @@ func Process[T any](ctx context.Context, path string, fn ProcessFunc[T], opts ..
 
 	notifier := newErrNotifier(cfg.OnError)
 	proc := processor[T]{fn: fn}
+	rootPath := newNulTermPath(path)
 
 	if cfg.Recursive {
-		return proc.processTree(ctx, path, cfg, notifier)
+		return proc.processTree(ctx, rootPath, cfg, notifier)
 	}
 
-	return proc.processDir(ctx, path, cfg, notifier)
+	return proc.processDir(ctx, rootPath, cfg, notifier)
 }
 
 // IOError is returned when a file system operation fails.
@@ -302,12 +303,10 @@ type processor[T any] struct {
 // additional buffers per worker.
 func (p processor[T]) processDir(
 	ctx context.Context,
-	dir string,
+	dirPath nulTermPath,
 	opts options,
 	notifier *errNotifier,
 ) ([]*T, []error) {
-	dirPath := pathWithNul(dir)
-
 	dirEnumerator, readDirErr := openDirEnumerator(dirPath)
 	if readDirErr != nil {
 		ioErr := &IOError{Path: ".", Op: "open", Err: readDirErr}
@@ -325,8 +324,7 @@ func (p processor[T]) processDir(
 	batch.reset(cap(dirBuf) * 2)
 
 	return p.processDirAdaptive(ctx, &adaptiveDirArgs{
-		dirPath:       dir,
-		dirPathBytes:  dirPath,
+		dirPath:       dirPath,
 		relPrefix:     nil,
 		dirEnumerator: dirEnumerator,
 		dirBuf:        dirBuf[:cap(dirBuf)],
@@ -345,15 +343,14 @@ type pipelineReuse struct {
 }
 
 type adaptiveDirArgs struct {
-	dirPath       string
-	dirPathBytes  []byte
-	relPrefix     []byte
+	dirPath       nulTermPath
+	relPrefix     rootRelPath
 	dirEnumerator readdirHandle
 	dirBuf        []byte
 	batch         *nameBatch
 	opts          options
 	notifier      *errNotifier
-	reportSubdir  func([]byte)
+	reportSubdir  func(nulTermName)
 	reuse         *pipelineReuse
 }
 
@@ -386,7 +383,6 @@ func (p processor[T]) processDirAdaptive(ctx context.Context, args *adaptiveDirA
 	if large {
 		pipelineArgs := dirPipelineArgs{
 			dirPath:       args.dirPath,
-			dirPathBytes:  args.dirPathBytes,
 			relPrefix:     args.relPrefix,
 			dirEnumerator: args.dirEnumerator,
 			initialNames:  args.batch.names,
@@ -411,7 +407,7 @@ func (p processor[T]) processDirAdaptive(ctx context.Context, args *adaptiveDirA
 		sharedBufs = args.reuse.sharedBufs
 	}
 
-	return p.processDirNames(ctx, args.dirPathBytes, args.relPrefix, args.batch.names, readErr, args.notifier, sharedBufs)
+	return p.processDirNames(ctx, args.dirPath, args.relPrefix, args.batch.names, readErr, args.notifier, sharedBufs)
 }
 
 // processTree processes a directory tree with parallel workers.
@@ -444,13 +440,10 @@ func (p processor[T]) processDirAdaptive(ctx context.Context, args *adaptiveDirA
 //	└─────────────────────────────────────────────────────────────────────────┘
 func (p processor[T]) processTree(
 	ctx context.Context,
-	root string,
+	root nulTermPath,
 	opts options,
 	notifier *errNotifier,
 ) ([]*T, []error) {
-	// Convert root path to NUL-terminated []byte for syscalls.
-	rootPath := pathWithNul(root)
-
 	// Per-worker result slices - no mutex contention for results.
 	// Each worker appends to its own slice, merged at the end.
 	//
@@ -465,13 +458,24 @@ func (p processor[T]) processTree(
 	}
 
 	type dirJob struct {
-		abs []byte // absolute path for syscalls (NUL-terminated)
-		rel []byte // relative path for results (nil for root)
+		absPath nulTermPath
 	}
 
 	type treeEvent struct {
 		job  dirJob
 		done bool
+	}
+
+	// Derive relative path from absolute path by stripping root prefix.
+	// Returns nil (represents ".") for the root directory itself.
+	rootLen := root.LenWithoutNul()
+	relPathFrom := func(absPath nulTermPath) rootRelPath {
+		absLen := absPath.LenWithoutNul()
+		if absLen <= rootLen {
+			return nil
+		}
+
+		return rootRelPath(absPath[rootLen+1 : absLen])
 	}
 
 	// ========================================================================
@@ -513,10 +517,10 @@ func (p processor[T]) processTree(
 	coordWG.Go(func() {
 		queue := make([]dirJob, 0, 1024) // typical tree breadth; grows if needed
 
-		// Seed queue with the root directory itself.
-		queue = append(queue, dirJob{abs: rootPath, rel: nil})
+		// Seed queue with the root directory itself, this starts the tree walk.
+		queue = append(queue, dirJob{absPath: root})
 
-		pending := len(queue)
+		pendingDirJobs := len(queue)
 		jobsClosed := false
 
 		// Drain buffered events to avoid premature termination when pending hits zero.
@@ -558,16 +562,14 @@ func (p processor[T]) processTree(
 		//
 		// A naive approach might use a mutex-protected queue that workers
 		// access directly. But this creates contention - workers would
-		// fight over the lock. The coordinator pattern serializes queue
-		// access in a single goroutine, using channels for communication.
-		// This is faster and easier to reason about.
+		// fight over the lock. Benchmarks showed that channels were faster.
 		//
-		for pending > 0 {
+		for pendingDirJobs > 0 {
 			stopping := ctx.Err() != nil
 
 			if stopping {
 				if len(queue) > 0 {
-					pending -= len(queue)
+					pendingDirJobs -= len(queue)
 					queue = queue[:0]
 				}
 
@@ -591,20 +593,20 @@ func (p processor[T]) processTree(
 			select {
 			case ev := <-events:
 				if ev.done {
-					pending--
+					pendingDirJobs--
 				} else if !stopping {
-					pending++
+					pendingDirJobs++
 
 					queue = append(queue, ev.job)
 				}
 
-				if pending == 0 && !stopping {
+				if pendingDirJobs == 0 && !stopping {
 					// events is buffered. Drain any already-discovered work before deciding
 					// that we're done, otherwise pending accounting can terminate early.
-					pending, queue = drainEvents(pending, queue)
+					pendingDirJobs, queue = drainEvents(pendingDirJobs, queue)
 				}
 
-				if pending == 0 && !jobsClosed {
+				if pendingDirJobs == 0 && !jobsClosed {
 					close(jobs)
 
 					jobsClosed = true
@@ -711,14 +713,9 @@ func (p processor[T]) processTree(
 					return
 				}
 
-				dirRel := "."
-				if len(job.rel) > 0 {
-					dirRel = string(job.rel)
-				}
-
-				dirEnumerator, err := openDirEnumerator(job.abs)
+				dirEnumerator, err := openDirEnumerator(job.absPath)
 				if err != nil {
-					ioErr := &IOError{Path: dirRel, Op: "open", Err: err}
+					ioErr := &IOError{Path: relPathFrom(job.absPath).String(), Op: "open", Err: err}
 					if notifier.ioErr(ioErr) {
 						workerErrs[workerID] = append(workerErrs[workerID], ioErr)
 					}
@@ -740,16 +737,16 @@ func (p processor[T]) processTree(
 				// don't know the full tree structure until we've visited every
 				// directory.
 				//
-				// NOTE: We must allocate new slices for rel (relative path)
-				// because dirJob is sent to a channel and processed later.
-				// The job's byte slices must outlive this callback.
-				//
-				reportSubdir := func(name []byte) {
-					rel := make([]byte, 0, relPathCap(job.rel, name))
-					rel = buildRelPath(rel, job.rel, name)
+				reportSubdir := func(name nulTermName) {
+					// Build child absPath: parent + "/" + name (includes NUL from name).
+					parentLen := job.absPath.LenWithoutNul()
+					childAbs := make([]byte, 0, parentLen+1+len(name))
+					childAbs = append(childAbs, job.absPath[:parentLen]...)
+					childAbs = append(childAbs, '/')
+					childAbs = append(childAbs, name...) // includes NUL
 
 					select {
-					case events <- treeEvent{job: dirJob{abs: joinPathWithNul(job.abs, name), rel: rel}}:
+					case events <- treeEvent{job: dirJob{absPath: childAbs}}:
 					case <-ctx.Done():
 					}
 				}
@@ -759,9 +756,8 @@ func (p processor[T]) processTree(
 				// Adaptive processing: switch to pipelined mode when the directory
 				// exceeds SmallFileThreshold, otherwise process sequentially.
 				dirResults, dirErrs := p.processDirAdaptive(ctx, &adaptiveDirArgs{
-					dirPath:       "",
-					dirPathBytes:  job.abs,
-					relPrefix:     job.rel,
+					dirPath:       job.absPath,
+					relPrefix:     relPathFrom(job.absPath),
 					dirEnumerator: dirEnumerator,
 					dirBuf:        bufs.dirBuf[:cap(bufs.dirBuf)],
 					batch:         &bufs.batch,
@@ -825,7 +821,7 @@ func (p processor[T]) processTree(
 	return results, allErrs
 }
 
-func readDirUntilThresholdOrEOF(ctx context.Context, dirEnumerator readdirHandle, dirBuf []byte, suffix string, batch *nameBatch, reportSubdir func([]byte), threshold int) (bool, error) {
+func readDirUntilThresholdOrEOF(ctx context.Context, dirEnumerator readdirHandle, dirBuf []byte, suffix string, batch *nameBatch, reportSubdir func(nulTermName), threshold int) (bool, error) {
 	for {
 		if ctx.Err() != nil {
 			return false, io.EOF

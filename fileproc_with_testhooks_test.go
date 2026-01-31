@@ -17,11 +17,11 @@ func Test_ReaddirError_BestEffort_NonRecursive(t *testing.T) {
 
 	errSentinel := errors.New("readdir boom")
 
-	restore := setReadDirBatchHook(func(rh readdirHandle, buf []byte, suffix string, batch *nameBatch, reportSubdir func([]byte)) error {
+	restore := setReadDirBatchHook(func(rh readdirHandle, buf []byte, suffix string, batch *nameBatch, reportSubdir func(nulTermName)) error {
 		// Hook is global to this test binary; keep tests non-parallel to avoid interference.
 		// Inject a non-EOF error after providing some names to test best-effort behavior.
-		batch.appendBytes([]byte("a.txt"))
-		batch.appendBytes([]byte("b.txt"))
+		batch.addName(nulTermName(append([]byte("a.txt"), 0)))
+		batch.addName(nulTermName(append([]byte("b.txt"), 0)))
 
 		return errSentinel
 	})
@@ -55,19 +55,19 @@ func Test_ReaddirError_BestEffort_Pipelined(t *testing.T) {
 	errSentinel := errors.New("readdir boom")
 	callCount := 0
 
-	restore := setReadDirBatchHook(func(rh readdirHandle, buf []byte, suffix string, batch *nameBatch, reportSubdir func([]byte)) error {
+	restore := setReadDirBatchHook(func(rh readdirHandle, buf []byte, suffix string, batch *nameBatch, reportSubdir func(nulTermName)) error {
 		// Hook is global to this test binary; keep tests non-parallel to avoid interference.
 		callCount++
 		switch callCount {
 		case 1:
 			// Seed enough names to trigger pipelining without error.
-			batch.appendBytes([]byte("a.txt"))
-			batch.appendBytes([]byte("b.txt"))
+			batch.addName(nulTermName(append([]byte("a.txt"), 0)))
+			batch.addName(nulTermName(append([]byte("b.txt"), 0)))
 
 			return nil
 		case 2:
 			// Next batch returns a non-EOF error but still provides names.
-			batch.appendBytes([]byte("c.txt"))
+			batch.addName(nulTermName(append([]byte("c.txt"), 0)))
 
 			return errSentinel
 		default:
@@ -107,11 +107,11 @@ func Test_ReaddirError_BestEffort_Recursive(t *testing.T) {
 
 	errSentinel := errors.New("readdir boom")
 
-	restore := setReadDirBatchHook(func(rh readdirHandle, buf []byte, suffix string, batch *nameBatch, reportSubdir func([]byte)) error {
+	restore := setReadDirBatchHook(func(rh readdirHandle, buf []byte, suffix string, batch *nameBatch, reportSubdir func(nulTermName)) error {
 		// Hook is global to this test binary; keep tests non-parallel to avoid interference.
 		// Inject a non-EOF error after providing some names to test best-effort behavior.
-		batch.appendBytes([]byte("a.txt"))
-		batch.appendBytes([]byte("b.txt"))
+		batch.addName(nulTermName(append([]byte("a.txt"), 0)))
+		batch.addName(nulTermName(append([]byte("b.txt"), 0)))
 
 		return errSentinel
 	})

@@ -31,13 +31,13 @@ import (
 // openat opens a file relative to a directory fd using a raw syscall.
 //
 // name must include its trailing NUL terminator.
-func openat(dirfd int, name []byte) (int, error) {
+func openat(dirfd int, name nulTermName) (int, error) {
 	// Retry on EINTR without an upper bound, matching Go's standard library.
 	for {
 		fd, _, errno := syscall.Syscall6(
 			syscall.SYS_OPENAT,
 			uintptr(dirfd),
-			uintptr(unsafe.Pointer(&name[0])),
+			uintptr(unsafe.Pointer(name.Ptr())),
 			uintptr(unix.O_RDONLY|unix.O_CLOEXEC|unix.O_LARGEFILE|unix.O_NOFOLLOW|unix.O_NONBLOCK),
 			0, 0, 0,
 		)
@@ -87,12 +87,12 @@ type readdirHandle struct {
 
 // openDirEnumerator opens a directory for entry enumeration.
 // path must include its trailing NUL terminator.
-func openDirEnumerator(path []byte) (readdirHandle, error) {
+func openDirEnumerator(path nulTermPath) (readdirHandle, error) {
 	for {
 		fd, _, errno := syscall.Syscall6(
 			syscall.SYS_OPENAT,
 			atFDCWD,
-			uintptr(unsafe.Pointer(&path[0])),
+			uintptr(unsafe.Pointer(path.Ptr())),
 			uintptr(unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_LARGEFILE|unix.O_NOFOLLOW),
 			0, 0, 0,
 		)
@@ -129,7 +129,7 @@ func (h readdirHandle) closeHandle() error {
 //
 // If reportSubdir is non-nil, it is called for each discovered subdirectory
 // entry name (without a trailing NUL).
-func readDirBatchImpl(rh readdirHandle, buf []byte, suffix string, batch *nameBatch, reportSubdir func(name []byte)) error {
+func readDirBatchImpl(rh readdirHandle, buf []byte, suffix string, batch *nameBatch, reportSubdir func(nulTermName)) error {
 	// Retry ReadDirent on EINTR without an upper bound, matching Go's stdlib.
 	var (
 		read int
@@ -168,33 +168,36 @@ func readDirBatchImpl(rh readdirHandle, buf []byte, suffix string, batch *nameBa
 
 		// Extract filename (ends at first NUL byte).
 		nameBytes := entry[direntNameOffset:reclen]
+		nulPos := 0
+
 		for i, b := range nameBytes {
 			if b == 0 {
-				nameBytes = nameBytes[:i]
+				nulPos = i
 
 				break
 			}
 		}
 
-		if len(nameBytes) == 0 || isDotEntry(nameBytes) {
+		if nulPos == 0 || isDotEntry(nameBytes[:nulPos]) {
 			continue
 		}
 
 		entryType := entry[direntTypeOffset]
+		name := nulTermName(nameBytes[:nulPos+1])
 
 		switch entryType {
 		case syscall.DT_DIR:
 			if reportSubdir != nil {
-				reportSubdir(nameBytes)
+				reportSubdir(name)
 			}
 
 		case syscall.DT_REG:
-			if hasSuffix(nameBytes, suffix) {
-				batch.appendBytes(nameBytes)
+			if name.HasSuffix(suffix) {
+				batch.addName(name)
 			}
 
 		case syscall.DT_UNKNOWN:
-			info, statErr := classifyAt(rh.fd, nameBytes)
+			info, statErr := classifyAt(rh.fd, name)
 			if statErr != nil {
 				// Can't classify (racy entry, permissions, etc.). Skip safely.
 				break
@@ -206,14 +209,14 @@ func readDirBatchImpl(rh readdirHandle, buf []byte, suffix string, batch *nameBa
 
 			if info.isDir {
 				if reportSubdir != nil {
-					reportSubdir(nameBytes)
+					reportSubdir(name)
 				}
 
 				break
 			}
 
-			if info.isReg && hasSuffix(nameBytes, suffix) {
-				batch.appendBytes(nameBytes)
+			if info.isReg && name.HasSuffix(suffix) {
+				batch.addName(name)
 			}
 
 		default:
@@ -241,19 +244,24 @@ type classifyResult struct {
 // classifyAt classifies the named entry using fstatat(AT_SYMLINK_NOFOLLOW).
 //
 // Only used when d_type == DT_UNKNOWN.
-func classifyAt(dirfd int, name []byte) (classifyResult, error) {
+func classifyAt(dirfd int, name nulTermName) (classifyResult, error) {
 	var st unix.Stat_t
 
-	nameStr := string(name)
-
 	for {
-		err := unix.Fstatat(dirfd, nameStr, &st, unix.AT_SYMLINK_NOFOLLOW)
-		if errors.Is(err, syscall.EINTR) {
+		_, _, errno := syscall.Syscall6(
+			syscall.SYS_NEWFSTATAT,
+			uintptr(dirfd),
+			uintptr(unsafe.Pointer(name.Ptr())),
+			uintptr(unsafe.Pointer(&st)),
+			unix.AT_SYMLINK_NOFOLLOW,
+			0, 0,
+		)
+		if errno == syscall.EINTR {
 			continue
 		}
 
-		if err != nil {
-			return classifyResult{}, fmt.Errorf("fstatat: %w", err)
+		if errno != 0 {
+			return classifyResult{}, fmt.Errorf("fstatat: %w", errno)
 		}
 
 		break
@@ -294,12 +302,12 @@ type fileHandle struct {
 
 // openDir opens a directory for file operations.
 // path must include its trailing NUL terminator.
-func openDir(path []byte) (dirHandle, error) {
+func openDir(path nulTermPath) (dirHandle, error) {
 	for {
 		fd, _, errno := syscall.Syscall6(
 			syscall.SYS_OPENAT,
 			atFDCWD,
-			uintptr(unsafe.Pointer(&path[0])),
+			uintptr(unsafe.Pointer(path.Ptr())),
 			uintptr(unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_LARGEFILE|unix.O_NOFOLLOW),
 			0, 0, 0,
 		)
@@ -317,7 +325,7 @@ func openDir(path []byte) (dirHandle, error) {
 
 // openDirFromReaddir creates a dirHandle from an already-open readdirHandle.
 // The returned dirHandle borrows the fd; closing the readdirHandle closes it.
-func openDirFromReaddir(rh readdirHandle, _ string) (dirHandle, error) {
+func openDirFromReaddir(rh readdirHandle, _ nulTermPath) (dirHandle, error) {
 	return dirHandle{fd: rh.fd, ownsFd: false}, nil
 }
 
@@ -334,7 +342,7 @@ func (d dirHandle) closeHandle() error {
 	return nil
 }
 
-func (d dirHandle) openFile(name []byte) (fileHandle, error) {
+func (d dirHandle) openFile(name nulTermName) (fileHandle, error) {
 	if len(name) <= 1 { // empty or just NUL
 		return fileHandle{fd: -1}, syscall.ENOENT
 	}
@@ -347,22 +355,27 @@ func (d dirHandle) openFile(name []byte) (fileHandle, error) {
 	return fileHandle{fd: fd}, nil
 }
 
-func (d dirHandle) statFile(name []byte) (Stat, statKind, error) {
+func (d dirHandle) statFile(name nulTermName) (Stat, statKind, error) {
 	if len(name) <= 1 {
 		return Stat{}, statKindOther, syscall.ENOENT
 	}
 
-	nameStr := string(name[:nameLen(name)])
-
 	var st unix.Stat_t
 	for {
-		err := unix.Fstatat(d.fd, nameStr, &st, unix.AT_SYMLINK_NOFOLLOW)
-		if errors.Is(err, syscall.EINTR) {
+		_, _, errno := syscall.Syscall6(
+			syscall.SYS_NEWFSTATAT,
+			uintptr(d.fd),
+			uintptr(unsafe.Pointer(name.Ptr())),
+			uintptr(unsafe.Pointer(&st)),
+			unix.AT_SYMLINK_NOFOLLOW,
+			0, 0,
+		)
+		if errno == syscall.EINTR {
 			continue
 		}
 
-		if err != nil {
-			return Stat{}, statKindOther, fmt.Errorf("fstatat: %w", err)
+		if errno != 0 {
+			return Stat{}, statKindOther, fmt.Errorf("fstatat: %w", errno)
 		}
 
 		break

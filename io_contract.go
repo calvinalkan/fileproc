@@ -30,12 +30,12 @@ import "io"
 //
 // Semantics notes (expected by the pipeline):
 //
-//   - Paths passed to openDirEnumerator/openDir are NUL-terminated ([]byte with
-//     a trailing 0), as produced by pathWithNul() (fileproc.go:1555).
+//   - Paths passed to openDirEnumerator/openDir are NUL-terminated (NulTermPath
+//     with a trailing 0), as produced by NewNulTermPath().
 //
-//   - Directory enumeration fills a *nameBatch* (fileproc.go:1413). Every name
-//     stored in nameBatch.names must include its trailing NUL terminator so it
-//     can be passed directly to Unix syscalls (and so nameLen() works).
+//   - Directory enumeration fills a *nameBatch*. Every name stored in
+//     nameBatch.names is a NulTermName (includes trailing NUL terminator)
+//     so it can be passed directly to Unix syscalls.
 //
 //   - Recursive mode is signaled by a non-nil reportSubdir callback passed to
 //     readDirBatch. Non-recursive mode passes reportSubdir=nil.
@@ -43,7 +43,7 @@ import "io"
 //     Backends must:
 //       - call reportSubdir(entryName) for each discovered subdirectory if and
 //         only if reportSubdir != nil
-//       - pass entryName *without* a trailing NUL terminator
+//       - pass entryName as NulTermName (with trailing NUL terminator)
 //       - treat entryName as ephemeral (it may point into a reusable buffer);
 //         reportSubdir must copy it if it needs to retain it
 //
@@ -57,10 +57,10 @@ import "io"
 
 // Function signatures required by the pipeline.
 var (
-	_ func([]byte) (readdirHandle, error)                                 = openDirEnumerator
-	_ func(readdirHandle, []byte, string, *nameBatch, func([]byte)) error = readDirBatchImpl
-	_ func([]byte) (dirHandle, error)                                     = openDir
-	_ func(readdirHandle, string) (dirHandle, error)                      = openDirFromReaddir
+	_ func(nulTermPath) (readdirHandle, error)                                 = openDirEnumerator
+	_ func(readdirHandle, []byte, string, *nameBatch, func(nulTermName)) error = readDirBatchImpl
+	_ func(nulTermPath) (dirHandle, error)                                     = openDir
+	_ func(readdirHandle, nulTermPath) (dirHandle, error)                      = openDirFromReaddir
 )
 
 // Method sets required by the pipeline.
@@ -72,8 +72,8 @@ type (
 
 	ioDirHandle interface {
 		closeHandle() error
-		openFile(name []byte) (fileHandle, error)
-		statFile(name []byte) (Stat, statKind, error)
+		openFile(name nulTermName) (fileHandle, error)
+		statFile(name nulTermName) (Stat, statKind, error)
 	}
 
 	ioFileHandle interface {

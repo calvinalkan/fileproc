@@ -26,9 +26,9 @@ type Stat struct {
 // the other returns an error.
 type File struct {
 	dh   dirHandle
-	name []byte // NUL-terminated filename
+	name nulTermName // NUL-terminated filename
 
-	relPath  []byte // ephemeral relative path (no NUL)
+	relPath  rootRelPath // ephemeral relative path (no NUL)
 	st       Stat
 	statDone bool
 

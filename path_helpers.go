@@ -3,62 +3,38 @@ package fileproc
 import "os"
 
 // ============================================================================
-// Path helpers
+// Path types
 // ============================================================================
+//
+// These types provide compile-time safety for the different path representations
+// used throughout the package. All are zero-cost wrappers around []byte.
+//
+// NUL-terminated types (for syscalls):
+//   - NulTermPath: path with trailing NUL (e.g., "/foo/bar\x00")
+//   - NulTermName: entry name with trailing NUL (e.g., "file.txt\x00")
+//
+// Non-NUL types:
+//   - RootRelPath: relative path without NUL (e.g., "subdir/file.txt")
+//
+// Why NUL-terminated?
+//
+// Unix syscalls (open, openat, stat, etc.) expect C-style NUL-terminated strings.
+// Go's string type is not NUL-terminated, so we must append a NUL byte before
+// passing to syscalls. These types make the requirement explicit and prevent
+// accidentally passing non-NUL-terminated paths to syscalls.
 
-// relPathString returns "." for the relative root directory, and the string form if not.
-func relPathString(relPrefix []byte) string {
-	if len(relPrefix) == 0 {
-		return "."
-	}
+// nulTermPath is a NUL-terminated absolute path for syscalls.
+//
+// The trailing NUL byte is always present and included in len().
+// Used with: openDirEnumerator, openDir, and similar syscall wrappers.
+//
+// Create with NewNulTermPath or nulTermPath.Join.
+type nulTermPath []byte
 
-	return string(relPrefix)
-}
-
-// relPathCap returns the capacity needed for prefix + name (strip trailing NUL if present).
-func relPathCap(prefix []byte, name []byte) int {
-	nameSize := nameLen(name)
-	if len(prefix) == 0 {
-		return nameSize
-	}
-
-	return len(prefix) + 1 + nameSize
-}
-
-// buildRelPath appends prefix + name into buf and returns the resulting slice.
-// name may include a trailing NUL terminator; the result never includes it.
-func buildRelPath(buf []byte, prefix []byte, name []byte) []byte {
-	buf = buf[:0]
-	buf = appendPathPrefix(buf, prefix)
-
-	nameSize := nameLen(name)
-	if nameSize == 0 {
-		return buf
-	}
-
-	return append(buf, name[:nameSize]...)
-}
-
-// appendPathPrefix appends prefix and a separator (if needed) to buf.
-// Caller controls buf capacity and initial length.
-func appendPathPrefix(buf []byte, prefix []byte) []byte {
-	if len(prefix) == 0 {
-		return buf
-	}
-
-	buf = append(buf, prefix...)
-
-	last := prefix[len(prefix)-1]
-	if last != os.PathSeparator && last != '/' {
-		buf = append(buf, os.PathSeparator)
-	}
-
-	return buf
-}
-
-// pathWithNul converts a string path to []byte with NUL terminator.
-// Used for syscalls that require NUL-terminated paths.
-func pathWithNul(s string) []byte {
+// newNulTermPath creates a NUL-terminated path from a string.
+// This allocates; use sparingly (typically once at Process entry).
+// Caller must ensure string is not already NUL-terminated.
+func newNulTermPath(s string) nulTermPath {
 	b := make([]byte, 0, len(s)+1)
 	b = append(b, s...)
 	b = append(b, 0)
@@ -66,9 +42,10 @@ func pathWithNul(s string) []byte {
 	return b
 }
 
-// pathStr converts a NUL-terminated path back to string (strips NUL).
-// Used for error messages.
-func pathStr(p []byte) string {
+// String returns the path without the trailing NUL.
+// Allocates a new string; use for error messages and debugging.
+// Used in io_unix.go and io_other.go backends.
+func (p nulTermPath) String() string {
 	if len(p) > 0 && p[len(p)-1] == 0 {
 		return string(p[:len(p)-1])
 	}
@@ -76,46 +53,125 @@ func pathStr(p []byte) string {
 	return string(p)
 }
 
-// joinPathWithNul joins a base path (NUL-terminated) with a name and returns
-// a new NUL-terminated path. base must be NUL-terminated.
-func joinPathWithNul(base, name []byte) []byte {
-	// base includes NUL at end, name does not include NUL.
-	baseLen := len(base)
-	if baseLen > 0 && base[baseLen-1] == 0 {
-		baseLen--
+// Ptr returns a pointer to the first byte for use with syscalls.
+// The caller must ensure p is non-empty.
+func (p nulTermPath) Ptr() *byte {
+	return &p[0]
+}
+
+// LenWithoutNul returns the path length excluding the trailing NUL.
+func (p nulTermPath) LenWithoutNul() int {
+	if len(p) > 0 && p[len(p)-1] == 0 {
+		return len(p) - 1
 	}
 
-	sep := byte(os.PathSeparator)
+	return len(p)
+}
 
-	// Note: We must not blindly append a separator. For example, when base is the
-	// filesystem root ("/" on Unix, "C:\\" on Windows), it already ends with a
-	// separator.
-	result := make([]byte, 0, baseLen+1+len(name)+1)
+// nulTermName is a NUL-terminated entry name for syscalls.
+//
+// Used for both file and directory names from directory listings.
+// Unlike [nulTermPath], this is just a name (no path separator components).
+// The trailing NUL byte is always present and included in len().
+//
+// Stored in nameBatch.names and File.name.
+type nulTermName []byte
 
-	result = append(result, base[:baseLen]...)
-	if baseLen > 0 {
-		last := base[baseLen-1]
-		if last != sep && last != '/' {
-			result = append(result, sep)
+// String returns the name without the trailing NUL.
+// Used in io_unix.go and io_other.go backends.
+func (n nulTermName) String() string {
+	if len(n) > 0 && n[len(n)-1] == 0 {
+		return string(n[:len(n)-1])
+	}
+
+	return string(n)
+}
+
+// LenWithoutNul returns the name length excluding the trailing NUL.
+func (n nulTermName) LenWithoutNul() int {
+	if len(n) > 0 && n[len(n)-1] == 0 {
+		return len(n) - 1
+	}
+
+	return len(n)
+}
+
+// Ptr returns a pointer to the first byte for use with syscalls.
+// The caller must ensure n is non-empty.
+func (n nulTermName) Ptr() *byte {
+	return &n[0]
+}
+
+// Bytes returns the name without the trailing NUL as a byte slice.
+// The returned slice shares memory with n; do not modify.
+func (n nulTermName) Bytes() []byte {
+	if len(n) > 0 && n[len(n)-1] == 0 {
+		return n[:len(n)-1]
+	}
+
+	return n
+}
+
+// HasSuffix reports whether the filename ends with suffix.
+// Empty suffix matches all filenames.
+func (n nulTermName) HasSuffix(suffix string) bool {
+	if suffix == "" {
+		return true
+	}
+
+	nameLen := n.LenWithoutNul()
+	suffixLen := len(suffix)
+
+	if nameLen < suffixLen {
+		return false
+	}
+
+	start := nameLen - suffixLen
+	for i := range suffixLen {
+		if n[start+i] != suffix[i] {
+			return false
 		}
 	}
 
-	result = append(result, name...)
-	result = append(result, 0)
-
-	return result
+	return true
 }
 
-// nameLen returns the length of the filename excluding a trailing NUL, if present.
-// Use this when calculating buffer sizes or path lengths.
-func nameLen(name []byte) int {
-	if len(name) == 0 {
-		return 0
+// rootRelPath is a path relative to the root directory passed to [Process].
+//
+// Does NOT include a NUL terminator. Used for user-facing output:
+// File.RelPathBorrowed(), error messages, etc. Never passed to syscalls.
+//
+// Example: for root "/home/user/project" and file at
+// "/home/user/project/src/main.go", rootRelPath is "src/main.go".
+type rootRelPath []byte
+
+// String returns the path as a string.
+// Returns "." for empty/root paths.
+func (p rootRelPath) String() string {
+	if len(p) == 0 {
+		return "."
 	}
 
-	if name[len(name)-1] == 0 {
-		return len(name) - 1
+	return string(p)
+}
+
+// Len returns the path length.
+func (p rootRelPath) Len() int {
+	return len(p)
+}
+
+// AppendTo appends p/name to buf and returns the resulting slice.
+// Used for buffer reuse patterns where allocation is amortized.
+func (p rootRelPath) AppendTo(buf []byte, name nulTermName) rootRelPath {
+	buf = buf[:0]
+
+	nameLen := name.LenWithoutNul()
+	if len(p) == 0 {
+		return append(buf, name[:nameLen]...)
 	}
 
-	return len(name)
+	buf = append(buf, p...)
+	buf = append(buf, os.PathSeparator)
+
+	return append(buf, name[:nameLen]...)
 }

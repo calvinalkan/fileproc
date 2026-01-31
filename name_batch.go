@@ -74,10 +74,10 @@ package fileproc
 //	fd, err := unix.Openat(dirfd, &name[0], flags, 0)
 //
 //	// For display/logging (exclude NUL):
-//	fmt.Println(string(name[:nameLen(name)]))  // "file1.md"
+//	fmt.Println(name.String())  // "file1.md"
 //
 //	// For path building (get length without NUL):
-//	pathLen := prefixLen + nameLen(name)  // 8, not 9
+//	pathLen := prefixLen + name.LenWithoutNul()  // 8, not 9
 //
 // INVARIANT: Every slice in names includes its NUL terminator, so
 // name[len(name)-1] == 0 always holds. This makes the contract explicit
@@ -91,42 +91,7 @@ type nameBatch struct {
 	// names contains slice headers pointing into storage. Each slice
 	// represents one filename INCLUDING its NUL terminator. These are
 	// NOT separate allocations - they're just "views" into storage.
-	names [][]byte
-}
-
-// byteSeq is a small constraint used for shared helper functions that work on
-// both string directory entry names (non-Linux/Windows ReadDir) and []byte
-// directory entry names (Linux getdents64 parsing).
-//
-// Keeping these helpers in one place avoids drift across platform-specific
-// files.
-type byteSeq interface {
-	~string | ~[]byte
-}
-
-// hasSuffix reports whether name ends with suffix. Empty suffix matches all.
-//
-// Implemented once for both string and []byte names.
-func hasSuffix[S byteSeq](name S, suffix string) bool {
-	if suffix == "" {
-		return true
-	}
-
-	nameLen := len(name)
-	suffixLen := len(suffix)
-
-	if nameLen < suffixLen {
-		return false
-	}
-
-	start := nameLen - suffixLen
-	for i := range suffixLen {
-		if name[start+i] != suffix[i] {
-			return false
-		}
-	}
-
-	return true
+	names []nulTermName
 }
 
 // reset prepares the batch for reuse, preserving allocated capacity.
@@ -157,28 +122,14 @@ func (b *nameBatch) reset(storageCap int) {
 	// But for typical directories, this eliminates all names slice growth.
 	namesCap := storageCap / 20
 	if namesCap > 0 && cap(b.names) < namesCap {
-		b.names = make([][]byte, 0, namesCap)
+		b.names = make([]nulTermName, 0, namesCap)
 	} else {
 		b.names = b.names[:0]
 	}
 }
 
-// appendBytes / appendString add a filename to the batch, appending a NUL
-// terminator. Both variants avoid conversions in hot paths.
-
-// appendBytes adds a filename to the batch, appending a NUL terminator.
-//
-// name must NOT include a NUL terminator (it is added here).
-func (b *nameBatch) appendBytes(name []byte) {
-	start := len(b.storage)
-	b.storage = append(b.storage, name...) // copy filename bytes into arena
-	b.storage = append(b.storage, 0)       // append NUL terminator for syscalls
-	b.names = append(b.names, b.storage[start:len(b.storage)])
-}
-
-// copyName copies a name that already includes its NUL terminator.
-// Used when transferring names between batches (e.g., pipelining).
-func (b *nameBatch) copyName(name []byte) {
+// addName appends a name to the batch. The name must include its NUL terminator.
+func (b *nameBatch) addName(name nulTermName) {
 	start := len(b.storage)
 	b.storage = append(b.storage, name...) // name already includes NUL
 	b.names = append(b.names, b.storage[start:len(b.storage)])

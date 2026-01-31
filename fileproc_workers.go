@@ -51,16 +51,14 @@ type fileProcOut[T any] struct {
 }
 
 type dirPipelineArgs struct {
-	// One of dirPath or dirPathBytes must be set for openDirFromReaddir.
-	// dirPathBytes is NUL-terminated (tree traversal).
-	dirPath      string
-	dirPathBytes []byte
+	// dirPath is NUL-terminated path for syscalls.
+	dirPath nulTermPath
 
-	relPrefix     []byte
+	relPrefix     rootRelPath
 	dirEnumerator readdirHandle
-	initialNames  [][]byte
+	initialNames  []nulTermName
 	suffix        string
-	reportSubdir  func(name []byte)
+	reportSubdir  func(nulTermName)
 	notifier      *errNotifier
 	dirBuf        []byte
 	// Filled by processDirPipelined before running the pipeline.
@@ -83,9 +81,9 @@ type dirPipelineArgs struct {
 // Tree workers pass their owned bufs to avoid per-directory allocations.
 func (p processor[T]) processDirNames(
 	ctx context.Context,
-	dirPath []byte,
-	relPrefix []byte,
-	names [][]byte,
+	dirPath nulTermPath,
+	relPrefix rootRelPath,
+	names []nulTermName,
 	readErr error,
 	notifier *errNotifier,
 	bufs *workerBufs,
@@ -99,7 +97,7 @@ func (p processor[T]) processDirNames(
 			return nil, nil
 		}
 
-		ioErr := &IOError{Path: relPathString(relPrefix), Op: "readdir", Err: readErr}
+		ioErr := &IOError{Path: relPrefix.String(), Op: "readdir", Err: readErr}
 		if notifier.ioErr(ioErr) {
 			return nil, []error{ioErr}
 		}
@@ -115,7 +113,7 @@ func (p processor[T]) processDirNames(
 		}
 
 		if readErr != nil {
-			ioErr := &IOError{Path: relPathString(relPrefix), Op: "readdir", Err: readErr}
+			ioErr := &IOError{Path: relPrefix.String(), Op: "readdir", Err: readErr}
 			if notifier.ioErr(ioErr) {
 				errs = append(errs, ioErr)
 			}
@@ -127,7 +125,7 @@ func (p processor[T]) processDirNames(
 	defer func() { _ = dh.closeHandle() }()
 
 	if bufs == nil {
-		pathBufCap := len(relPrefix) + pathBufExtra
+		pathBufCap := relPrefix.Len() + pathBufExtra
 		bufs = &workerBufs{
 			pathBuf: make([]byte, 0, pathBufCap),
 			// dataBuf, dataArena, worker.buf start zero-valued, grow as needed.
@@ -144,7 +142,7 @@ func (p processor[T]) processDirNames(
 		return results, errs
 	}
 
-	ioErr := &IOError{Path: relPathString(relPrefix), Op: "readdir", Err: readErr}
+	ioErr := &IOError{Path: relPrefix.String(), Op: "readdir", Err: readErr}
 	if notifier.ioErr(ioErr) {
 		errs = append(errs, ioErr)
 	}
@@ -152,13 +150,13 @@ func (p processor[T]) processDirNames(
 	return results, errs
 }
 
-func openDirForFiles(dirPath []byte, relPrefix []byte, notifier *errNotifier) (dirHandle, *IOError, bool) {
+func openDirForFiles(dirPath nulTermPath, relPrefix rootRelPath, notifier *errNotifier) (dirHandle, *IOError, bool) {
 	dh, err := openDir(dirPath)
 	if err == nil {
 		return dh, nil, true
 	}
 
-	ioErr := &IOError{Path: relPathString(relPrefix), Op: "open", Err: err}
+	ioErr := &IOError{Path: relPrefix.String(), Op: "open", Err: err}
 	if notifier.ioErr(ioErr) {
 		return dirHandle{}, ioErr, false
 	}
@@ -169,8 +167,8 @@ func openDirForFiles(dirPath []byte, relPrefix []byte, notifier *errNotifier) (d
 func processFilesWithHandle[T any](
 	ctx context.Context,
 	dh dirHandle,
-	relPrefix []byte,
-	names [][]byte,
+	relPrefix rootRelPath,
+	names []nulTermName,
 	cfg fileProcCfg[T],
 	bufs *workerBufs,
 ) ([]*T, []error) {
@@ -192,8 +190,8 @@ func processFilesWithHandle[T any](
 func processFilesInto[T any](
 	ctx context.Context,
 	dh dirHandle,
-	relPrefix []byte,
-	names [][]byte,
+	relPrefix rootRelPath,
+	names []nulTermName,
 	cfg fileProcCfg[T],
 	bufs *workerBufs,
 	out fileProcOut[T],
@@ -217,7 +215,7 @@ func processFilesInto[T any](
 
 	// closeIfOpen closes the current file handle and reports close errors.
 	// Converts path to string only when reporting an error.
-	closeIfOpen := func(relPath []byte) bool {
+	closeIfOpen := func(relPath rootRelPath) bool {
 		if !fhOpen {
 			return false
 		}
@@ -226,7 +224,7 @@ func processFilesInto[T any](
 		fhOpen = false
 
 		if closeErr != nil {
-			ioErr := &IOError{Path: string(relPath), Op: "close", Err: closeErr}
+			ioErr := &IOError{Path: relPath.String(), Op: "close", Err: closeErr}
 			if cfg.notifier.ioErr(ioErr) {
 				*out.errs = append(*out.errs, ioErr)
 			}
@@ -244,17 +242,13 @@ func processFilesInto[T any](
 			return
 		}
 
-		if nameLen(name) == 0 {
-			continue
-		}
+		var relPath rootRelPath
 
-		var relPath []byte
-
-		if len(relPrefix) > 0 {
-			bufs.pathBuf = buildRelPath(bufs.pathBuf, relPrefix, name)
+		if relPrefix.Len() > 0 {
+			bufs.pathBuf = relPrefix.AppendTo(bufs.pathBuf, name)
 			relPath = bufs.pathBuf
 		} else {
-			relPath = name[:nameLen(name)]
+			relPath = rootRelPath(name.Bytes())
 		}
 
 		bufs.worker.buf = bufs.worker.buf[:0]
@@ -282,7 +276,7 @@ func processFilesInto[T any](
 				continue
 			}
 
-			procErr := &ProcessError{Path: string(relPath), Err: fnErr}
+			procErr := &ProcessError{Path: relPath.String(), Err: fnErr}
 			if cfg.notifier.callbackErr(procErr) {
 				*out.errs = append(*out.errs, procErr)
 			}
@@ -369,7 +363,7 @@ func (p processor[T]) runDirPipeline(ctx context.Context, args *dirPipelineArgs)
 
 	dirRel := args.dirRel
 	if dirRel == "" {
-		dirRel = relPathString(args.relPrefix)
+		dirRel = args.relPrefix.String()
 	}
 
 	batchCh := make(chan *nameBatch, args.queueCapacity)
@@ -422,7 +416,7 @@ func (p processor[T]) runDirPipeline(ctx context.Context, args *dirPipelineArgs)
 			}
 
 			for _, n := range args.initialNames {
-				batch.copyName(n)
+				batch.addName(n)
 			}
 
 			if !sendBatch(batch) {
@@ -477,7 +471,7 @@ func (p processor[T]) runDirPipeline(ctx context.Context, args *dirPipelineArgs)
 		// sharedBufs is only safe when workerCount==1 (tree pipeline).
 		bufs := args.sharedBufs
 		if bufs == nil {
-			pathBufCap := len(args.relPrefix) + pathBufExtra
+			pathBufCap := args.relPrefix.Len() + pathBufExtra
 			bufs = &workerBufs{
 				pathBuf: make([]byte, 0, pathBufCap),
 				// dataBuf, dataArena, worker.buf start zero-valued, grow as needed.
@@ -556,22 +550,10 @@ func (p processor[T]) runDirPipeline(ctx context.Context, args *dirPipelineArgs)
 	return results, allErrs
 }
 
-func (args *dirPipelineArgs) openDirPath() string {
-	if args.dirPath != "" {
-		return args.dirPath
-	}
-
-	if len(args.dirPathBytes) > 0 {
-		return pathStr(args.dirPathBytes)
-	}
-
-	return ""
-}
-
 func (p processor[T]) processDirPipelined(ctx context.Context, args *dirPipelineArgs) ([]*T, []error) {
-	dirRel := relPathString(args.relPrefix)
+	dirRel := args.relPrefix.String()
 
-	dh, err := openDirFromReaddir(args.dirEnumerator, args.openDirPath())
+	dh, err := openDirFromReaddir(args.dirEnumerator, args.dirPath)
 	if err != nil {
 		ioErr := &IOError{Path: dirRel, Op: "open", Err: err}
 		if args.notifier.ioErr(ioErr) {

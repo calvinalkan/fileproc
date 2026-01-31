@@ -25,15 +25,6 @@ import (
 	"syscall"
 )
 
-// appendString copies a filename into the batch, appending a NUL terminator.
-// Non-Linux backends use string names from os.File.ReadDir.
-func (b *nameBatch) appendString(name string) {
-	start := len(b.storage)
-	b.storage = append(b.storage, name...)
-	b.storage = append(b.storage, 0)
-	b.names = append(b.names, b.storage[start:len(b.storage)])
-}
-
 const readDirBatchSize = 4096
 
 // ============================================================================
@@ -51,8 +42,8 @@ type readdirHandle struct {
 
 // openDirEnumerator opens a directory for entry enumeration.
 // path must include its trailing NUL terminator.
-func openDirEnumerator(path []byte) (readdirHandle, error) {
-	p := pathStr(path)
+func openDirEnumerator(path nulTermPath) (readdirHandle, error) {
+	p := path.String()
 
 	info, err := os.Lstat(p)
 	if err != nil {
@@ -91,7 +82,7 @@ func (h readdirHandle) closeHandle() error {
 //
 // If reportSubdir is non-nil, it is called for each discovered subdirectory
 // entry name (without a trailing NUL).
-func readDirBatchImpl(rh readdirHandle, _ []byte, suffix string, batch *nameBatch, reportSubdir func(name []byte)) error {
+func readDirBatchImpl(rh readdirHandle, _ []byte, suffix string, batch *nameBatch, reportSubdir func(nulTermName)) error {
 	entries, err := rh.f.ReadDir(readDirBatchSize)
 	for _, e := range entries {
 		// Use Type() instead of IsDir() to avoid following symlinks.
@@ -102,10 +93,16 @@ func readDirBatchImpl(rh readdirHandle, _ []byte, suffix string, batch *nameBatc
 			continue
 		}
 
+		// Convert string to nulTermName once per entry.
+		nameStr := e.Name()
+		nameBuf := make([]byte, len(nameStr)+1)
+		copy(nameBuf, nameStr)
+		name := nulTermName(nameBuf)
+
 		// Directories (only relevant in recursive mode where reportSubdir != nil).
 		if typ.IsDir() {
 			if reportSubdir != nil {
-				reportSubdir([]byte(e.Name()))
+				reportSubdir(name)
 			}
 			continue
 		}
@@ -113,12 +110,11 @@ func readDirBatchImpl(rh readdirHandle, _ []byte, suffix string, batch *nameBatc
 		// When Type() is unknown, lstat to avoid following symlinks and to
 		// reliably detect directories and regular files.
 		if typ&fs.ModeType == 0 {
-			name := e.Name()
-			if reportSubdir == nil && !hasSuffix(name, suffix) {
+			if reportSubdir == nil && !name.HasSuffix(suffix) {
 				continue
 			}
 
-			info, statErr := os.Lstat(filepath.Join(rh.path, name))
+			info, statErr := os.Lstat(filepath.Join(rh.path, nameStr))
 			if statErr != nil {
 				continue
 			}
@@ -129,13 +125,13 @@ func readDirBatchImpl(rh readdirHandle, _ []byte, suffix string, batch *nameBatc
 
 			if info.IsDir() {
 				if reportSubdir != nil {
-					reportSubdir([]byte(name))
+					reportSubdir(name)
 				}
 				continue
 			}
 
-			if info.Mode().IsRegular() && hasSuffix(name, suffix) {
-				batch.appendString(name)
+			if info.Mode().IsRegular() && name.HasSuffix(suffix) {
+				batch.addName(name)
 			}
 
 			continue
@@ -146,12 +142,11 @@ func readDirBatchImpl(rh readdirHandle, _ []byte, suffix string, batch *nameBatc
 			continue
 		}
 
-		name := e.Name()
-		if !hasSuffix(name, suffix) {
+		if !name.HasSuffix(suffix) {
 			continue
 		}
 
-		batch.appendString(name)
+		batch.addName(name)
 	}
 
 	if err == nil {
@@ -181,8 +176,8 @@ type fileHandle struct {
 
 // openDir opens a directory for file operations.
 // path must include its trailing NUL terminator.
-func openDir(path []byte) (dirHandle, error) {
-	p := pathStr(path)
+func openDir(path nulTermPath) (dirHandle, error) {
+	p := path.String()
 
 	info, err := os.Lstat(p)
 	if err != nil {
@@ -202,8 +197,8 @@ func openDir(path []byte) (dirHandle, error) {
 //
 // The pipeline passes the directory string as known by the orchestration layer.
 // In this backend we just store it and use filepath.Join for file opens.
-func openDirFromReaddir(_ readdirHandle, path string) (dirHandle, error) {
-	return dirHandle{path: path}, nil
+func openDirFromReaddir(_ readdirHandle, path nulTermPath) (dirHandle, error) {
+	return dirHandle{path: path.String()}, nil
 }
 
 func (d dirHandle) closeHandle() error {
@@ -212,12 +207,12 @@ func (d dirHandle) closeHandle() error {
 
 // openFile opens a file relative to this directory.
 // name must include its trailing NUL terminator.
-func (d dirHandle) openFile(name []byte) (fileHandle, error) {
+func (d dirHandle) openFile(name nulTermName) (fileHandle, error) {
 	if len(name) <= 1 {
 		return fileHandle{}, os.ErrNotExist
 	}
 
-	fullPath := filepath.Join(d.path, string(name[:len(name)-1]))
+	fullPath := filepath.Join(d.path, name.String())
 
 	f, err := os.Open(fullPath)
 	if err != nil {
@@ -227,12 +222,12 @@ func (d dirHandle) openFile(name []byte) (fileHandle, error) {
 	return fileHandle{f: f}, nil
 }
 
-func (d dirHandle) statFile(name []byte) (Stat, statKind, error) {
+func (d dirHandle) statFile(name nulTermName) (Stat, statKind, error) {
 	if len(name) <= 1 {
 		return Stat{}, statKindOther, os.ErrNotExist
 	}
 
-	fullPath := filepath.Join(d.path, string(name[:len(name)-1]))
+	fullPath := filepath.Join(d.path, name.String())
 
 	info, err := os.Lstat(fullPath)
 	if err != nil {
