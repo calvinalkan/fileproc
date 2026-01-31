@@ -17,11 +17,11 @@ func Test_ReaddirError_BestEffort_NonRecursive(t *testing.T) {
 
 	errSentinel := errors.New("readdir boom")
 
-	restore := setReadDirBatchHook(func(rh readdirHandle, buf []byte, suffix string, batch *nameBatch, reportSubdir func(nulTermName)) error {
+	restore := setReadDirBatchHook(func(rh readdirHandle, dirPath nulTermPath, buf []byte, suffix string, batch *pathArena, reportSubdir func(nulTermName)) error {
 		// Hook is global to this test binary; keep tests non-parallel to avoid interference.
 		// Inject a non-EOF error after providing some names to test best-effort behavior.
-		batch.addName(nulTermName(append([]byte("a.txt"), 0)))
-		batch.addName(nulTermName(append([]byte("b.txt"), 0)))
+		batch.addPath(dirPath, nulTermName(append([]byte("a.txt"), 0)))
+		batch.addPath(dirPath, nulTermName(append([]byte("b.txt"), 0)))
 
 		return errSentinel
 	})
@@ -39,7 +39,7 @@ func Test_ReaddirError_BestEffort_NonRecursive(t *testing.T) {
 		t.Fatalf("expected 1 error, got %d", len(errs))
 	}
 
-	assertIOError(t, errs[0], ".", "readdir")
+	assertIOError(t, errs[0], root, "readdir")
 
 	if !errors.Is(errs[0], errSentinel) {
 		t.Fatalf("expected error to wrap %q, got %v", errSentinel, errs[0])
@@ -55,19 +55,19 @@ func Test_ReaddirError_BestEffort_Pipelined(t *testing.T) {
 	errSentinel := errors.New("readdir boom")
 	callCount := 0
 
-	restore := setReadDirBatchHook(func(rh readdirHandle, buf []byte, suffix string, batch *nameBatch, reportSubdir func(nulTermName)) error {
+	restore := setReadDirBatchHook(func(rh readdirHandle, dirPath nulTermPath, buf []byte, suffix string, batch *pathArena, reportSubdir func(nulTermName)) error {
 		// Hook is global to this test binary; keep tests non-parallel to avoid interference.
 		callCount++
 		switch callCount {
 		case 1:
 			// Seed enough names to trigger pipelining without error.
-			batch.addName(nulTermName(append([]byte("a.txt"), 0)))
-			batch.addName(nulTermName(append([]byte("b.txt"), 0)))
+			batch.addPath(dirPath, nulTermName(append([]byte("a.txt"), 0)))
+			batch.addPath(dirPath, nulTermName(append([]byte("b.txt"), 0)))
 
 			return nil
 		case 2:
 			// Next batch returns a non-EOF error but still provides names.
-			batch.addName(nulTermName(append([]byte("c.txt"), 0)))
+			batch.addPath(dirPath, nulTermName(append([]byte("c.txt"), 0)))
 
 			return errSentinel
 		default:
@@ -93,7 +93,7 @@ func Test_ReaddirError_BestEffort_Pipelined(t *testing.T) {
 		t.Fatalf("expected 1 error, got %d", len(errs))
 	}
 
-	assertIOError(t, errs[0], ".", "readdir")
+	assertIOError(t, errs[0], root, "readdir")
 
 	if !errors.Is(errs[0], errSentinel) {
 		t.Fatalf("expected error to wrap %q, got %v", errSentinel, errs[0])
@@ -107,11 +107,11 @@ func Test_ReaddirError_BestEffort_Recursive(t *testing.T) {
 
 	errSentinel := errors.New("readdir boom")
 
-	restore := setReadDirBatchHook(func(rh readdirHandle, buf []byte, suffix string, batch *nameBatch, reportSubdir func(nulTermName)) error {
+	restore := setReadDirBatchHook(func(rh readdirHandle, dirPath nulTermPath, buf []byte, suffix string, batch *pathArena, reportSubdir func(nulTermName)) error {
 		// Hook is global to this test binary; keep tests non-parallel to avoid interference.
 		// Inject a non-EOF error after providing some names to test best-effort behavior.
-		batch.addName(nulTermName(append([]byte("a.txt"), 0)))
-		batch.addName(nulTermName(append([]byte("b.txt"), 0)))
+		batch.addPath(dirPath, nulTermName(append([]byte("a.txt"), 0)))
+		batch.addPath(dirPath, nulTermName(append([]byte("b.txt"), 0)))
 
 		return errSentinel
 	})
@@ -135,7 +135,7 @@ func Test_ReaddirError_BestEffort_Recursive(t *testing.T) {
 		t.Fatalf("expected 1 error, got %d", len(errs))
 	}
 
-	assertIOError(t, errs[0], ".", "readdir")
+	assertIOError(t, errs[0], root, "readdir")
 
 	if !errors.Is(errs[0], errSentinel) {
 		t.Fatalf("expected error to wrap %q, got %v", errSentinel, errs[0])

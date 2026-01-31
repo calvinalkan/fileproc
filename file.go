@@ -28,7 +28,7 @@ type File struct {
 	dh   dirHandle
 	name nulTermName // NUL-terminated filename
 
-	relPath  rootRelPath // ephemeral relative path (no NUL)
+	path     nulTermPath // NUL-terminated full path
 	st       Stat
 	statDone bool
 
@@ -43,13 +43,16 @@ type File struct {
 	statErr error
 }
 
-// RelPathBorrowed returns the file path relative to the root directory passed to
-// Process.
+// PathBorrowed returns the absolute file path (without the trailing NUL).
 //
 // The returned slice is ephemeral and only valid during the callback.
 // Copy if you need to retain it.
-func (f *File) RelPathBorrowed() []byte {
-	return f.relPath
+func (f *File) PathBorrowed() []byte {
+	if len(f.path) > 0 && f.path[len(f.path)-1] == 0 {
+		return f.path[:len(f.path)-1]
+	}
+
+	return f.path
 }
 
 // Stat returns file metadata.

@@ -52,8 +52,8 @@
 //	│ Non-recursive (processDir):                                             │
 //	│   - dirBuf: 32KB directory-entry buffer on Linux (also used as a        │
 //	│     sizing heuristic on other platforms)                                │
-//	│   - batch: nameBatch for collecting filenames                           │
-//	│   - Pipeline workers allocate their own pathBuf and buffers for:        │
+//	│   - pathArena: for collecting paths                                     │
+//	│   - Pipeline workers allocate their own buffers for:                    │
 //	│       • Worker.Buf (callback scratch space)                             │
 //	│       • File.Bytes arena (when used)                                   │
 //	│                                                                         │
@@ -62,16 +62,15 @@
 //	│   - Per tree worker (allocated once, reused for ALL directories):       │
 //	│       • dirBuf  (32KB): Linux dirent buffer / sizing heuristic          │
 //	│       • Worker.Buf (callback scratch space)                             │
-//	│       • pathBuf (512B): building relative paths                         │
-//	│       • batch: collecting filenames                                     │
-//	│       • freeBatches: channel-as-freelist for pipeline batches           │
+//	│       • pathArena: collecting paths                                     │
+//	│       • freeArenas: channel-as-freelist for pipeline arenas           │
 //	│                                                                         │
 //	└─────────────────────────────────────────────────────────────────────────┘
 //
 // Rough memory budget for recursive mode with 8 workers (excluding results
 // and other overhead), assuming defaults:
 //
-//	8 × (32KB dirBuf + 512B pathBuf + 6×(≈64KB batch storage + ≈75KB name headers)) ≈ 6–7MB
+//	8 × (32KB dirBuf + 6×(≈64KB arena storage + ≈75KB name headers)) ≈ 5–6MB
 package fileproc
 
 import (
@@ -79,6 +78,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -88,7 +88,7 @@ import (
 //
 // ProcessFunc may be called concurrently and must be safe for concurrent use.
 //
-// f provides access to [File] metadata and content. f.RelPathBorrowed() is
+// f provides access to [File] metadata and content. f.PathBorrowed() is
 // ephemeral and only valid during the callback.
 //
 // w provides reusable temporary buffer space. w.Buf() returns a slice that is
@@ -114,7 +114,7 @@ type ProcessFunc[T any] func(f *File, w *Worker) (*T, error)
 // By default, only the specified directory is processed. Use [WithRecursive]
 // to process subdirectories recursively.
 //
-// f.RelPathBorrowed() returns the path relative to the root. Results are unordered
+// f.PathBorrowed() returns the absolute path. Results are unordered
 // when processed with multiple workers.
 //
 // To stop processing on error, use [WithOnError] with a cancelable context:
@@ -143,10 +143,14 @@ type ProcessFunc[T any] func(f *File, w *Worker) (*T, error)
 // may not be seen depending on timing. Do not rely on newly created entries
 // being processed in the same call.
 func Process[T any](ctx context.Context, path string, fn ProcessFunc[T], opts ...Option) ([]*T, []error) {
-	path = filepath.Clean(path)
-
 	if strings.IndexByte(path, 0) >= 0 {
 		return nil, []error{&IOError{Path: ".", Op: "open", Err: errContainsNUL}}
+	}
+
+	path, err := filepath.Abs(path)
+	if err != nil {
+		// fails only os.getwd()
+		return nil, []error{fmt.Errorf("file absolute path: %w", errContainsNUL)}
 	}
 
 	if ctx.Err() != nil {
@@ -171,8 +175,7 @@ func Process[T any](ctx context.Context, path string, fn ProcessFunc[T], opts ..
 
 // IOError is returned when a file system operation fails.
 type IOError struct {
-	// Path is the path relative to the root directory passed to [Process].
-	// The root directory itself is reported as ".".
+	// Path is the absolute path for the failed operation.
 	Path string
 	// Op is the operation that failed: "open", "read", "close", or "readdir".
 	Op string
@@ -190,7 +193,7 @@ func (e *IOError) Unwrap() error {
 
 // ProcessError is returned when a user callback ([ProcessFunc]) returns an error.
 type ProcessError struct {
-	// Path is the relative file path (owned, not borrowed).
+	// Path is the absolute file path (owned, not borrowed).
 	Path string
 	// Err is the error returned by the callback.
 	Err error
@@ -217,25 +220,21 @@ const (
 	maxWorkers = 256
 
 	// defaultReadBufSize is the initial buffer size for file reads and
-	// path buffer growth heuristics.
+	// buffer growth heuristics.
 	defaultReadBufSize = 512
-
-	// pathBufExtra is extra capacity for path buffers to reduce reallocs
-	// when joining directory prefix with filename.
-	pathBufExtra = defaultReadBufSize
 
 	// defaultSmallFileThreshold is the default for WithSmallFileThreshold.
 	// Below this file count, sequential file processing beats pipelined workers.
 	defaultSmallFileThreshold = 1500
 
-	// maxPipelineQueue caps the number of batches buffered between the readdir
+	// maxPipelineQueue caps the number of arenas buffered between the readdir
 	// producer and file-processing workers in non-recursive pipelined mode.
 	//
 	// This prevents excessive memory usage when Workers is set very high.
 	// When the cap is hit, the producer blocks until workers catch up.
 	maxPipelineQueue = maxWorkers
 
-	// pipelineBatchCount is the number of nameBatch objects to pre-allocate
+	// pipelineBatchCount is the number of pathArena objects to pre-allocate
 	// for the pipelining free-list when running in tree worker context.
 	// Formula: 1 (producer) + 4 (channel buffer) + 1 (worker) = 6
 	// (Tree workers use Workers=1 for pipelining within a directory).
@@ -246,7 +245,7 @@ var errContainsNUL = errors.New("contains NUL byte")
 
 // workerBufs holds pre-allocated buffers that a worker reuses across all
 // files and directories it processes. Passed by pointer to avoid copying
-// and to allow growable fields (batch) to expand.
+// and to allow growable fields (pathArena) to expand.
 //
 // Lifetime: created once per worker goroutine, lives until worker exits.
 type workerBufs struct {
@@ -259,14 +258,10 @@ type workerBufs struct {
 	// Reused: reset for each directory.
 	dirBuf []byte
 
-	// pathBuf is scratch space for building "prefix/filename" paths.
-	// Reused: reset (len=0) for each file, capacity preserved.
-	pathBuf []byte
-
-	// batch collects filenames read from a directory (arena-style storage).
+	// paths collects paths read from a directory (arena-style storage).
 	// Reused: reset for each directory, internal capacity preserved.
-	// See nameBatch comments for the arena allocation pattern.
-	batch nameBatch
+	// See pathArena comments for the arena allocation pattern.
+	paths pathArena
 
 	// dataBuf is temporary buffer for File.Bytes() read syscall.
 	// Sized to st.Size+1, grows to max file size seen. Reused across files.
@@ -297,7 +292,7 @@ type processor[T any] struct {
 //
 // Allocations (one-shot, not pooled):
 //   - dirBuf (32KB): for reading directory entries
-//   - batch: for collecting filenames
+//   - pathArena: for collecting paths
 //
 // For large directories, switches to processDirPipelined which allocates
 // additional buffers per worker.
@@ -309,7 +304,7 @@ func (p processor[T]) processDir(
 ) ([]*T, []error) {
 	dirEnumerator, readDirErr := openDirEnumerator(dirPath)
 	if readDirErr != nil {
-		ioErr := &IOError{Path: ".", Op: "open", Err: readDirErr}
+		ioErr := &IOError{Path: dirPath.String(), Op: "open", Err: readDirErr}
 		if notifier.ioErr(ioErr) {
 			return nil, []error{ioErr}
 		}
@@ -320,15 +315,14 @@ func (p processor[T]) processDir(
 	defer func() { _ = dirEnumerator.closeHandle() }()
 
 	dirBuf := make([]byte, 0, dirReadBufSize)
-	batch := &nameBatch{}
-	batch.reset(cap(dirBuf) * 2)
+	paths := &pathArena{}
+	paths.reset(cap(dirBuf) * 2)
 
 	return p.processDirAdaptive(ctx, &adaptiveDirArgs{
 		dirPath:       dirPath,
-		relPrefix:     nil,
 		dirEnumerator: dirEnumerator,
 		dirBuf:        dirBuf[:cap(dirBuf)],
-		batch:         batch,
+		paths:         paths,
 		opts:          opts,
 		notifier:      notifier,
 		reportSubdir:  nil,
@@ -337,17 +331,16 @@ func (p processor[T]) processDir(
 }
 
 type pipelineReuse struct {
-	freeBatches   chan *nameBatch
+	freeArenas    chan *pathArena
 	queueCapacity int
 	sharedBufs    *workerBufs
 }
 
 type adaptiveDirArgs struct {
 	dirPath       nulTermPath
-	relPrefix     rootRelPath
 	dirEnumerator readdirHandle
 	dirBuf        []byte
-	batch         *nameBatch
+	paths         *pathArena
 	opts          options
 	notifier      *errNotifier
 	reportSubdir  func(nulTermName)
@@ -369,9 +362,10 @@ func (p processor[T]) processDirAdaptive(ctx context.Context, args *adaptiveDirA
 	large, readErr := readDirUntilThresholdOrEOF(
 		ctx,
 		args.dirEnumerator,
+		args.dirPath,
 		args.dirBuf,
 		args.opts.Suffix,
-		args.batch,
+		args.paths,
 		args.reportSubdir,
 		args.opts.SmallFileThreshold,
 	)
@@ -382,20 +376,19 @@ func (p processor[T]) processDirAdaptive(ctx context.Context, args *adaptiveDirA
 
 	if large {
 		pipelineArgs := dirPipelineArgs{
-			dirPath:       args.dirPath,
-			relPrefix:     args.relPrefix,
-			dirEnumerator: args.dirEnumerator,
-			initialNames:  args.batch.names,
-			suffix:        args.opts.Suffix,
-			reportSubdir:  args.reportSubdir,
-			notifier:      args.notifier,
-			dirBuf:        args.dirBuf,
-			workerCount:   args.opts.Workers,
+			dirPath:        args.dirPath,
+			dirEnumerator:  args.dirEnumerator,
+			initialEntries: args.paths.entries,
+			suffix:         args.opts.Suffix,
+			reportSubdir:   args.reportSubdir,
+			notifier:       args.notifier,
+			dirBuf:         args.dirBuf,
+			workerCount:    args.opts.Workers,
 		}
 
 		if args.reuse != nil {
 			pipelineArgs.queueCapacity = args.reuse.queueCapacity
-			pipelineArgs.freeBatches = args.reuse.freeBatches
+			pipelineArgs.freeArenas = args.reuse.freeArenas
 			pipelineArgs.sharedBufs = args.reuse.sharedBufs
 		}
 
@@ -407,7 +400,7 @@ func (p processor[T]) processDirAdaptive(ctx context.Context, args *adaptiveDirA
 		sharedBufs = args.reuse.sharedBufs
 	}
 
-	return p.processDirNames(ctx, args.dirPath, args.relPrefix, args.batch.names, readErr, args.notifier, sharedBufs)
+	return p.processDirNames(ctx, args.dirPath, args.paths.entries, readErr, args.notifier, sharedBufs)
 }
 
 // processTree processes a directory tree with parallel workers.
@@ -429,12 +422,11 @@ func (p processor[T]) processDirAdaptive(ctx context.Context, args *adaptiveDirA
 //	│         │                                                               │
 //	│         │ dirBuf  [32KB]  ← reused for ALL directories                  │
 //	│         │ Worker.Buf  ← reused for ALL files                            │
-//	│         │ pathBuf [512B]  ← reused for ALL paths                        │
-//	│         │ batch           ← reused for ALL directories                  │
-//	│         │ freeBatches     ← channel-as-freelist for large dirs          │
+//	│         │ pathArena       ← reused for ALL directories                  │
+//	│         │ freeArenas     ← channel-as-freelist for large dirs          │
 //	│         │                                                               │
 //	│         └─► for job := range jobs:                                      │
-//	│               batch.reset()      ← amortized reuse (may grow)           │
+//	│               pathArena.reset()  ← amortized reuse (may grow)           │
 //	│               processFilesInto() ← uses worker's buffers                │
 //	│                                                                         │
 //	└─────────────────────────────────────────────────────────────────────────┘
@@ -464,18 +456,6 @@ func (p processor[T]) processTree(
 	type treeEvent struct {
 		job  dirJob
 		done bool
-	}
-
-	// Derive relative path from absolute path by stripping root prefix.
-	// Returns nil (represents ".") for the root directory itself.
-	rootLen := root.LenWithoutNul()
-	relPathFrom := func(absPath nulTermPath) rootRelPath {
-		absLen := absPath.LenWithoutNul()
-		if absLen <= rootLen {
-			return nil
-		}
-
-		return rootRelPath(absPath[rootLen+1 : absLen])
 	}
 
 	// ========================================================================
@@ -663,8 +643,7 @@ func (p processor[T]) processTree(
 	//
 	worker := func(workerID int) {
 		bufs := &workerBufs{
-			dirBuf:  make([]byte, 0, dirReadBufSize),
-			pathBuf: make([]byte, 0, pathBufExtra),
+			dirBuf: make([]byte, 0, dirReadBufSize),
 			// dataBuf, dataArena, worker.buf start zero-valued, grow as needed.
 		}
 
@@ -675,21 +654,21 @@ func (p processor[T]) processTree(
 			Suffix:             opts.Suffix,
 			OnError:            opts.OnError,
 		}
-		// Pre-allocate batches for pipelining large directories.
+		// Pre-allocate arenas for pipelining large directories.
 		// Uses channel-as-freelist pattern (see fileproc_workers.go).
 		//
 		// Why pipelineBatchCount (6)?
 		//   In tree mode, pipelining within a directory uses Workers=1,
-		//   so we need: 1 (producer) + 4 (channel buffer) + 1 (worker) = 6 batches.
+		//   so we need: 1 (producer) + 4 (channel buffer) + 1 (worker) = 6 arenas.
 		//
-		freeBatches := make(chan *nameBatch, pipelineBatchCount)
+		freeArenas := make(chan *pathArena, pipelineBatchCount)
 		for range pipelineBatchCount {
-			freeBatches <- &nameBatch{}
+			freeArenas <- &pathArena{}
 		}
 		// Keep queue capacity in sync with pipelineBatchCount sizing.
 		pipelineQueueCap := pipelineBatchCount - dirOpts.Workers - 1
 		reuse := pipelineReuse{
-			freeBatches:   freeBatches,
+			freeArenas:    freeArenas,
 			queueCapacity: pipelineQueueCap,
 			sharedBufs:    bufs,
 		}
@@ -715,7 +694,7 @@ func (p processor[T]) processTree(
 
 				dirEnumerator, err := openDirEnumerator(job.absPath)
 				if err != nil {
-					ioErr := &IOError{Path: relPathFrom(job.absPath).String(), Op: "open", Err: err}
+					ioErr := &IOError{Path: job.absPath.String(), Op: "open", Err: err}
 					if notifier.ioErr(ioErr) {
 						workerErrs[workerID] = append(workerErrs[workerID], ioErr)
 					}
@@ -738,11 +717,13 @@ func (p processor[T]) processTree(
 				// directory.
 				//
 				reportSubdir := func(name nulTermName) {
-					// Build child absPath: parent + "/" + name (includes NUL from name).
+					// Build child path: parent + sep + name (includes NUL from name).
 					parentLen := job.absPath.LenWithoutNul()
 					childAbs := make([]byte, 0, parentLen+1+len(name))
 					childAbs = append(childAbs, job.absPath[:parentLen]...)
-					childAbs = append(childAbs, '/')
+					if parentLen > 0 && job.absPath[parentLen-1] != os.PathSeparator {
+						childAbs = append(childAbs, os.PathSeparator)
+					}
 					childAbs = append(childAbs, name...) // includes NUL
 
 					select {
@@ -751,16 +732,15 @@ func (p processor[T]) processTree(
 					}
 				}
 
-				bufs.batch.reset(cap(bufs.dirBuf) * 2)
+				bufs.paths.reset(cap(bufs.dirBuf) * 2)
 
 				// Adaptive processing: switch to pipelined mode when the directory
 				// exceeds SmallFileThreshold, otherwise process sequentially.
 				dirResults, dirErrs := p.processDirAdaptive(ctx, &adaptiveDirArgs{
 					dirPath:       job.absPath,
-					relPrefix:     relPathFrom(job.absPath),
 					dirEnumerator: dirEnumerator,
 					dirBuf:        bufs.dirBuf[:cap(bufs.dirBuf)],
-					batch:         &bufs.batch,
+					paths:         &bufs.paths,
 					opts:          dirOpts,
 					notifier:      notifier,
 					reportSubdir:  reportSubdir,
@@ -821,14 +801,14 @@ func (p processor[T]) processTree(
 	return results, allErrs
 }
 
-func readDirUntilThresholdOrEOF(ctx context.Context, dirEnumerator readdirHandle, dirBuf []byte, suffix string, batch *nameBatch, reportSubdir func(nulTermName), threshold int) (bool, error) {
+func readDirUntilThresholdOrEOF(ctx context.Context, dirEnumerator readdirHandle, dirPath nulTermPath, dirBuf []byte, suffix string, arena *pathArena, reportSubdir func(nulTermName), threshold int) (bool, error) {
 	for {
 		if ctx.Err() != nil {
 			return false, io.EOF
 		}
 
-		err := readDirBatch(dirEnumerator, dirBuf, suffix, batch, reportSubdir)
-		if len(batch.names) > threshold {
+		err := readDirBatch(dirEnumerator, dirPath, dirBuf, suffix, arena, reportSubdir)
+		if len(arena.entries) > threshold {
 			if err != nil && !errors.Is(err, io.EOF) {
 				// Best-effort: signal error but keep already-read names.
 				return false, err

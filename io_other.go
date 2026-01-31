@@ -82,7 +82,7 @@ func (h readdirHandle) closeHandle() error {
 //
 // If reportSubdir is non-nil, it is called for each discovered subdirectory
 // entry name (without a trailing NUL).
-func readDirBatchImpl(rh readdirHandle, _ []byte, suffix string, batch *nameBatch, reportSubdir func(nulTermName)) error {
+func readDirBatchImpl(rh readdirHandle, dirPath nulTermPath, _ []byte, suffix string, batch *pathArena, reportSubdir func(nulTermName)) error {
 	entries, err := rh.f.ReadDir(readDirBatchSize)
 	for _, e := range entries {
 		// Use Type() instead of IsDir() to avoid following symlinks.
@@ -131,7 +131,7 @@ func readDirBatchImpl(rh readdirHandle, _ []byte, suffix string, batch *nameBatc
 			}
 
 			if info.Mode().IsRegular() && name.HasSuffix(suffix) {
-				batch.addName(name)
+				batch.addPath(dirPath, name)
 			}
 
 			continue
@@ -146,7 +146,7 @@ func readDirBatchImpl(rh readdirHandle, _ []byte, suffix string, batch *nameBatc
 			continue
 		}
 
-		batch.addName(name)
+		batch.addPath(dirPath, name)
 	}
 
 	if err == nil {

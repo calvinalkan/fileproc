@@ -2,9 +2,9 @@
 
 package fileproc
 
-func readDirBatch(rh readdirHandle, buf []byte, suffix string, batch *nameBatch, reportSubdir func(nulTermName)) error {
-	return readDirBatchImpl(rh, buf, suffix, batch, reportSubdir)
+func readDirBatch(rh readdirHandle, dirPath nulTermPath, buf []byte, suffix string, batch *pathArena, reportSubdir func(nulTermName)) error {
+	return readDirBatchImpl(rh, dirPath, buf, suffix, batch, reportSubdir)
 }
 
 // Compile-time guard: wrapper signature must match the backend contract.
-var _ func(readdirHandle, []byte, string, *nameBatch, func(nulTermName)) error = readDirBatch
+var _ func(readdirHandle, nulTermPath, []byte, string, *pathArena, func(nulTermName)) error = readDirBatch

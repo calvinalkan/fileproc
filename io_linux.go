@@ -129,7 +129,7 @@ func (h readdirHandle) closeHandle() error {
 //
 // If reportSubdir is non-nil, it is called for each discovered subdirectory
 // entry name (without a trailing NUL).
-func readDirBatchImpl(rh readdirHandle, buf []byte, suffix string, batch *nameBatch, reportSubdir func(nulTermName)) error {
+func readDirBatchImpl(rh readdirHandle, dirPath nulTermPath, buf []byte, suffix string, batch *pathArena, reportSubdir func(nulTermName)) error {
 	// Retry ReadDirent on EINTR without an upper bound, matching Go's stdlib.
 	var (
 		read int
@@ -193,7 +193,7 @@ func readDirBatchImpl(rh readdirHandle, buf []byte, suffix string, batch *nameBa
 
 		case syscall.DT_REG:
 			if name.HasSuffix(suffix) {
-				batch.addName(name)
+				batch.addPath(dirPath, name)
 			}
 
 		case syscall.DT_UNKNOWN:
@@ -216,7 +216,7 @@ func readDirBatchImpl(rh readdirHandle, buf []byte, suffix string, batch *nameBa
 			}
 
 			if info.isReg && name.HasSuffix(suffix) {
-				batch.addName(name)
+				batch.addPath(dirPath, name)
 			}
 
 		default:

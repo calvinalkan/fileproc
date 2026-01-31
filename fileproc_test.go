@@ -34,10 +34,10 @@ const (
 )
 
 // ============================================================================
-// File.RelPath() tests
+// File.PathBorrowed() tests
 // ============================================================================
 
-func Test_File_RelPath_Returns_Correct_Path_When_NonRecursive(t *testing.T) {
+func Test_File_PathBorrowed_Returns_Correct_Path_When_NonRecursive(t *testing.T) {
 	t.Parallel()
 
 	root := t.TempDir()
@@ -57,7 +57,7 @@ func Test_File_RelPath_Returns_Correct_Path_When_NonRecursive(t *testing.T) {
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, _ *fileproc.Worker) (*struct{}, error) {
 		mu.Lock()
 
-		seen[string(f.RelPathBorrowed())] = true
+		seen[string(f.PathBorrowed())] = true
 
 		mu.Unlock()
 
@@ -72,12 +72,12 @@ func Test_File_RelPath_Returns_Correct_Path_When_NonRecursive(t *testing.T) {
 		t.Fatalf("expected 2 results, got %d", len(results))
 	}
 
-	if !seen["alpha.txt"] || !seen["beta.md"] {
+	if !seen[filepath.Join(root, "alpha.txt")] || !seen[filepath.Join(root, "beta.md")] {
 		t.Fatalf("missing expected paths: %v", seen)
 	}
 }
 
-func Test_File_RelPath_Returns_Correct_Path_When_Recursive(t *testing.T) {
+func Test_File_PathBorrowed_Returns_Correct_Path_When_Recursive(t *testing.T) {
 	t.Parallel()
 
 	root := t.TempDir()
@@ -99,7 +99,7 @@ func Test_File_RelPath_Returns_Correct_Path_When_Recursive(t *testing.T) {
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, _ *fileproc.Worker) (*struct{}, error) {
 		mu.Lock()
 
-		seen[string(f.RelPathBorrowed())] = true
+		seen[string(f.PathBorrowed())] = true
 
 		mu.Unlock()
 
@@ -114,7 +114,11 @@ func Test_File_RelPath_Returns_Correct_Path_When_Recursive(t *testing.T) {
 		t.Fatalf("expected 3 results, got %d", len(results))
 	}
 
-	want := []string{"top.txt", filepath.Join("sub", "nested.txt"), filepath.Join("sub", "deep", "file.txt")}
+	want := []string{
+		filepath.Join(root, "top.txt"),
+		filepath.Join(root, "sub", "nested.txt"),
+		filepath.Join(root, "sub", "deep", "file.txt"),
+	}
 	for _, w := range want {
 		if !seen[w] {
 			t.Fatalf("missing expected path %q: %v", w, seen)
@@ -122,7 +126,7 @@ func Test_File_RelPath_Returns_Correct_Path_When_Recursive(t *testing.T) {
 	}
 }
 
-func Test_File_RelPath_Copy_Remains_Valid_When_Process_Returns(t *testing.T) {
+func Test_File_PathBorrowed_Copy_Remains_Valid_When_Process_Returns(t *testing.T) {
 	t.Parallel()
 
 	root := t.TempDir()
@@ -135,7 +139,7 @@ func Test_File_RelPath_Copy_Remains_Valid_When_Process_Returns(t *testing.T) {
 	}
 
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, _ *fileproc.Worker) (*pathHolder, error) {
-		return &pathHolder{path: string(f.RelPathBorrowed())}, nil
+		return &pathHolder{path: string(f.PathBorrowed())}, nil
 	}, opts...)
 
 	if len(errs) != 0 {
@@ -147,8 +151,8 @@ func Test_File_RelPath_Copy_Remains_Valid_When_Process_Returns(t *testing.T) {
 	}
 
 	// The path should still be valid here (arena not released)
-	if results[0].path != "test.txt" {
-		t.Fatalf("expected path 'test.txt', got %q", results[0].path)
+	if results[0].path != filepath.Join(root, "test.txt") {
+		t.Fatalf("expected path %q, got %q", filepath.Join(root, "test.txt"), results[0].path)
 	}
 }
 
@@ -1117,7 +1121,7 @@ func Test_Arena_Multiple_Files_Dont_Interfere_When_Sequential(t *testing.T) {
 			return nil, fmt.Errorf("test: %w", err)
 		}
 
-		return &fileData{path: string(f.RelPathBorrowed()), data: data}, nil
+		return &fileData{path: string(f.PathBorrowed()), data: data}, nil
 	}, opts...)
 
 	if len(errs) != 0 {
@@ -1129,9 +1133,9 @@ func Test_Arena_Multiple_Files_Dont_Interfere_When_Sequential(t *testing.T) {
 	}
 
 	expected := map[string]string{
-		"a.txt": "alpha",
-		"b.txt": "bravo",
-		"c.txt": "charlie",
+		filepath.Join(root, "a.txt"): "alpha",
+		filepath.Join(root, "b.txt"): "bravo",
+		filepath.Join(root, "c.txt"): "charlie",
 	}
 
 	for _, r := range results {
@@ -1324,7 +1328,7 @@ func Test_Concurrency_Multiple_Workers_Have_Independent_WorkerBuf_When_Parallel(
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, scratch *fileproc.Worker) (*scratchResult, error) {
 		// Write file path into scratch buffer
 		buf := scratch.Buf(256)
-		buf = append(buf, f.RelPathBorrowed()...)
+		buf = append(buf, f.PathBorrowed()...)
 
 		// Copy to result (scratch only valid during callback)
 		return &scratchResult{data: append([]byte(nil), buf...)}, nil
@@ -1714,7 +1718,7 @@ func Test_Process_Returns_TopLevel_Files_And_Skips_Symlinks_When_NonRecursive(t 
 			return nil, fmt.Errorf("stat: %w", statErr)
 		}
 
-		path := string(f.RelPathBorrowed())
+		path := string(f.PathBorrowed())
 
 		mu.Lock()
 
@@ -1730,13 +1734,17 @@ func Test_Process_Returns_TopLevel_Files_And_Skips_Symlinks_When_NonRecursive(t 
 		t.Fatalf("unexpected errors: %v", errs)
 	}
 
-	wantPaths := []string{"a.md", "b.txt", "empty.md"}
+	wantPaths := []string{
+		filepath.Join(root, "a.md"),
+		filepath.Join(root, "b.txt"),
+		filepath.Join(root, "empty.md"),
+	}
 	assertStringSlicesEqual(t, resultPaths(results), wantPaths)
 
 	expectedData := map[string][]byte{
-		"a.md":     []byte("alpha"),
-		"b.txt":    []byte("bravo"),
-		"empty.md": {},
+		filepath.Join(root, "a.md"):     []byte("alpha"),
+		filepath.Join(root, "b.txt"):    []byte("bravo"),
+		filepath.Join(root, "empty.md"): {},
 	}
 
 	for path, want := range expectedData {
@@ -1750,7 +1758,7 @@ func Test_Process_Returns_TopLevel_Files_And_Skips_Symlinks_When_NonRecursive(t 
 			t.Fatalf("missing callback for %s", path)
 		}
 
-		info, err := os.Stat(filepath.Join(root, path))
+		info, err := os.Stat(path)
 		if err != nil {
 			t.Fatalf("stat %s: %v", path, err)
 		}
@@ -1764,11 +1772,11 @@ func Test_Process_Returns_TopLevel_Files_And_Skips_Symlinks_When_NonRecursive(t 
 		}
 	}
 
-	if _, ok := seen[filepath.Join("sub", "c.md")]; ok {
+	if _, ok := seen[filepath.Join(root, "sub", "c.md")]; ok {
 		t.Fatal("unexpected subdir file in non-recursive mode")
 	}
 
-	if _, ok := seen["link.md"]; ok {
+	if _, ok := seen[filepath.Join(root, "link.md")]; ok {
 		t.Fatal("unexpected symlink in results")
 	}
 }
@@ -1796,7 +1804,7 @@ func Test_Process_Applies_Suffix_Filter_And_Skips_Symlink_Dirs_When_Recursive(t 
 	)
 
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, _ *fileproc.Worker) (*string, error) {
-		path := string(f.RelPathBorrowed())
+		path := string(f.PathBorrowed())
 
 		mu.Lock()
 
@@ -1811,10 +1819,13 @@ func Test_Process_Applies_Suffix_Filter_And_Skips_Symlink_Dirs_When_Recursive(t 
 		t.Fatalf("unexpected errors: %v", errs)
 	}
 
-	wantPaths := []string{"keep.md", filepath.Join("sub", "keep2.md")}
+	wantPaths := []string{
+		filepath.Join(root, "keep.md"),
+		filepath.Join(root, "sub", "keep2.md"),
+	}
 	assertStringSlicesEqual(t, resultPaths(results), wantPaths)
 
-	if _, ok := got[filepath.Join("sub_link", "keep2.md")]; ok {
+	if _, ok := got[filepath.Join(root, "sub_link", "keep2.md")]; ok {
 		t.Fatal("symlinked directory was traversed")
 	}
 }
@@ -1936,7 +1947,7 @@ func Test_Process_Returns_ProcessError_When_Callback_Fails(t *testing.T) {
 		t.Fatalf("unexpected error: %v", procErr)
 	}
 
-	if procErr.Path != testBadFile {
+	if procErr.Path != filepath.Join(root, testBadFile) {
 		t.Fatalf("unexpected path: %s", procErr.Path)
 	}
 }
@@ -1949,8 +1960,8 @@ func Test_Process_Closes_File_Handle_When_Callback_Errors_After_Read(t *testing.
 	writeFile(t, root, "b.txt", []byte("bravo"))
 
 	expected := map[string][]byte{
-		"a.txt": []byte("alpha"),
-		"b.txt": []byte("bravo"),
+		filepath.Join(root, "a.txt"): []byte("alpha"),
+		filepath.Join(root, "b.txt"): []byte("bravo"),
 	}
 
 	opts := []fileproc.Option{
@@ -1974,11 +1985,11 @@ func Test_Process_Closes_File_Handle_When_Callback_Errors_After_Read(t *testing.
 			return nil, fmt.Errorf("read file: %w", err)
 		}
 
-		relPath := string(f.RelPathBorrowed())
+		path := string(f.PathBorrowed())
 
-		exp, ok := expected[relPath]
+		exp, ok := expected[path]
 		if !ok {
-			return nil, fmt.Errorf("unexpected path %q: %w", relPath, mismatch)
+			return nil, fmt.Errorf("unexpected path %q: %w", path, mismatch)
 		}
 
 		if !errorInjected {
@@ -2040,7 +2051,7 @@ func Test_Process_Silently_Skips_When_File_Becomes_Directory(t *testing.T) {
 		callCount++
 
 		// On first call for the racy file, replace it with a directory
-		if string(f.RelPathBorrowed()) == "will_become_dir.txt" {
+		if string(f.PathBorrowed()) == racePath {
 			// Remove file and create directory with same name before reading
 			err := os.Remove(racePath)
 			if err != nil {
@@ -2104,7 +2115,7 @@ func Test_Process_Silently_Skips_When_File_Becomes_Symlink(t *testing.T) {
 		callCount++
 
 		// On the racy file, replace it with a symlink before reading
-		if string(f.RelPathBorrowed()) == "will_become_symlink.txt" {
+		if string(f.PathBorrowed()) == racePath {
 			// Remove file and create symlink with same name
 			err := os.Remove(racePath)
 			if err != nil {
@@ -2291,7 +2302,7 @@ func Test_Process_Returns_IOError_When_Path_Is_File(t *testing.T) {
 		t.Fatalf("expected IOError, got %T", errs[0])
 	}
 
-	if ioErr.Path != "." {
+	if ioErr.Path != filePath {
 		t.Fatalf("unexpected error path: %s", ioErr.Path)
 	}
 
@@ -2338,7 +2349,7 @@ func Test_Process_Returns_IOError_When_Path_Is_Symlink(t *testing.T) {
 		t.Fatalf("expected IOError, got %T", errs[0])
 	}
 
-	if ioErr.Path != "." {
+	if ioErr.Path != symPath {
 		t.Fatalf("unexpected error path: %s", ioErr.Path)
 	}
 
@@ -2347,7 +2358,7 @@ func Test_Process_Returns_IOError_When_Path_Is_Symlink(t *testing.T) {
 	}
 }
 
-func Test_Process_Reports_Dot_Path_When_Root_Open_Fails(t *testing.T) {
+func Test_Process_Reports_Path_When_Root_Open_Fails(t *testing.T) {
 	t.Parallel()
 
 	root := t.TempDir()
@@ -2383,7 +2394,7 @@ func Test_Process_Reports_Dot_Path_When_Root_Open_Fails(t *testing.T) {
 		t.Fatalf("expected IOError, got %T", errs[0])
 	}
 
-	if ioErr.Path != "." {
+	if ioErr.Path != missing {
 		t.Fatalf("unexpected error path: %s", ioErr.Path)
 	}
 
@@ -2463,11 +2474,11 @@ func Test_Process_Processes_All_Files_When_Pipelined_Workers(t *testing.T) {
 	for i := range 8 {
 		name := "f" + strings.Repeat("x", i) + ".txt"
 		writeFile(t, root, name, []byte("data"))
-		wantPaths = append(wantPaths, name)
+		wantPaths = append(wantPaths, filepath.Join(root, name))
 	}
 
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, _ *fileproc.Worker) (*string, error) {
-		path := string(f.RelPathBorrowed())
+		path := string(f.PathBorrowed())
 
 		return &path, nil
 	}, fileproc.WithWorkers(4), fileproc.WithSmallFileThreshold(1))
@@ -2492,7 +2503,7 @@ func Test_Process_Processes_All_Files_When_Pipelined_With_Multiple_ReadDirBatche
 	for i := range testNumFilesMed {
 		name := fmt.Sprintf("f-%04d-%s.txt", i, pad)
 		writeFile(t, root, name, []byte("x"))
-		wantPaths = append(wantPaths, name)
+		wantPaths = append(wantPaths, filepath.Join(root, name))
 	}
 
 	opts := []fileproc.Option{
@@ -2506,7 +2517,7 @@ func Test_Process_Processes_All_Files_When_Pipelined_With_Multiple_ReadDirBatche
 	)
 
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, _ *fileproc.Worker) (*string, error) {
-		path := string(f.RelPathBorrowed())
+		path := string(f.PathBorrowed())
 
 		mu.Lock()
 
@@ -2551,8 +2562,9 @@ func Test_Process_Reads_Content_When_Pipelined(t *testing.T) {
 		name := fmt.Sprintf("f-%03d.txt", i)
 		content := fmt.Sprintf("data-%03d", i)
 		writeFile(t, root, name, []byte(content))
-		wantPaths = append(wantPaths, name)
-		wantData[name] = content
+		fullPath := filepath.Join(root, name)
+		wantPaths = append(wantPaths, fullPath)
+		wantData[fullPath] = content
 	}
 
 	opts := []fileproc.Option{
@@ -2571,7 +2583,7 @@ func Test_Process_Reads_Content_When_Pipelined(t *testing.T) {
 			return nil, fmt.Errorf("read: %w", err)
 		}
 
-		path := string(f.RelPathBorrowed())
+		path := string(f.PathBorrowed())
 
 		mu.Lock()
 
@@ -2659,8 +2671,8 @@ func Test_Process_Continues_When_OnError_Drops_Errors(t *testing.T) {
 	)
 
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, _ *fileproc.Worker) (*string, error) {
-		path := string(f.RelPathBorrowed())
-		if path == "bad.txt" {
+		path := string(f.PathBorrowed())
+		if path == filepath.Join(root, "bad.txt") {
 			return nil, errors.New("fail")
 		}
 
@@ -2685,8 +2697,8 @@ func Test_Process_Continues_When_OnError_Drops_Errors(t *testing.T) {
 		t.Fatalf("expected OnError count=1, got %d", seenErrs)
 	}
 
-	assertStringSlicesEqual(t, resultPaths(results), []string{"good.txt"})
-	assertStringSlicesEqual(t, paths, []string{"good.txt"})
+	assertStringSlicesEqual(t, resultPaths(results), []string{filepath.Join(root, "good.txt")})
+	assertStringSlicesEqual(t, paths, []string{filepath.Join(root, "good.txt")})
 }
 
 func Test_Process_OnError_Counts_Are_Cumulative_When_Multiple_Errors(t *testing.T) {
@@ -2776,7 +2788,7 @@ func Test_Process_Skips_NonRegular_When_Fifo_Present(t *testing.T) {
 	}
 
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, _ *fileproc.Worker) (*string, error) {
-		path := string(f.RelPathBorrowed())
+		path := string(f.PathBorrowed())
 
 		return &path, nil
 	}, fileproc.WithWorkers(1))
@@ -2785,7 +2797,7 @@ func Test_Process_Skips_NonRegular_When_Fifo_Present(t *testing.T) {
 		t.Fatalf("unexpected errors: %v", errs)
 	}
 
-	assertStringSlicesEqual(t, resultPaths(results), []string{"regular.txt"})
+	assertStringSlicesEqual(t, resultPaths(results), []string{filepath.Join(root, "regular.txt")})
 }
 
 func Test_Process_Stops_Early_When_Context_Canceled(t *testing.T) {
@@ -2854,7 +2866,7 @@ func Test_Process_Reports_IOError_When_Subdir_Not_Readable_Recursive(t *testing.
 	})
 
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, _ *fileproc.Worker) (*string, error) {
-		path := string(f.RelPathBorrowed())
+		path := string(f.PathBorrowed())
 
 		return &path, nil
 	}, fileproc.WithRecursive(), fileproc.WithWorkers(1), fileproc.WithSmallFileThreshold(1000))
@@ -2868,7 +2880,7 @@ func Test_Process_Reports_IOError_When_Subdir_Not_Readable_Recursive(t *testing.
 		t.Fatalf("expected IOError, got %T", errs[0])
 	}
 
-	if ioErr.Path != "blocked" {
+	if ioErr.Path != filepath.Join(root, "blocked") {
 		t.Fatalf("unexpected error path: %s", ioErr.Path)
 	}
 
@@ -2876,7 +2888,7 @@ func Test_Process_Reports_IOError_When_Subdir_Not_Readable_Recursive(t *testing.
 		t.Fatalf("unexpected error op: %s", ioErr.Op)
 	}
 
-	assertStringSlicesEqual(t, resultPaths(results), []string{"root.txt"})
+	assertStringSlicesEqual(t, resultPaths(results), []string{filepath.Join(root, "root.txt")})
 }
 
 func Test_Process_Does_Not_Hang_When_Cancelled_In_Pipelined_Mode(t *testing.T) {
@@ -3215,8 +3227,8 @@ func Test_Process_Counts_Errors_Correctly_When_Mixed_IO_And_Process_Errors_Concu
 	}
 
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, _ *fileproc.Worker) (*string, error) {
-		path := string(f.RelPathBorrowed())
-		if path == testBadFile {
+		path := string(f.PathBorrowed())
+		if path == filepath.Join(root, testBadFile) {
 			return nil, sentinel
 		}
 
@@ -3224,7 +3236,7 @@ func Test_Process_Counts_Errors_Correctly_When_Mixed_IO_And_Process_Errors_Concu
 	}, opts...)
 
 	// Only good.txt should be successful.
-	assertStringSlicesEqual(t, resultPaths(results), []string{"good.txt"})
+	assertStringSlicesEqual(t, resultPaths(results), []string{filepath.Join(root, "good.txt")})
 
 	if len(errs) != 2 {
 		t.Fatalf("expected 2 errors, got %d (%v)", len(errs), errs)
@@ -3249,13 +3261,13 @@ func Test_Process_Counts_Errors_Correctly_When_Mixed_IO_And_Process_Errors_Concu
 				t.Fatalf("unexpected io op: %s", ioErr.Op)
 			}
 
-			if ioErr.Path != "blocked" {
+			if ioErr.Path != filepath.Join(root, "blocked") {
 				t.Fatalf("unexpected io path: %s", ioErr.Path)
 			}
 		case errors.As(err, &procErr):
 			procSeen = true
 
-			if procErr.Path != testBadFile {
+			if procErr.Path != filepath.Join(root, testBadFile) {
 				t.Fatalf("unexpected proc path: %s", procErr.Path)
 			}
 
@@ -3378,7 +3390,7 @@ func Test_Process_Drops_IOErrors_When_OnError_Returns_False(t *testing.T) {
 	}
 
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, _ *fileproc.Worker) (*string, error) {
-		path := string(f.RelPathBorrowed())
+		path := string(f.PathBorrowed())
 
 		return &path, nil
 	}, opts...)
@@ -3387,7 +3399,7 @@ func Test_Process_Drops_IOErrors_When_OnError_Returns_False(t *testing.T) {
 		t.Fatalf("expected no collected errors, got %v", errs)
 	}
 
-	assertStringSlicesEqual(t, resultPaths(results), []string{"good.txt"})
+	assertStringSlicesEqual(t, resultPaths(results), []string{filepath.Join(root, "good.txt")})
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -3396,7 +3408,7 @@ func Test_Process_Drops_IOErrors_When_OnError_Returns_False(t *testing.T) {
 		t.Fatalf("expected OnError to be called once, got %d", onErrorN)
 	}
 
-	if ioErrPath != "blocked" {
+	if ioErrPath != filepath.Join(root, "blocked") {
 		t.Fatalf("unexpected IOError path: %q", ioErrPath)
 	}
 
@@ -3424,7 +3436,7 @@ func Test_Process_Processes_All_Files_When_Using_Recursive_Concurrent_Workers(t 
 	writeFile(t, root, "root1.txt", []byte("a"))
 	writeFile(t, root, "root2.txt", []byte("b"))
 
-	wantPaths = append(wantPaths, "root1.txt", "root2.txt")
+	wantPaths = append(wantPaths, filepath.Join(root, "root1.txt"), filepath.Join(root, "root2.txt"))
 
 	// Many subdirectories to exercise coordinator + multiple workers.
 	for i := range 25 {
@@ -3435,7 +3447,7 @@ func Test_Process_Processes_All_Files_When_Using_Recursive_Concurrent_Workers(t 
 		writeFile(t, root, file1, []byte("x"))
 		writeFile(t, root, file2, []byte("y"))
 
-		wantPaths = append(wantPaths, file1, file2)
+		wantPaths = append(wantPaths, filepath.Join(root, file1), filepath.Join(root, file2))
 	}
 
 	opts := []fileproc.Option{
@@ -3450,7 +3462,7 @@ func Test_Process_Processes_All_Files_When_Using_Recursive_Concurrent_Workers(t 
 	)
 
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, _ *fileproc.Worker) (*string, error) {
-		path := string(f.RelPathBorrowed())
+		path := string(f.PathBorrowed())
 
 		mu.Lock()
 
@@ -3492,13 +3504,13 @@ func Test_Process_Traverses_Subdirs_When_Using_Recursive_LargeDir_Pipelined(t *t
 	for i := range 20 {
 		p := filepath.Join("big", fmt.Sprintf("f%02d.txt", i))
 		writeFile(t, root, p, []byte("x"))
-		wantPaths = append(wantPaths, p)
+		wantPaths = append(wantPaths, filepath.Join(root, p))
 	}
 
 	// Nested directory under the large dir.
 	nested := filepath.Join("big", "sub", "inner.txt")
 	writeFile(t, root, nested, []byte("y"))
-	wantPaths = append(wantPaths, nested)
+	wantPaths = append(wantPaths, filepath.Join(root, nested))
 
 	opts := []fileproc.Option{
 		fileproc.WithRecursive(),
@@ -3507,7 +3519,7 @@ func Test_Process_Traverses_Subdirs_When_Using_Recursive_LargeDir_Pipelined(t *t
 	}
 
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, _ *fileproc.Worker) (*string, error) {
-		path := string(f.RelPathBorrowed())
+		path := string(f.PathBorrowed())
 
 		return &path, nil
 	}, opts...)

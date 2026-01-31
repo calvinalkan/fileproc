@@ -14,7 +14,7 @@ import "os"
 //   - NulTermName: entry name with trailing NUL (e.g., "file.txt\x00")
 //
 // Non-NUL types:
-//   - RootRelPath: relative path without NUL (e.g., "subdir/file.txt")
+//   - (none)
 //
 // Why NUL-terminated?
 //
@@ -74,7 +74,7 @@ func (p nulTermPath) LenWithoutNul() int {
 // Unlike [nulTermPath], this is just a name (no path separator components).
 // The trailing NUL byte is always present and included in len().
 //
-// Stored in nameBatch.names and File.name.
+// Stored in pathArena entries and File.name.
 type nulTermName []byte
 
 // String returns the name without the trailing NUL.
@@ -136,42 +136,148 @@ func (n nulTermName) HasSuffix(suffix string) bool {
 	return true
 }
 
-// rootRelPath is a path relative to the root directory passed to [Process].
+// ============================================================================
+// pathArena: Arena-Style Allocation for Directory Entries
+// ============================================================================
 //
-// Does NOT include a NUL terminator. Used for user-facing output:
-// File.RelPathBorrowed(), error messages, etc. Never passed to syscalls.
+// pathArena collects full paths using an "arena" allocation pattern that
+// minimizes heap allocations when reading directories with many files.
 //
-// Example: for root "/home/user/project" and file at
-// "/home/user/project/src/main.go", rootRelPath is "src/main.go".
-type rootRelPath []byte
+// THE PROBLEM:
+//
+// A naive implementation would allocate each path separately:
+//
+//	paths := []string{}
+//	for _, entry := range dirEntries {
+//	    paths = append(paths, filepath.Join(dir, entry.Name())) // ALLOCATES per file
+//	}
+//
+// For a directory with 1000 files, this causes 1000+ allocations. When
+// processing thousands of directories, allocation overhead dominates.
+//
+// THE SOLUTION: Arena-Style Storage
+//
+// Instead of allocating each path separately, we pack all paths into a single
+// contiguous byte buffer ("storage"), then create slices that point into this
+// buffer ("entries"). This reduces allocations from O(files) to O(1).
+//
+// MEMORY LAYOUT:
+//
+// After appending "/root/file1", "/root/file2", and "/root/doc":
+//
+//	storage (one contiguous []byte allocation, includes trailing NULs):
+//	┌───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┐
+//	│ / │ r │ o │ o │ t │ / │ f │ 1 │\0 │ / │ r │ o │ o │ t │ / │ f │ 2 │\0 │ / │ r │ o │ o │ t │ / │ d │\0 │
+//	└───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───┘
+//	  0   1   2   3   4   5   6   7   8   9  10  11  12  13  14  15  16  17  18  19  20  21  22  23  24  25
+//	  ▲                               ▲   ▲                               ▲   ▲                           ▲
+//	  │                               │   │                               │   │                           │
+//	  └─────── entries[0] ────────────┘   └─────── entries[1] ────────────┘   └────── entries[2] ───────────┘
+//	        storage[0:9]                        storage[9:18]                     storage[18:26]
+//
+//	entries ([]pathEntry - slice of headers, NOT new allocations):
+//	┌─────────────────┬─────────────────┬─────────────────┐
+//	│ ptr=&storage[0] │ ptr=&storage[9] │ ptr=&storage[18]│
+//	│ len=9, cap=9    │ len=9, cap=9    │ len=8, cap=8    │
+//	└─────────────────┴─────────────────┴─────────────────┘
+//	      entries[0]        entries[1]        entries[2]
+//
+// KEY INSIGHT: Each entry in `entries` is just a couple slice headers (24 bytes
+// each on 64-bit: pointer + length + capacity). The headers point into
+// `storage` rather than owning their own memory. No per-file allocation occurs!
+//
+// WHY NUL TERMINATORS?
+//
+// The NUL byte (\0) after each name is required for Unix syscalls. By storing
+// the NUL as part of each path and name slice, we can pass names directly to
+// syscalls without any conversion or allocation.
+//
+// ALLOCATION COMPARISON:
+//
+//	Directory with 1000 files:
+//	┌─────────────────────┬──────────────────────────────────┐
+//	│ Approach            │ Heap Allocations                 │
+//	├─────────────────────┼──────────────────────────────────┤
+//	│ []string            │ ~1000 (one per filename)         │
+//	│ pathArena (arena)   │ ~2 (storage + entries slice)     │
+//	└─────────────────────┴──────────────────────────────────┘
+//
+// USAGE PATTERNS:
+//
+//	// For syscalls (NUL included, ready to use):
+//	fd, err := unix.Openat(dirfd, &name[0], flags, 0)
+//
+//	// For display/logging (exclude NUL):
+//	fmt.Println(path.String()) // "/root/file1"
+type pathArena struct {
+	// storage is the arena: a single contiguous byte buffer that holds
+	// all paths packed together with NUL terminators between them.
+	// Pre-sized to avoid growth during directory reading.
+	storage []byte
 
-// String returns the path as a string.
-// Returns "." for empty/root paths.
-func (p rootRelPath) String() string {
-	if len(p) == 0 {
-		return "."
-	}
-
-	return string(p)
+	// entries contains headers pointing into storage. Each entry provides
+	// both full path and basename (both NUL-terminated). These are NOT
+	// separate allocations - they're just "views" into storage.
+	entries []pathEntry
 }
 
-// Len returns the path length.
-func (p rootRelPath) Len() int {
-	return len(p)
+type pathEntry struct {
+	path nulTermPath // NUL-terminated full path
+	name nulTermName // NUL-terminated basename (slice into path)
 }
 
-// AppendTo appends p/name to buf and returns the resulting slice.
-// Used for buffer reuse patterns where allocation is amortized.
-func (p rootRelPath) AppendTo(buf []byte, name nulTermName) rootRelPath {
-	buf = buf[:0]
-
-	nameLen := name.LenWithoutNul()
-	if len(p) == 0 {
-		return append(buf, name[:nameLen]...)
+// reset prepares the arena for reuse, preserving allocated capacity.
+//
+// The storageCap parameter hints at expected total bytes for all paths.
+// Typically set to len(dirBuf) * 2, estimating that names occupy about
+// half of the raw dirent data returned by getdents64 (prefix added later).
+//
+// After reset, the arena is empty but retains its backing arrays, enabling
+// zero-allocation reuse across multiple directories.
+func (b *pathArena) reset(storageCap int) {
+	// Grow storage capacity if needed, otherwise just reset length to 0.
+	// The backing array is retained for reuse.
+	if storageCap > 0 && cap(b.storage) < storageCap {
+		b.storage = make([]byte, 0, storageCap)
+	} else {
+		b.storage = b.storage[:0]
 	}
 
-	buf = append(buf, p...)
-	buf = append(buf, os.PathSeparator)
+	// Pre-size the entries slice to avoid growth allocations during append.
+	//
+	// Heuristic: assume average filename is ~20 bytes (including NUL).
+	// For storageCap=64KB, this pre-allocates space for ~3200 entries.
+	// This eliminates the repeated allocations that occur when a slice
+	// grows: 0→1→2→4→8→16→...→2048 (about 11 allocations for 1000 files).
+	//
+	// If the estimate is wrong, append still works - it just allocates.
+	// But for typical directories, this eliminates all entries slice growth.
+	namesCap := storageCap / 20
+	if namesCap > 0 && cap(b.entries) < namesCap {
+		b.entries = make([]pathEntry, 0, namesCap)
+	} else {
+		b.entries = b.entries[:0]
+	}
+}
 
-	return append(buf, name[:nameLen]...)
+// addPath appends a full path and basename to the arena.
+// dirPath and name must include their trailing NUL terminators.
+func (b *pathArena) addPath(dirPath nulTermPath, name nulTermName) {
+	start := len(b.storage)
+	dirLen := dirPath.LenWithoutNul()
+
+	if dirLen > 0 {
+		b.storage = append(b.storage, dirPath[:dirLen]...)
+		if dirPath[dirLen-1] != os.PathSeparator {
+			b.storage = append(b.storage, os.PathSeparator)
+		}
+	}
+
+	nameStart := len(b.storage)
+	b.storage = append(b.storage, name...) // name already includes NUL
+	full := b.storage[start:len(b.storage)]
+	b.entries = append(b.entries, pathEntry{
+		path: full,
+		name: full[nameStart-start:],
+	})
 }
