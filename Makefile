@@ -33,4 +33,4 @@ fmt:
 
 bench:
 	@bash .pi/skills/fileproc-benchmark/scripts/bench_regress.sh
-	./cmd/benchreport/benchreport compare --against baseline --n 5 --fail-above 2
+	./cmd/benchreport/benchreport compare --against baseline --fail-above 2

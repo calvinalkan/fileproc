@@ -467,7 +467,7 @@ func fmtPct(v float64) string {
 
 func fmtPctColored(v float64) string {
 	s := fmtPct(v)
-	if _, ok := os.LookupEnv("NO_COLOR"); ok {
+	if !colorEnabled() {
 		return s
 	}
 
@@ -479,4 +479,13 @@ func fmtPctColored(v float64) string {
 	default:
 		return s
 	}
+}
+
+func colorEnabled() bool {
+	fi, err := os.Stdout.Stat()
+	if err != nil {
+		return false
+	}
+
+	return fi.Mode()&os.ModeCharDevice != 0
 }
