@@ -324,35 +324,94 @@ func (p processor[T]) processDir(
 	batch := &nameBatch{}
 	batch.reset(cap(dirBuf) * 2)
 
-	exceedsSmallFileTreshold, readDirErr := readDirUntilThresholdOrEOF(
+	return p.processDirAdaptive(ctx, &adaptiveDirArgs{
+		dirPath:       dir,
+		dirPathBytes:  dirPath,
+		relPrefix:     nil,
+		dirEnumerator: dirEnumerator,
+		dirBuf:        dirBuf[:cap(dirBuf)],
+		batch:         batch,
+		opts:          opts,
+		notifier:      notifier,
+		reportSubdir:  nil,
+		reuse:         nil,
+	})
+}
+
+type pipelineReuse struct {
+	freeBatches   chan *nameBatch
+	queueCapacity int
+	sharedBufs    *workerBufs
+}
+
+type adaptiveDirArgs struct {
+	dirPath       string
+	dirPathBytes  []byte
+	relPrefix     []byte
+	dirEnumerator readdirHandle
+	dirBuf        []byte
+	batch         *nameBatch
+	opts          options
+	notifier      *errNotifier
+	reportSubdir  func([]byte)
+	reuse         *pipelineReuse
+}
+
+// processDirAdaptive decides between sequential and pipelined processing
+// based on SmallFileThreshold, and wires error reporting consistently.
+//
+// ADAPTIVE PROCESSING STRATEGY:
+//
+// We start reading the directory sequentially. If we discover more than
+// SmallFileThreshold files, we switch mid-stream to pipelined processing.
+// The files already read become the "initial" batch for the pipeline.
+//
+// This avoids pipeline setup overhead for small directories while still
+// benefiting from overlap in large ones.
+func (p processor[T]) processDirAdaptive(ctx context.Context, args *adaptiveDirArgs) ([]*T, []error) {
+	large, readErr := readDirUntilThresholdOrEOF(
 		ctx,
-		dirEnumerator,
-		dirBuf[:cap(dirBuf)],
-		opts.Suffix,
-		batch,
-		nil,
-		opts.SmallFileThreshold,
+		args.dirEnumerator,
+		args.dirBuf,
+		args.opts.Suffix,
+		args.batch,
+		args.reportSubdir,
+		args.opts.SmallFileThreshold,
 	)
 
 	if ctx.Err() != nil {
 		return nil, nil
 	}
 
-	if exceedsSmallFileTreshold {
-		return p.processDirPipelined(ctx, &dirPipelineArgs{
-			dirPath:       dir,
-			relPrefix:     nil,
-			dirEnumerator: dirEnumerator,
-			initialNames:  batch.names,
-			suffix:        opts.Suffix,
-			reportSubdir:  nil,
-			notifier:      notifier,
-			dirBuf:        dirBuf[:cap(dirBuf)],
-			workerCount:   opts.Workers,
-		})
+	if large {
+		pipelineArgs := dirPipelineArgs{
+			dirPath:       args.dirPath,
+			dirPathBytes:  args.dirPathBytes,
+			relPrefix:     args.relPrefix,
+			dirEnumerator: args.dirEnumerator,
+			initialNames:  args.batch.names,
+			suffix:        args.opts.Suffix,
+			reportSubdir:  args.reportSubdir,
+			notifier:      args.notifier,
+			dirBuf:        args.dirBuf,
+			workerCount:   args.opts.Workers,
+		}
+
+		if args.reuse != nil {
+			pipelineArgs.queueCapacity = args.reuse.queueCapacity
+			pipelineArgs.freeBatches = args.reuse.freeBatches
+			pipelineArgs.sharedBufs = args.reuse.sharedBufs
+		}
+
+		return p.processDirPipelined(ctx, &pipelineArgs)
 	}
 
-	return p.processDirNames(ctx, dirPath, nil, batch.names, readDirErr, notifier, nil)
+	var sharedBufs *workerBufs
+	if args.reuse != nil {
+		sharedBufs = args.reuse.sharedBufs
+	}
+
+	return p.processDirNames(ctx, args.dirPathBytes, args.relPrefix, args.batch.names, readErr, args.notifier, sharedBufs)
 }
 
 // processTree processes a directory tree with parallel workers.
@@ -627,6 +686,11 @@ func (p processor[T]) processTree(
 		}
 		// Keep queue capacity in sync with pipelineBatchCount sizing.
 		pipelineQueueCap := pipelineBatchCount - dirOpts.Workers - 1
+		reuse := pipelineReuse{
+			freeBatches:   freeBatches,
+			queueCapacity: pipelineQueueCap,
+			sharedBufs:    bufs,
+		}
 
 		// ====================================================================
 		// MAIN WORK LOOP: Process directories until coordinator closes jobs
@@ -692,76 +756,26 @@ func (p processor[T]) processTree(
 
 				bufs.batch.reset(cap(bufs.dirBuf) * 2)
 
-				// ============================================================
-				// ADAPTIVE PROCESSING STRATEGY
-				// ============================================================
-				//
-				// We start reading the directory sequentially. If we discover
-				// more than SmallFileThreshold files, we switch mid-stream to
-				// pipelined processing. The files already read become the
-				// "initial" batch for the pipeline.
-				//
-				// This avoids pipeline setup overhead for small directories
-				// while still benefiting from overlap in large ones.
-				//
-				large, err := readDirUntilThresholdOrEOF(
-					ctx,
-					dirEnumerator,
-					bufs.dirBuf[:cap(bufs.dirBuf)],
-					dirOpts.Suffix,
-					&bufs.batch,
-					reportSubdir,
-					dirOpts.SmallFileThreshold,
-				)
-
-				if ctx.Err() != nil {
-					return
+				// Adaptive processing: switch to pipelined mode when the directory
+				// exceeds SmallFileThreshold, otherwise process sequentially.
+				dirResults, dirErrs := p.processDirAdaptive(ctx, &adaptiveDirArgs{
+					dirPath:       "",
+					dirPathBytes:  job.abs,
+					relPrefix:     job.rel,
+					dirEnumerator: dirEnumerator,
+					dirBuf:        bufs.dirBuf[:cap(bufs.dirBuf)],
+					batch:         &bufs.batch,
+					opts:          dirOpts,
+					notifier:      notifier,
+					reportSubdir:  reportSubdir,
+					reuse:         &reuse,
+				})
+				if len(dirErrs) > 0 {
+					workerErrs[workerID] = append(workerErrs[workerID], dirErrs...)
 				}
 
-				var readErr error
-				if err != nil && !errors.Is(err, io.EOF) {
-					// Best-effort: process already-read names, but surface the readdir error.
-					readErr = err
-				}
-
-				// Large directory? Switch to pipelined processing.
-				if large {
-					// Reuse the tree worker's buffers and batch pool to avoid allocations.
-					dirResults, dirErrs := p.processDirPipelined(ctx, &dirPipelineArgs{
-						dirPathBytes:  job.abs,
-						relPrefix:     job.rel,
-						dirEnumerator: dirEnumerator,
-						initialNames:  bufs.batch.names,
-						suffix:        dirOpts.Suffix,
-						reportSubdir:  reportSubdir,
-						notifier:      notifier,
-						dirBuf:        bufs.dirBuf,
-						workerCount:   dirOpts.Workers,
-						queueCapacity: pipelineQueueCap,
-						freeBatches:   freeBatches,
-						sharedBufs:    bufs,
-					})
-					if len(dirErrs) > 0 {
-						workerErrs[workerID] = append(workerErrs[workerID], dirErrs...)
-					}
-
-					if len(dirResults) > 0 {
-						workerResults[workerID] = append(workerResults[workerID], dirResults...)
-					}
-
-					return
-				}
-
-				// Small/medium directory: process files directly.
-				if ctx.Err() == nil {
-					dirResults, dirErrs := p.processDirNames(ctx, job.abs, job.rel, bufs.batch.names, readErr, notifier, bufs)
-					if len(dirErrs) > 0 {
-						workerErrs[workerID] = append(workerErrs[workerID], dirErrs...)
-					}
-
-					if len(dirResults) > 0 {
-						workerResults[workerID] = append(workerResults[workerID], dirResults...)
-					}
+				if len(dirResults) > 0 {
+					workerResults[workerID] = append(workerResults[workerID], dirResults...)
 				}
 			}()
 
