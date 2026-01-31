@@ -28,53 +28,8 @@ import (
 const readDirBatchSize = 4096
 
 // ============================================================================
-// Directory enumeration (readdirHandle + readDirBatch)
+// Directory enumeration (readDirBatchImpl)
 // ============================================================================
-
-// readdirHandle wraps a directory for enumeration.
-//
-// Part of the internal I/O backend contract (see io_contract.go).
-type readdirHandle struct {
-	fd   int // kept for cross-platform symmetry; unused by this backend
-	f    *os.File
-	path string
-}
-
-// openDirEnumerator opens a directory for entry enumeration.
-// path must include its trailing NUL terminator.
-func openDirEnumerator(path nulTermPath) (readdirHandle, error) {
-	p := path.String()
-
-	info, err := os.Lstat(p)
-	if err != nil {
-		return readdirHandle{fd: -1}, err
-	}
-	if info.Mode()&fs.ModeSymlink != 0 {
-		return readdirHandle{fd: -1}, syscall.ELOOP
-	}
-	if !info.IsDir() {
-		return readdirHandle{fd: -1}, syscall.ENOTDIR
-	}
-
-	f, err := os.Open(p)
-	if err != nil {
-		return readdirHandle{fd: -1}, err
-	}
-	return readdirHandle{fd: 0, f: f, path: p}, nil
-}
-
-func (h readdirHandle) closeHandle() error {
-	if h.f == nil {
-		return nil
-	}
-
-	err := h.f.Close()
-	if err != nil {
-		return fmt.Errorf("close readdir: %w", err)
-	}
-
-	return nil
-}
 
 // readDirBatchImpl enumerates directory entries using (*os.File).ReadDir.
 //
@@ -82,8 +37,8 @@ func (h readdirHandle) closeHandle() error {
 //
 // If reportSubdir is non-nil, it is called for each discovered subdirectory
 // entry name (without a trailing NUL).
-func readDirBatchImpl(rh readdirHandle, dirPath nulTermPath, _ []byte, suffix string, batch *pathArena, reportSubdir func(nulTermName)) error {
-	entries, err := rh.f.ReadDir(readDirBatchSize)
+func readDirBatchImpl(dh dirHandle, dirPath nulTermPath, _ []byte, suffix string, batch *pathArena, reportSubdir func(nulTermName)) error {
+	entries, err := dh.f.ReadDir(readDirBatchSize)
 	for _, e := range entries {
 		// Use Type() instead of IsDir() to avoid following symlinks.
 		typ := e.Type()
@@ -114,7 +69,7 @@ func readDirBatchImpl(rh readdirHandle, dirPath nulTermPath, _ []byte, suffix st
 				continue
 			}
 
-			info, statErr := os.Lstat(filepath.Join(rh.path, nameStr))
+			info, statErr := os.Lstat(filepath.Join(dh.path, nameStr))
 			if statErr != nil {
 				continue
 			}
@@ -162,10 +117,9 @@ func readDirBatchImpl(rh readdirHandle, dirPath nulTermPath, _ []byte, suffix st
 // Directory + file handles for processing (dirHandle/fileHandle)
 // ============================================================================
 
-// dirHandle wraps a directory path for file operations.
-//
-// This backend does not use openat; it constructs full paths via filepath.Join.
+// dirHandle wraps an open directory for ReadDir and full-path operations.
 type dirHandle struct {
+	f    *os.File
 	path string
 }
 
@@ -190,19 +144,25 @@ func openDir(path nulTermPath) (dirHandle, error) {
 		return dirHandle{}, syscall.ENOTDIR
 	}
 
-	return dirHandle{path: p}, nil
-}
+	f, err := os.Open(p)
+	if err != nil {
+		return dirHandle{}, err
+	}
 
-// openDirFromReaddir creates a dirHandle from an already-open readdirHandle.
-//
-// The pipeline passes the directory string as known by the orchestration layer.
-// In this backend we just store it and use filepath.Join for file opens.
-func openDirFromReaddir(_ readdirHandle, path nulTermPath) (dirHandle, error) {
-	return dirHandle{path: path.String()}, nil
+	return dirHandle{f: f, path: p}, nil
 }
 
 func (d dirHandle) closeHandle() error {
-	return nil // nothing to close
+	if d.f == nil {
+		return nil
+	}
+
+	err := d.f.Close()
+	if err != nil {
+		return fmt.Errorf("close dir: %w", err)
+	}
+
+	return nil
 }
 
 // openFile opens a file relative to this directory.

@@ -23,62 +23,18 @@ import (
 )
 
 // ============================================================================
-// Directory enumeration (readdirHandle + readDirBatch)
+// Directory enumeration (readDirBatchImpl)
 // ============================================================================
 
 const readDirBatchSize = 4096
-
-// readdirHandle wraps a directory for enumeration.
-//
-// We store both:
-//   - fd: used for openat-based operations
-//   - f:  *os.File wrapper used for (*os.File).ReadDir
-//
-// Part of the internal I/O backend contract (see io_contract.go).
-type readdirHandle struct {
-	fd int
-	f  *os.File
-}
-
-// openDirEnumerator opens a directory for entry enumeration.
-// path must include its trailing NUL terminator.
-func openDirEnumerator(path nulTermPath) (readdirHandle, error) {
-	p := path.String()
-
-	for {
-		fd, err := unix.Open(p, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
-		if err == syscall.EINTR {
-			continue
-		}
-		if err != nil {
-			return readdirHandle{fd: -1}, err
-		}
-
-		f := os.NewFile(uintptr(fd), p)
-		return readdirHandle{fd: fd, f: f}, nil
-	}
-}
-
-func (h readdirHandle) closeHandle() error {
-	if h.f == nil {
-		return nil
-	}
-
-	err := h.f.Close()
-	if err != nil {
-		return fmt.Errorf("close readdir: %w", err)
-	}
-
-	return nil
-}
 
 // readDirBatchImpl enumerates directory entries using (*os.File).ReadDir.
 //
 // Names appended to batch include their trailing NUL terminator.
 //
 // If reportSubdir is non-nil, it is called for each discovered subdirectory.
-func readDirBatchImpl(rh readdirHandle, dirPath nulTermPath, _ []byte, suffix string, batch *pathArena, reportSubdir func(nulTermName)) error {
-	entries, err := rh.f.ReadDir(readDirBatchSize)
+func readDirBatchImpl(dh dirHandle, dirPath nulTermPath, _ []byte, suffix string, batch *pathArena, reportSubdir func(nulTermName)) error {
+	entries, err := dh.f.ReadDir(readDirBatchSize)
 	for _, e := range entries {
 		// Use Type() instead of IsDir() to avoid following symlinks.
 		typ := e.Type()
@@ -109,7 +65,7 @@ func readDirBatchImpl(rh readdirHandle, dirPath nulTermPath, _ []byte, suffix st
 				continue
 			}
 
-			kind, statErr := classifyAt(rh.fd, nameStr)
+			kind, statErr := classifyAt(dh.fd, nameStr)
 			if statErr != nil {
 				continue
 			}
@@ -180,10 +136,10 @@ func classifyAt(dirfd int, name string) (statKind, error) {
 // Directory + file handles for processing (dirHandle/fileHandle)
 // ============================================================================
 
-// dirHandle wraps an open directory for openat-based file operations.
+// dirHandle wraps an open directory for ReadDir/openat-based operations.
 type dirHandle struct {
-	fd     int
-	ownsFd bool
+	fd int
+	f  *os.File
 }
 
 // fileHandle wraps an open file descriptor.
@@ -194,6 +150,7 @@ type fileHandle struct {
 // openDir opens a directory for file operations.
 // path must include its trailing NUL terminator.
 func openDir(path nulTermPath) (dirHandle, error) {
+	pathStr := path.String()
 	for {
 		fd, _, errno := syscall.Syscall(
 			unix.SYS_OPEN,
@@ -207,22 +164,17 @@ func openDir(path nulTermPath) (dirHandle, error) {
 		if errno != 0 {
 			return dirHandle{fd: -1}, errno
 		}
-		return dirHandle{fd: int(fd), ownsFd: true}, nil
+		f := os.NewFile(uintptr(fd), pathStr)
+		return dirHandle{fd: int(fd), f: f}, nil
 	}
-}
-
-// openDirFromReaddir creates a dirHandle from an already-open readdirHandle.
-// The returned dirHandle borrows the fd; closing the readdirHandle closes it.
-func openDirFromReaddir(rh readdirHandle, _ nulTermPath) (dirHandle, error) {
-	return dirHandle{fd: rh.fd, ownsFd: false}, nil
 }
 
 func (d dirHandle) closeHandle() error {
-	if !d.ownsFd || d.fd < 0 {
+	if d.f == nil {
 		return nil
 	}
 
-	err := syscall.Close(d.fd)
+	err := d.f.Close()
 	if err != nil {
 		return fmt.Errorf("close dir: %w", err)
 	}

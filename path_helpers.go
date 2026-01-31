@@ -26,7 +26,7 @@ import "os"
 // nulTermPath is a NUL-terminated absolute path for syscalls.
 //
 // The trailing NUL byte is always present and included in len().
-// Used with: openDirEnumerator, openDir, and similar syscall wrappers.
+// Used with: openDir and similar syscall wrappers.
 //
 // Create with NewNulTermPath or nulTermPath.Join.
 type nulTermPath []byte

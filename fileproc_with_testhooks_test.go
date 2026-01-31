@@ -17,7 +17,7 @@ func Test_ReaddirError_BestEffort_NonRecursive(t *testing.T) {
 
 	errSentinel := errors.New("readdir boom")
 
-	restore := setReadDirBatchHook(func(rh readdirHandle, dirPath nulTermPath, buf []byte, suffix string, batch *pathArena, reportSubdir func(nulTermName)) error {
+	restore := setReadDirBatchHook(func(dh dirHandle, dirPath nulTermPath, buf []byte, suffix string, batch *pathArena, reportSubdir func(nulTermName)) error {
 		// Hook is global to this test binary; keep tests non-parallel to avoid interference.
 		// Inject a non-EOF error after providing some names to test best-effort behavior.
 		batch.addPath(dirPath, nulTermName(append([]byte("a.txt"), 0)))
@@ -55,7 +55,7 @@ func Test_ReaddirError_BestEffort_Pipelined(t *testing.T) {
 	errSentinel := errors.New("readdir boom")
 	callCount := 0
 
-	restore := setReadDirBatchHook(func(rh readdirHandle, dirPath nulTermPath, buf []byte, suffix string, batch *pathArena, reportSubdir func(nulTermName)) error {
+	restore := setReadDirBatchHook(func(dh dirHandle, dirPath nulTermPath, buf []byte, suffix string, batch *pathArena, reportSubdir func(nulTermName)) error {
 		// Hook is global to this test binary; keep tests non-parallel to avoid interference.
 		callCount++
 		switch callCount {
@@ -107,7 +107,7 @@ func Test_ReaddirError_BestEffort_Recursive(t *testing.T) {
 
 	errSentinel := errors.New("readdir boom")
 
-	restore := setReadDirBatchHook(func(rh readdirHandle, dirPath nulTermPath, buf []byte, suffix string, batch *pathArena, reportSubdir func(nulTermName)) error {
+	restore := setReadDirBatchHook(func(dh dirHandle, dirPath nulTermPath, buf []byte, suffix string, batch *pathArena, reportSubdir func(nulTermName)) error {
 		// Hook is global to this test binary; keep tests non-parallel to avoid interference.
 		// Inject a non-EOF error after providing some names to test best-effort behavior.
 		batch.addPath(dirPath, nulTermName(append([]byte("a.txt"), 0)))

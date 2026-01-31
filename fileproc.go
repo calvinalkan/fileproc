@@ -88,7 +88,7 @@ import (
 //
 // ProcessFunc may be called concurrently and must be safe for concurrent use.
 //
-// f provides access to [File] metadata and content. f.PathBorrowed() is
+// f provides access to [File] metadata and content. f.AbsPathBorrowed() is
 // ephemeral and only valid during the callback.
 //
 // w provides reusable temporary buffer space. w.Buf() returns a slice that is
@@ -114,7 +114,7 @@ type ProcessFunc[T any] func(f *File, w *Worker) (*T, error)
 // By default, only the specified directory is processed. Use [WithRecursive]
 // to process subdirectories recursively.
 //
-// f.PathBorrowed() returns the absolute path. Results are unordered
+// f.AbsPathBorrowed() returns the absolute path. Results are unordered
 // when processed with multiple workers.
 //
 // To stop processing on error, use [WithOnError] with a cancelable context:
@@ -302,9 +302,9 @@ func (p processor[T]) processDir(
 	opts options,
 	notifier *errNotifier,
 ) ([]*T, []error) {
-	dirEnumerator, readDirErr := openDirEnumerator(dirPath)
-	if readDirErr != nil {
-		ioErr := &IOError{Path: dirPath.String(), Op: "open", Err: readDirErr}
+	dh, openErr := openDir(dirPath)
+	if openErr != nil {
+		ioErr := &IOError{Path: dirPath.String(), Op: "open", Err: openErr}
 		if notifier.ioErr(ioErr) {
 			return nil, []error{ioErr}
 		}
@@ -312,21 +312,21 @@ func (p processor[T]) processDir(
 		return nil, nil
 	}
 
-	defer func() { _ = dirEnumerator.closeHandle() }()
+	defer func() { _ = dh.closeHandle() }()
 
 	dirBuf := make([]byte, 0, dirReadBufSize)
 	paths := &pathArena{}
 	paths.reset(cap(dirBuf) * 2)
 
 	return p.processDirAdaptive(ctx, &adaptiveDirArgs{
-		dirPath:       dirPath,
-		dirEnumerator: dirEnumerator,
-		dirBuf:        dirBuf[:cap(dirBuf)],
-		paths:         paths,
-		opts:          opts,
-		notifier:      notifier,
-		reportSubdir:  nil,
-		reuse:         nil,
+		dirPath:      dirPath,
+		dirHandle:    dh,
+		dirBuf:       dirBuf[:cap(dirBuf)],
+		paths:        paths,
+		opts:         opts,
+		notifier:     notifier,
+		reportSubdir: nil,
+		reuse:        nil,
 	})
 }
 
@@ -337,14 +337,14 @@ type pipelineReuse struct {
 }
 
 type adaptiveDirArgs struct {
-	dirPath       nulTermPath
-	dirEnumerator readdirHandle
-	dirBuf        []byte
-	paths         *pathArena
-	opts          options
-	notifier      *errNotifier
-	reportSubdir  func(nulTermName)
-	reuse         *pipelineReuse
+	dirPath      nulTermPath
+	dirHandle    dirHandle
+	dirBuf       []byte
+	paths        *pathArena
+	opts         options
+	notifier     *errNotifier
+	reportSubdir func(nulTermName)
+	reuse        *pipelineReuse
 }
 
 // processDirAdaptive decides between sequential and pipelined processing
@@ -361,7 +361,7 @@ type adaptiveDirArgs struct {
 func (p processor[T]) processDirAdaptive(ctx context.Context, args *adaptiveDirArgs) ([]*T, []error) {
 	large, readErr := readDirUntilThresholdOrEOF(
 		ctx,
-		args.dirEnumerator,
+		args.dirHandle,
 		args.dirPath,
 		args.dirBuf,
 		args.opts.Suffix,
@@ -377,7 +377,7 @@ func (p processor[T]) processDirAdaptive(ctx context.Context, args *adaptiveDirA
 	if large {
 		pipelineArgs := dirPipelineArgs{
 			dirPath:        args.dirPath,
-			dirEnumerator:  args.dirEnumerator,
+			dirHandle:      args.dirHandle,
 			initialEntries: args.paths.entries,
 			suffix:         args.opts.Suffix,
 			reportSubdir:   args.reportSubdir,
@@ -400,7 +400,7 @@ func (p processor[T]) processDirAdaptive(ctx context.Context, args *adaptiveDirA
 		sharedBufs = args.reuse.sharedBufs
 	}
 
-	return p.processDirNames(ctx, args.dirPath, args.paths.entries, readErr, args.notifier, sharedBufs)
+	return p.processDirNames(ctx, args.dirPath, args.dirHandle, args.paths.entries, readErr, args.notifier, sharedBufs)
 }
 
 // processTree processes a directory tree with parallel workers.
@@ -692,7 +692,7 @@ func (p processor[T]) processTree(
 					return
 				}
 
-				dirEnumerator, err := openDirEnumerator(job.absPath)
+				dh, err := openDir(job.absPath)
 				if err != nil {
 					ioErr := &IOError{Path: job.absPath.String(), Op: "open", Err: err}
 					if notifier.ioErr(ioErr) {
@@ -702,7 +702,7 @@ func (p processor[T]) processTree(
 					return
 				}
 
-				defer func() { _ = dirEnumerator.closeHandle() }()
+				defer func() { _ = dh.closeHandle() }()
 
 				// ============================================================
 				// SUBDIRECTORY DISCOVERY
@@ -720,10 +720,12 @@ func (p processor[T]) processTree(
 					// Build child path: parent + sep + name (includes NUL from name).
 					parentLen := job.absPath.LenWithoutNul()
 					childAbs := make([]byte, 0, parentLen+1+len(name))
+
 					childAbs = append(childAbs, job.absPath[:parentLen]...)
 					if parentLen > 0 && job.absPath[parentLen-1] != os.PathSeparator {
 						childAbs = append(childAbs, os.PathSeparator)
 					}
+
 					childAbs = append(childAbs, name...) // includes NUL
 
 					select {
@@ -737,14 +739,14 @@ func (p processor[T]) processTree(
 				// Adaptive processing: switch to pipelined mode when the directory
 				// exceeds SmallFileThreshold, otherwise process sequentially.
 				dirResults, dirErrs := p.processDirAdaptive(ctx, &adaptiveDirArgs{
-					dirPath:       job.absPath,
-					dirEnumerator: dirEnumerator,
-					dirBuf:        bufs.dirBuf[:cap(bufs.dirBuf)],
-					paths:         &bufs.paths,
-					opts:          dirOpts,
-					notifier:      notifier,
-					reportSubdir:  reportSubdir,
-					reuse:         &reuse,
+					dirPath:      job.absPath,
+					dirHandle:    dh,
+					dirBuf:       bufs.dirBuf[:cap(bufs.dirBuf)],
+					paths:        &bufs.paths,
+					opts:         dirOpts,
+					notifier:     notifier,
+					reportSubdir: reportSubdir,
+					reuse:        &reuse,
 				})
 				if len(dirErrs) > 0 {
 					workerErrs[workerID] = append(workerErrs[workerID], dirErrs...)
@@ -801,13 +803,13 @@ func (p processor[T]) processTree(
 	return results, allErrs
 }
 
-func readDirUntilThresholdOrEOF(ctx context.Context, dirEnumerator readdirHandle, dirPath nulTermPath, dirBuf []byte, suffix string, arena *pathArena, reportSubdir func(nulTermName), threshold int) (bool, error) {
+func readDirUntilThresholdOrEOF(ctx context.Context, dh dirHandle, dirPath nulTermPath, dirBuf []byte, suffix string, arena *pathArena, reportSubdir func(nulTermName), threshold int) (bool, error) {
 	for {
 		if ctx.Err() != nil {
 			return false, io.EOF
 		}
 
-		err := readDirBatch(dirEnumerator, dirPath, dirBuf, suffix, arena, reportSubdir)
+		err := readDirBatch(dh, dirPath, dirBuf, suffix, arena, reportSubdir)
 		if len(arena.entries) > threshold {
 			if err != nil && !errors.Is(err, io.EOF) {
 				// Best-effort: signal error but keep already-read names.

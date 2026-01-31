@@ -54,7 +54,7 @@ func openat(dirfd int, name nulTermName) (int, error) {
 }
 
 // ============================================================================
-// Directory enumeration handle (readdirHandle)
+// Directory enumeration (readDirBatchImpl)
 // ============================================================================
 
 // linux_dirent64 offsets (from linux/dirent.h):
@@ -78,50 +78,6 @@ const (
 
 var errInvalidDirent = errors.New("invalid dirent")
 
-// readdirHandle wraps a directory fd for reading entries (getdents64).
-//
-// Part of the internal I/O backend contract (see io_contract.go).
-type readdirHandle struct {
-	fd int
-}
-
-// openDirEnumerator opens a directory for entry enumeration.
-// path must include its trailing NUL terminator.
-func openDirEnumerator(path nulTermPath) (readdirHandle, error) {
-	for {
-		fd, _, errno := syscall.Syscall6(
-			syscall.SYS_OPENAT,
-			atFDCWD,
-			uintptr(unsafe.Pointer(path.Ptr())),
-			uintptr(unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_LARGEFILE|unix.O_NOFOLLOW),
-			0, 0, 0,
-		)
-		if errno == syscall.EINTR {
-			continue
-		}
-
-		if errno != 0 {
-			return readdirHandle{fd: -1}, errno
-		}
-
-		return readdirHandle{fd: int(fd)}, nil
-	}
-}
-
-func (h readdirHandle) closeHandle() error {
-	if h.fd < 0 {
-		return nil
-	}
-
-	// We intentionally do not retry close(2) on EINTR.
-	err := syscall.Close(h.fd)
-	if err != nil {
-		return fmt.Errorf("close readdir: %w", err)
-	}
-
-	return nil
-}
-
 // readDirBatchImpl reads directory entries using getdents64 (syscall.ReadDirent)
 // and appends matching file names to batch.
 //
@@ -129,14 +85,14 @@ func (h readdirHandle) closeHandle() error {
 //
 // If reportSubdir is non-nil, it is called for each discovered subdirectory
 // entry name (without a trailing NUL).
-func readDirBatchImpl(rh readdirHandle, dirPath nulTermPath, buf []byte, suffix string, batch *pathArena, reportSubdir func(nulTermName)) error {
+func readDirBatchImpl(dh dirHandle, dirPath nulTermPath, buf []byte, suffix string, batch *pathArena, reportSubdir func(nulTermName)) error {
 	// Retry ReadDirent on EINTR without an upper bound, matching Go's stdlib.
 	var (
 		read int
 		err  error
 	)
 	for {
-		read, err = syscall.ReadDirent(rh.fd, buf)
+		read, err = syscall.ReadDirent(dh.fd, buf)
 		if err == syscall.EINTR {
 			continue
 		}
@@ -197,7 +153,7 @@ func readDirBatchImpl(rh readdirHandle, dirPath nulTermPath, buf []byte, suffix 
 			}
 
 		case syscall.DT_UNKNOWN:
-			info, statErr := classifyAt(rh.fd, name)
+			info, statErr := classifyAt(dh.fd, name)
 			if statErr != nil {
 				// Can't classify (racy entry, permissions, etc.). Skip safely.
 				break
@@ -285,14 +241,9 @@ func classifyAt(dirfd int, name nulTermName) (classifyResult, error) {
 // Directory + file handles for processing (dirHandle/fileHandle)
 // ============================================================================
 
-// dirHandle wraps an open directory for openat-based file operations.
-//
-// ownsFd controls whether closeHandle() closes the underlying fd. When a
-// dirHandle is created via openDirFromReaddir, it borrows the fd owned by the
-// readdirHandle.
+// dirHandle wraps an open directory for getdents64/openat-based operations.
 type dirHandle struct {
-	fd     int
-	ownsFd bool
+	fd int
 }
 
 // fileHandle wraps an open file descriptor.
@@ -319,18 +270,12 @@ func openDir(path nulTermPath) (dirHandle, error) {
 			return dirHandle{fd: -1}, errno
 		}
 
-		return dirHandle{fd: int(fd), ownsFd: true}, nil
+		return dirHandle{fd: int(fd)}, nil
 	}
 }
 
-// openDirFromReaddir creates a dirHandle from an already-open readdirHandle.
-// The returned dirHandle borrows the fd; closing the readdirHandle closes it.
-func openDirFromReaddir(rh readdirHandle, _ nulTermPath) (dirHandle, error) {
-	return dirHandle{fd: rh.fd, ownsFd: false}, nil
-}
-
 func (d dirHandle) closeHandle() error {
-	if !d.ownsFd || d.fd < 0 {
+	if d.fd < 0 {
 		return nil
 	}
 

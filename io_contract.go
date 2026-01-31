@@ -30,8 +30,8 @@ import "io"
 //
 // Semantics notes (expected by the pipeline):
 //
-//   - Paths passed to openDirEnumerator/openDir are NUL-terminated (NulTermPath
-//     with a trailing 0), as produced by NewNulTermPath().
+//   - Paths passed to openDir are NUL-terminated (NulTermPath with a trailing 0),
+//     as produced by NewNulTermPath().
 //
 //   - Directory enumeration fills a *pathArena*. Every entry stored in
 //     pathArena.entries includes both the full path (NUL-terminated) and
@@ -59,19 +59,13 @@ import "io"
 
 // Function signatures required by the pipeline.
 var (
-	_ func(nulTermPath) (readdirHandle, error)                                              = openDirEnumerator
-	_ func(readdirHandle, nulTermPath, []byte, string, *pathArena, func(nulTermName)) error = readDirBatchImpl
-	_ func(nulTermPath) (dirHandle, error)                                                  = openDir
-	_ func(readdirHandle, nulTermPath) (dirHandle, error)                                   = openDirFromReaddir
+	_ func(nulTermPath) (dirHandle, error)                                              = openDir
+	_ func(dirHandle, nulTermPath, []byte, string, *pathArena, func(nulTermName)) error = readDirBatchImpl
 )
 
 // Method sets required by the pipeline.
 // These interfaces are only used for compile-time checking.
 type (
-	ioReaddirHandle interface {
-		closeHandle() error
-	}
-
 	ioDirHandle interface {
 		closeHandle() error
 		openFile(name nulTermName) (fileHandle, error)
@@ -87,7 +81,6 @@ type (
 )
 
 var (
-	_ ioReaddirHandle = readdirHandle{}
-	_ ioDirHandle     = dirHandle{}
-	_ ioFileHandle    = fileHandle{}
+	_ ioDirHandle  = dirHandle{}
+	_ ioFileHandle = fileHandle{}
 )

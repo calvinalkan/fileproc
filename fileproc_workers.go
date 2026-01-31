@@ -54,14 +54,12 @@ type dirPipelineArgs struct {
 	// dirPath is NUL-terminated path for syscalls.
 	dirPath nulTermPath
 
-	dirEnumerator  readdirHandle
+	dirHandle      dirHandle
 	initialEntries []pathEntry
 	suffix         string
 	reportSubdir   func(nulTermName)
 	notifier       *errNotifier
 	dirBuf         []byte
-	// Filled by processDirPipelined before running the pipeline.
-	dirHandle dirHandle
 
 	// workerCount/queueCapacity define pipeline sizing.
 	// If queueCapacity is zero and freeArenas is nil, we compute sizing from workerCount.
@@ -80,6 +78,7 @@ type dirPipelineArgs struct {
 func (p processor[T]) processDirNames(
 	ctx context.Context,
 	dirPath nulTermPath,
+	dh dirHandle,
 	entries []pathEntry,
 	readErr error,
 	notifier *errNotifier,
@@ -101,25 +100,6 @@ func (p processor[T]) processDirNames(
 
 		return nil, nil
 	}
-
-	dh, openErr, ok := openDirForFiles(dirPath, notifier)
-	if !ok {
-		var errs []error
-		if openErr != nil {
-			errs = append(errs, openErr)
-		}
-
-		if readErr != nil {
-			ioErr := &IOError{Path: dirPath.String(), Op: "readdir", Err: readErr}
-			if notifier.ioErr(ioErr) {
-				errs = append(errs, ioErr)
-			}
-		}
-
-		return nil, errs
-	}
-
-	defer func() { _ = dh.closeHandle() }()
 
 	if bufs == nil {
 		bufs = &workerBufs{
@@ -143,20 +123,6 @@ func (p processor[T]) processDirNames(
 	}
 
 	return results, errs
-}
-
-func openDirForFiles(dirPath nulTermPath, notifier *errNotifier) (dirHandle, *IOError, bool) {
-	dh, err := openDir(dirPath)
-	if err == nil {
-		return dh, nil, true
-	}
-
-	ioErr := &IOError{Path: dirPath.String(), Op: "open", Err: err}
-	if notifier.ioErr(ioErr) {
-		return dirHandle{}, ioErr, false
-	}
-
-	return dirHandle{}, nil, false
 }
 
 func processFilesWithHandle[T any](
@@ -413,7 +379,7 @@ func (p processor[T]) runDirPipeline(ctx context.Context, args *dirPipelineArgs)
 				return
 			}
 
-			err := readDirBatch(args.dirEnumerator, args.dirPath, args.dirBuf[:cap(args.dirBuf)], args.suffix, arena, args.reportSubdir)
+			err := readDirBatch(args.dirHandle, args.dirPath, args.dirBuf[:cap(args.dirBuf)], args.suffix, arena, args.reportSubdir)
 
 			if !sendArena(arena) {
 				return
@@ -528,16 +494,6 @@ func (p processor[T]) runDirPipeline(ctx context.Context, args *dirPipelineArgs)
 }
 
 func (p processor[T]) processDirPipelined(ctx context.Context, args *dirPipelineArgs) ([]*T, []error) {
-	dh, err := openDirFromReaddir(args.dirEnumerator, args.dirPath)
-	if err != nil {
-		ioErr := &IOError{Path: args.dirPath.String(), Op: "open", Err: err}
-		if args.notifier.ioErr(ioErr) {
-			return nil, []error{ioErr}
-		}
-
-		return nil, nil
-	}
-
 	workerCount := args.workerCount
 	queueCap := args.queueCapacity
 	freeArenas := args.freeArenas
@@ -562,7 +518,6 @@ func (p processor[T]) processDirPipelined(ctx context.Context, args *dirPipeline
 	}
 
 	pipelineArgs := *args
-	pipelineArgs.dirHandle = dh
 	pipelineArgs.workerCount = workerCount
 	pipelineArgs.queueCapacity = queueCap
 	pipelineArgs.freeArenas = freeArenas

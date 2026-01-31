@@ -43,11 +43,11 @@ type File struct {
 	statErr error
 }
 
-// PathBorrowed returns the absolute file path (without the trailing NUL).
+// AbsPathBorrowed returns the absolute file path (without the trailing NUL).
 //
 // The returned slice is ephemeral and only valid during the callback.
 // Copy if you need to retain it.
-func (f *File) PathBorrowed() []byte {
+func (f *File) AbsPathBorrowed() []byte {
 	if len(f.path) > 0 && f.path[len(f.path)-1] == 0 {
 		return f.path[:len(f.path)-1]
 	}

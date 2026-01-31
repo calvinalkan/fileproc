@@ -34,10 +34,10 @@ const (
 )
 
 // ============================================================================
-// File.PathBorrowed() tests
+// File.AbsPathBorrowed() tests
 // ============================================================================
 
-func Test_File_PathBorrowed_Returns_Correct_Path_When_NonRecursive(t *testing.T) {
+func Test_File_AbsPathBorrowed_Returns_Correct_Path_When_NonRecursive(t *testing.T) {
 	t.Parallel()
 
 	root := t.TempDir()
@@ -57,7 +57,7 @@ func Test_File_PathBorrowed_Returns_Correct_Path_When_NonRecursive(t *testing.T)
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, _ *fileproc.Worker) (*struct{}, error) {
 		mu.Lock()
 
-		seen[string(f.PathBorrowed())] = true
+		seen[string(f.AbsPathBorrowed())] = true
 
 		mu.Unlock()
 
@@ -77,7 +77,7 @@ func Test_File_PathBorrowed_Returns_Correct_Path_When_NonRecursive(t *testing.T)
 	}
 }
 
-func Test_File_PathBorrowed_Returns_Correct_Path_When_Recursive(t *testing.T) {
+func Test_File_AbsPathBorrowed_Returns_Correct_Path_When_Recursive(t *testing.T) {
 	t.Parallel()
 
 	root := t.TempDir()
@@ -99,7 +99,7 @@ func Test_File_PathBorrowed_Returns_Correct_Path_When_Recursive(t *testing.T) {
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, _ *fileproc.Worker) (*struct{}, error) {
 		mu.Lock()
 
-		seen[string(f.PathBorrowed())] = true
+		seen[string(f.AbsPathBorrowed())] = true
 
 		mu.Unlock()
 
@@ -126,7 +126,7 @@ func Test_File_PathBorrowed_Returns_Correct_Path_When_Recursive(t *testing.T) {
 	}
 }
 
-func Test_File_PathBorrowed_Copy_Remains_Valid_When_Process_Returns(t *testing.T) {
+func Test_File_AbsPathBorrowed_Copy_Remains_Valid_When_Process_Returns(t *testing.T) {
 	t.Parallel()
 
 	root := t.TempDir()
@@ -139,7 +139,7 @@ func Test_File_PathBorrowed_Copy_Remains_Valid_When_Process_Returns(t *testing.T
 	}
 
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, _ *fileproc.Worker) (*pathHolder, error) {
-		return &pathHolder{path: string(f.PathBorrowed())}, nil
+		return &pathHolder{path: string(f.AbsPathBorrowed())}, nil
 	}, opts...)
 
 	if len(errs) != 0 {
@@ -1121,7 +1121,7 @@ func Test_Arena_Multiple_Files_Dont_Interfere_When_Sequential(t *testing.T) {
 			return nil, fmt.Errorf("test: %w", err)
 		}
 
-		return &fileData{path: string(f.PathBorrowed()), data: data}, nil
+		return &fileData{path: string(f.AbsPathBorrowed()), data: data}, nil
 	}, opts...)
 
 	if len(errs) != 0 {
@@ -1328,7 +1328,7 @@ func Test_Concurrency_Multiple_Workers_Have_Independent_WorkerBuf_When_Parallel(
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, scratch *fileproc.Worker) (*scratchResult, error) {
 		// Write file path into scratch buffer
 		buf := scratch.Buf(256)
-		buf = append(buf, f.PathBorrowed()...)
+		buf = append(buf, f.AbsPathBorrowed()...)
 
 		// Copy to result (scratch only valid during callback)
 		return &scratchResult{data: append([]byte(nil), buf...)}, nil
@@ -1718,7 +1718,7 @@ func Test_Process_Returns_TopLevel_Files_And_Skips_Symlinks_When_NonRecursive(t 
 			return nil, fmt.Errorf("stat: %w", statErr)
 		}
 
-		path := string(f.PathBorrowed())
+		path := string(f.AbsPathBorrowed())
 
 		mu.Lock()
 
@@ -1804,7 +1804,7 @@ func Test_Process_Applies_Suffix_Filter_And_Skips_Symlink_Dirs_When_Recursive(t 
 	)
 
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, _ *fileproc.Worker) (*string, error) {
-		path := string(f.PathBorrowed())
+		path := string(f.AbsPathBorrowed())
 
 		mu.Lock()
 
@@ -1985,7 +1985,7 @@ func Test_Process_Closes_File_Handle_When_Callback_Errors_After_Read(t *testing.
 			return nil, fmt.Errorf("read file: %w", err)
 		}
 
-		path := string(f.PathBorrowed())
+		path := string(f.AbsPathBorrowed())
 
 		exp, ok := expected[path]
 		if !ok {
@@ -2051,7 +2051,7 @@ func Test_Process_Silently_Skips_When_File_Becomes_Directory(t *testing.T) {
 		callCount++
 
 		// On first call for the racy file, replace it with a directory
-		if string(f.PathBorrowed()) == racePath {
+		if string(f.AbsPathBorrowed()) == racePath {
 			// Remove file and create directory with same name before reading
 			err := os.Remove(racePath)
 			if err != nil {
@@ -2115,7 +2115,7 @@ func Test_Process_Silently_Skips_When_File_Becomes_Symlink(t *testing.T) {
 		callCount++
 
 		// On the racy file, replace it with a symlink before reading
-		if string(f.PathBorrowed()) == racePath {
+		if string(f.AbsPathBorrowed()) == racePath {
 			// Remove file and create symlink with same name
 			err := os.Remove(racePath)
 			if err != nil {
@@ -2478,7 +2478,7 @@ func Test_Process_Processes_All_Files_When_Pipelined_Workers(t *testing.T) {
 	}
 
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, _ *fileproc.Worker) (*string, error) {
-		path := string(f.PathBorrowed())
+		path := string(f.AbsPathBorrowed())
 
 		return &path, nil
 	}, fileproc.WithWorkers(4), fileproc.WithSmallFileThreshold(1))
@@ -2517,7 +2517,7 @@ func Test_Process_Processes_All_Files_When_Pipelined_With_Multiple_ReadDirBatche
 	)
 
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, _ *fileproc.Worker) (*string, error) {
-		path := string(f.PathBorrowed())
+		path := string(f.AbsPathBorrowed())
 
 		mu.Lock()
 
@@ -2583,7 +2583,7 @@ func Test_Process_Reads_Content_When_Pipelined(t *testing.T) {
 			return nil, fmt.Errorf("read: %w", err)
 		}
 
-		path := string(f.PathBorrowed())
+		path := string(f.AbsPathBorrowed())
 
 		mu.Lock()
 
@@ -2671,7 +2671,7 @@ func Test_Process_Continues_When_OnError_Drops_Errors(t *testing.T) {
 	)
 
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, _ *fileproc.Worker) (*string, error) {
-		path := string(f.PathBorrowed())
+		path := string(f.AbsPathBorrowed())
 		if path == filepath.Join(root, "bad.txt") {
 			return nil, errors.New("fail")
 		}
@@ -2788,7 +2788,7 @@ func Test_Process_Skips_NonRegular_When_Fifo_Present(t *testing.T) {
 	}
 
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, _ *fileproc.Worker) (*string, error) {
-		path := string(f.PathBorrowed())
+		path := string(f.AbsPathBorrowed())
 
 		return &path, nil
 	}, fileproc.WithWorkers(1))
@@ -2866,7 +2866,7 @@ func Test_Process_Reports_IOError_When_Subdir_Not_Readable_Recursive(t *testing.
 	})
 
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, _ *fileproc.Worker) (*string, error) {
-		path := string(f.PathBorrowed())
+		path := string(f.AbsPathBorrowed())
 
 		return &path, nil
 	}, fileproc.WithRecursive(), fileproc.WithWorkers(1), fileproc.WithSmallFileThreshold(1000))
@@ -3227,7 +3227,7 @@ func Test_Process_Counts_Errors_Correctly_When_Mixed_IO_And_Process_Errors_Concu
 	}
 
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, _ *fileproc.Worker) (*string, error) {
-		path := string(f.PathBorrowed())
+		path := string(f.AbsPathBorrowed())
 		if path == filepath.Join(root, testBadFile) {
 			return nil, sentinel
 		}
@@ -3390,7 +3390,7 @@ func Test_Process_Drops_IOErrors_When_OnError_Returns_False(t *testing.T) {
 	}
 
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, _ *fileproc.Worker) (*string, error) {
-		path := string(f.PathBorrowed())
+		path := string(f.AbsPathBorrowed())
 
 		return &path, nil
 	}, opts...)
@@ -3462,7 +3462,7 @@ func Test_Process_Processes_All_Files_When_Using_Recursive_Concurrent_Workers(t 
 	)
 
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, _ *fileproc.Worker) (*string, error) {
-		path := string(f.PathBorrowed())
+		path := string(f.AbsPathBorrowed())
 
 		mu.Lock()
 
@@ -3519,7 +3519,7 @@ func Test_Process_Traverses_Subdirs_When_Using_Recursive_LargeDir_Pipelined(t *t
 	}
 
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, _ *fileproc.Worker) (*string, error) {
-		path := string(f.PathBorrowed())
+		path := string(f.AbsPathBorrowed())
 
 		return &path, nil
 	}, opts...)
