@@ -84,6 +84,31 @@ import (
 	"sync"
 )
 
+// ProcessFunc is called for each file.
+//
+// ProcessFunc may be called concurrently and must be safe for concurrent use.
+//
+// f provides access to [File] metadata and content. f.RelPathBorrowed() is
+// ephemeral and only valid during the callback.
+//
+// w provides reusable temporary buffer space. w.Buf() returns a slice that is
+// only valid during the callback.
+//
+// Callbacks are not invoked for directories, symlinks, or other non-regular
+// files.
+//
+// Return values:
+//   - (*T, nil): emit the result
+//   - (nil, nil): skip this file silently
+//   - (_, error): skip and report the error as a [ProcessError]
+//
+// Whether [ProcessError]s (and [IOError]s) are included in the returned error
+// slice depends on [WithOnError]. If OnError is nil, all errors are collected.
+//
+// Panics are not recovered by this package. Callbacks must not panic; if you
+// need to guard against panics, recover inside the callback.
+type ProcessFunc[T any] func(f *File, w *Worker) (*T, error)
+
 // Process processes files in a directory.
 //
 // By default, only the specified directory is processed. Use [WithRecursive]
@@ -327,25 +352,7 @@ func (p processor[T]) processDir(
 		})
 	}
 
-	var (
-		results []*T
-		errs    []error
-	)
-
-	if len(batch.names) > 0 {
-		// If we have a read dir error, but already have some files, process
-		// them before returning the errors
-		results, errs = p.processFilesSequential(ctx, dir, nil, batch.names, notifier)
-	}
-
-	if readDirErr != nil && !errors.Is(readDirErr, io.EOF) {
-		ioErr := &IOError{Path: ".", Op: "readdir", Err: readDirErr}
-		if notifier.ioErr(ioErr) {
-			errs = append(errs, ioErr)
-		}
-	}
-
-	return results, errs
+	return p.processDirNames(ctx, dirPath, nil, batch.names, readDirErr, notifier, nil)
 }
 
 // processTree processes a directory tree with parallel workers.
@@ -674,14 +681,8 @@ func (p processor[T]) processTree(
 				// The job's byte slices must outlive this callback.
 				//
 				reportSubdir := func(name []byte) {
-					relCap := len(name)
-					if len(job.rel) > 0 {
-						relCap = len(job.rel) + 1 + len(name)
-					}
-
-					rel := make([]byte, 0, relCap)
-					rel = appendPathPrefix(rel, job.rel)
-					rel = append(rel, name...)
+					rel := make([]byte, 0, relPathCap(job.rel, name))
+					rel = buildRelPath(rel, job.rel, name)
 
 					select {
 					case events <- treeEvent{job: dirJob{abs: joinPathWithNul(job.abs, name), rel: rel}}:
@@ -752,44 +753,14 @@ func (p processor[T]) processTree(
 				}
 
 				// Small/medium directory: process files directly.
-				if ctx.Err() == nil && len(bufs.batch.names) > 0 {
-					dh, openErr, ok := openDirForFiles(job.abs, job.rel, notifier)
-					if !ok {
-						if openErr != nil {
-							workerErrs[workerID] = append(workerErrs[workerID], openErr)
-						}
-
-						if readErr != nil {
-							readErrIO := &IOError{Path: dirRel, Op: "readdir", Err: readErr}
-							if notifier.ioErr(readErrIO) {
-								workerErrs[workerID] = append(workerErrs[workerID], readErrIO)
-							}
-						}
-
-						return
-					}
-
-					cfg := fileProcCfg[T]{
-						fn:       p.fn,
-						notifier: notifier,
-					}
-
-					dirResults, dirErrs := processFilesWithHandle(ctx, dh, job.rel, bufs.batch.names, cfg, bufs)
-					_ = dh.closeHandle()
-
+				if ctx.Err() == nil {
+					dirResults, dirErrs := p.processDirNames(ctx, job.abs, job.rel, bufs.batch.names, readErr, notifier, bufs)
 					if len(dirErrs) > 0 {
 						workerErrs[workerID] = append(workerErrs[workerID], dirErrs...)
 					}
 
 					if len(dirResults) > 0 {
 						workerResults[workerID] = append(workerResults[workerID], dirResults...)
-					}
-				}
-
-				if readErr != nil {
-					readErrIO := &IOError{Path: dirRel, Op: "readdir", Err: readErr}
-					if notifier.ioErr(readErrIO) {
-						workerErrs[workerID] = append(workerErrs[workerID], readErrIO)
 					}
 				}
 			}()

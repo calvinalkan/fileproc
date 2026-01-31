@@ -19,7 +19,7 @@ package fileproc
 //	│    │                                                                    │
 //	│    ├─► processDir()                  ← Allocates: dirBuf, batch         │
 //	│    │     │                                                              │
-//	│    │     ├─► processFilesSequential() ← Allocates: pathBuf              │
+//	│    │     ├─► processDirNames() ← Allocates: pathBuf             │
 //	│    │     │     └─► processFilesInto()   ← Uses passed buffers           │
 //	│    │     │                                                              │
 //	│    │     └─► processDirPipelined()   ← Allocates: freeBatches channel   │
@@ -50,14 +50,6 @@ type fileProcOut[T any] struct {
 	errs    *[]error
 }
 
-func relPathString(relPrefix []byte) string {
-	if len(relPrefix) == 0 {
-		return "."
-	}
-
-	return string(relPrefix)
-}
-
 type dirPipelineArgs struct {
 	// One of dirPath or dirPathBytes must be set for openDirFromReaddir.
 	// dirPathBytes is NUL-terminated (tree traversal).
@@ -71,6 +63,9 @@ type dirPipelineArgs struct {
 	reportSubdir  func(name []byte)
 	notifier      *errNotifier
 	dirBuf        []byte
+	// Filled by processDirPipelined before running the pipeline.
+	dirHandle dirHandle
+	dirRel    string
 
 	// workerCount/queueCapacity define pipeline sizing.
 	// If queueCapacity is zero and freeBatches is nil, we compute sizing from workerCount.
@@ -83,34 +78,60 @@ type dirPipelineArgs struct {
 	sharedBufs  *workerBufs
 }
 
-// ============================================================================
-// SEQUENTIAL PROCESSING (small directories)
-// ============================================================================
-
-func (p processor[T]) processFilesSequential(
+// processDirNames handles open+process+readdir-error reporting in one place.
+// If bufs is nil, it allocates per-call worker buffers (non-recursive path).
+// Tree workers pass their owned bufs to avoid per-directory allocations.
+func (p processor[T]) processDirNames(
 	ctx context.Context,
-	dir string,
+	dirPath []byte,
 	relPrefix []byte,
 	names [][]byte,
+	readErr error,
 	notifier *errNotifier,
+	bufs *workerBufs,
 ) ([]*T, []error) {
-	dirPath := pathWithNul(dir)
+	if readErr != nil && errors.Is(readErr, io.EOF) {
+		readErr = nil
+	}
 
-	dh, ioErr, ok := openDirForFiles(dirPath, relPrefix, notifier)
-	if !ok {
-		if ioErr != nil {
+	if len(names) == 0 {
+		if readErr == nil {
+			return nil, nil
+		}
+
+		ioErr := &IOError{Path: relPathString(relPrefix), Op: "readdir", Err: readErr}
+		if notifier.ioErr(ioErr) {
 			return nil, []error{ioErr}
 		}
 
 		return nil, nil
 	}
 
+	dh, openErr, ok := openDirForFiles(dirPath, relPrefix, notifier)
+	if !ok {
+		var errs []error
+		if openErr != nil {
+			errs = append(errs, openErr)
+		}
+
+		if readErr != nil {
+			ioErr := &IOError{Path: relPathString(relPrefix), Op: "readdir", Err: readErr}
+			if notifier.ioErr(ioErr) {
+				errs = append(errs, ioErr)
+			}
+		}
+
+		return nil, errs
+	}
+
 	defer func() { _ = dh.closeHandle() }()
 
-	pathBufCap := len(relPrefix) + pathBufExtra
-	bufs := &workerBufs{
-		pathBuf: make([]byte, 0, pathBufCap),
-		// dataBuf, dataArena, worker.buf start zero-valued, grow as needed.
+	if bufs == nil {
+		pathBufCap := len(relPrefix) + pathBufExtra
+		bufs = &workerBufs{
+			pathBuf: make([]byte, 0, pathBufCap),
+			// dataBuf, dataArena, worker.buf start zero-valued, grow as needed.
+		}
 	}
 
 	cfg := fileProcCfg[T]{
@@ -118,7 +139,17 @@ func (p processor[T]) processFilesSequential(
 		notifier: notifier,
 	}
 
-	return processFilesWithHandle(ctx, dh, relPrefix, names, cfg, bufs)
+	results, errs := processFilesWithHandle(ctx, dh, relPrefix, names, cfg, bufs)
+	if readErr == nil {
+		return results, errs
+	}
+
+	ioErr := &IOError{Path: relPathString(relPrefix), Op: "readdir", Err: readErr}
+	if notifier.ioErr(ioErr) {
+		errs = append(errs, ioErr)
+	}
+
+	return results, errs
 }
 
 func openDirForFiles(dirPath []byte, relPrefix []byte, notifier *errNotifier) (dirHandle, *IOError, bool) {
@@ -220,7 +251,7 @@ func processFilesInto[T any](
 		var relPath []byte
 
 		if len(relPrefix) > 0 {
-			bufs.pathBuf = appendPathBytesPrefix(bufs.pathBuf, relPrefix, name)
+			bufs.pathBuf = buildRelPath(bufs.pathBuf, relPrefix, name)
 			relPath = bufs.pathBuf
 		} else {
 			relPath = name[:nameLen(name)]
@@ -282,27 +313,12 @@ func processFilesInto[T any](
 // PIPELINED PROCESSING (large directories)
 // ============================================================================
 
-// pipelineArgs controls the shared pipeline runner.
+// dirPipelineArgs controls the shared pipeline runner.
 //
 // Invariants:
 //   - sharedBufs is only set when workerCount==1 (tree pipeline).
 //   - initialNames entries include a trailing NUL terminator.
 //   - queueCapacity/freeBatches sizing must be coordinated to avoid leaks.
-type pipelineArgs struct {
-	dirEnumerator readdirHandle
-	dirHandle     dirHandle
-	relPrefix     []byte
-	dirRel        string
-	initialNames  [][]byte
-	suffix        string
-	reportSubdir  func(name []byte)
-	notifier      *errNotifier
-	dirBuf        []byte
-	workerCount   int
-	queueCapacity int
-	freeBatches   chan *nameBatch
-	sharedBufs    *workerBufs
-}
 
 func pipelineSizing(workerCount int) (int, int) {
 	// Bound buffering so high worker counts can't over-allocate batches.
@@ -342,13 +358,18 @@ func (p batchPool) put(batch *nameBatch) {
 	}
 }
 
-func (p processor[T]) runDirPipeline(ctx context.Context, args *pipelineArgs) ([]*T, []error) {
+func (p processor[T]) runDirPipeline(ctx context.Context, args *dirPipelineArgs) ([]*T, []error) {
 	// Shared pipeline runner for large directories.
 	// Producer enumerates entries into batches; workers drain batches.
 	// freeBatches provides bounded batch reuse to avoid allocations.
 	cfg := fileProcCfg[T]{
 		fn:       p.fn,
 		notifier: args.notifier,
+	}
+
+	dirRel := args.dirRel
+	if dirRel == "" {
+		dirRel = relPathString(args.relPrefix)
 	}
 
 	batchCh := make(chan *nameBatch, args.queueCapacity)
@@ -433,7 +454,7 @@ func (p processor[T]) runDirPipeline(ctx context.Context, args *pipelineArgs) ([
 				return
 			}
 
-			ioErr := &IOError{Path: args.dirRel, Op: "readdir", Err: err}
+			ioErr := &IOError{Path: dirRel, Op: "readdir", Err: err}
 			if args.notifier.ioErr(ioErr) {
 				// Producer errors are single-threaded; collect and merge after wait.
 				producerErrs = append(producerErrs, ioErr)
@@ -548,10 +569,7 @@ func (args *dirPipelineArgs) openDirPath() string {
 }
 
 func (p processor[T]) processDirPipelined(ctx context.Context, args *dirPipelineArgs) ([]*T, []error) {
-	dirRel := "."
-	if len(args.relPrefix) > 0 {
-		dirRel = string(args.relPrefix)
-	}
+	dirRel := relPathString(args.relPrefix)
 
 	dh, err := openDirFromReaddir(args.dirEnumerator, args.openDirPath())
 	if err != nil {
@@ -591,21 +609,12 @@ func (p processor[T]) processDirPipelined(ctx context.Context, args *dirPipeline
 		queueCap = max(cap(freeBatches)-workerCount-1, 0)
 	}
 
-	return p.runDirPipeline(ctx, &pipelineArgs{
-		dirEnumerator: args.dirEnumerator,
-		dirHandle:     dh,
-		relPrefix:     args.relPrefix,
-		dirRel:        dirRel,
-		initialNames:  args.initialNames,
-		suffix:        args.suffix,
-		reportSubdir:  args.reportSubdir,
-		notifier:      args.notifier,
-		dirBuf:        args.dirBuf,
-		workerCount:   workerCount,
-		queueCapacity: queueCap,
-		freeBatches:   freeBatches,
-		// sharedBufs is only set by tree traversal where the worker is blocked
-		// on this call and workerCount==1, so reuse is safe.
-		sharedBufs: args.sharedBufs,
-	})
+	pipelineArgs := *args
+	pipelineArgs.dirHandle = dh
+	pipelineArgs.dirRel = dirRel
+	pipelineArgs.workerCount = workerCount
+	pipelineArgs.queueCapacity = queueCap
+	pipelineArgs.freeBatches = freeBatches
+
+	return p.runDirPipeline(ctx, &pipelineArgs)
 }

@@ -302,31 +302,6 @@ func (w *Worker) Buf(size int) []byte {
 	return w.buf[:0]
 }
 
-// ProcessFunc is called for each file.
-//
-// ProcessFunc may be called concurrently and must be safe for concurrent use.
-//
-// f provides access to file metadata and content. f.RelPathBorrowed() is
-// ephemeral and only valid during the callback.
-//
-// w provides reusable temporary buffer space. w.Buf() returns a slice that is
-// only valid during the callback.
-//
-// Callbacks are not invoked for directories, symlinks, or other non-regular
-// files.
-//
-// Return values:
-//   - (*T, nil): emit the result
-//   - (nil, nil): skip this file silently
-//   - (_, error): skip and report the error as a [ProcessError]
-//
-// Whether [ProcessError]s (and [IOError]s) are included in the returned error
-// slice depends on [WithOnError]. If OnError is nil, all errors are collected.
-//
-// Panics are not recovered by this package. Callbacks must not panic; if you
-// need to guard against panics, recover inside the callback.
-type ProcessFunc[T any] func(f *File, w *Worker) (*T, error)
-
 var (
 	errBytesAfterRead     = errors.New("Bytes: cannot call after Read")
 	errBytesAlreadyCalled = errors.New("Bytes: already called")

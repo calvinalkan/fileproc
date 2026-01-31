@@ -6,15 +6,37 @@ import "os"
 // Path helpers
 // ============================================================================
 
-// appendPathBytesPrefix builds a path from prefix and name (which includes NUL terminator).
-// Returns a slice WITHOUT NUL terminator (for display/string conversion).
-func appendPathBytesPrefix(buf []byte, prefix []byte, name []byte) []byte {
+// relPathString returns "." for the relative root directory, and the string form if not.
+func relPathString(relPrefix []byte) string {
+	if len(relPrefix) == 0 {
+		return "."
+	}
+
+	return string(relPrefix)
+}
+
+// relPathCap returns the capacity needed for prefix + name (strip trailing NUL if present).
+func relPathCap(prefix []byte, name []byte) int {
+	nameSize := nameLen(name)
+	if len(prefix) == 0 {
+		return nameSize
+	}
+
+	return len(prefix) + 1 + nameSize
+}
+
+// buildRelPath appends prefix + name into buf and returns the resulting slice.
+// name may include a trailing NUL terminator; the result never includes it.
+func buildRelPath(buf []byte, prefix []byte, name []byte) []byte {
 	buf = buf[:0]
 	buf = appendPathPrefix(buf, prefix)
 
-	buf = append(buf, name[:nameLen(name)]...)
+	nameSize := nameLen(name)
+	if nameSize == 0 {
+		return buf
+	}
 
-	return buf
+	return append(buf, name[:nameSize]...)
 }
 
 // appendPathPrefix appends prefix and a separator (if needed) to buf.
@@ -84,12 +106,16 @@ func joinPathWithNul(base, name []byte) []byte {
 	return result
 }
 
-// nameLen returns the length of the filename EXCLUDING the NUL terminator.
+// nameLen returns the length of the filename excluding a trailing NUL, if present.
 // Use this when calculating buffer sizes or path lengths.
 func nameLen(name []byte) int {
 	if len(name) == 0 {
 		return 0
 	}
 
-	return len(name) - 1
+	if name[len(name)-1] == 0 {
+		return len(name) - 1
+	}
+
+	return len(name)
 }
