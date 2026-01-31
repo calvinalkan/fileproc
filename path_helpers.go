@@ -83,3 +83,13 @@ func joinPathWithNul(base, name []byte) []byte {
 
 	return result
 }
+
+// nameLen returns the length of the filename EXCLUDING the NUL terminator.
+// Use this when calculating buffer sizes or path lengths.
+func nameLen(name []byte) int {
+	if len(name) == 0 {
+		return 0
+	}
+
+	return len(name) - 1
+}

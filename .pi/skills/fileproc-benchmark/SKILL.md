@@ -36,7 +36,7 @@ go run ./cmd/ticketgen --out .data/tickets_nested3_1m --files 1m --layout deep
 ## 2. Quick Start
 
 ```bash
-make bench   # Run regression + compare vs avg of last 5 runs, fail if >1% regression
+make bench   # Run regression + compare avg last 5 vs baseline avg, fail if >2% regression
 ```
 
 ## 3. Process Modes
@@ -57,8 +57,9 @@ Benchmarks support three process modes via `--process`:
 | Compare vs previous run | `cmd/benchreport/benchreport compare` |
 | Compare read results | `cmd/benchreport/benchreport compare --process read` |
 | Compare stat results | `cmd/benchreport/benchreport compare --process stat` |
-| Compare vs baseline | `cmd/benchreport/benchreport compare --against baseline` |
-| Fail if regression >5% | `cmd/benchreport/benchreport compare --against baseline --fail-above 5` |
+| Compare avg last 5 vs prev 5 | `cmd/benchreport/benchreport compare --against avg --n 5` |
+| Compare avg last 5 vs baseline avg | `cmd/benchreport/benchreport compare --against baseline --n 5` |
+| Fail if regression >5% | `cmd/benchreport/benchreport compare --against baseline --n 5 --fail-above 5` |
 | Sweep worker counts | `.pi/skills/fileproc-benchmark/scripts/bench_sweep.sh --case flat_100k` |
 | Sweep with read mode | `.pi/skills/fileproc-benchmark/scripts/bench_sweep.sh --case flat_100k --process read` |
 | Profile CPU/memory | `.pi/skills/fileproc-benchmark/scripts/bench_profile.sh --case flat_100k --cpu --mem` |
@@ -82,11 +83,14 @@ All paths are from project root.
 # Compare stat-mode results vs previous run
 ./cmd/benchreport/benchreport compare --process stat
 
-# Compare latest vs rolling average of last 5 runs
+# Compare avg of last 5 runs vs avg of previous 5 runs
 ./cmd/benchreport/benchreport compare --against avg --n 5
 
+# Compare avg of last 5 runs vs baseline avg
+./cmd/benchreport/benchreport compare --against baseline --n 5
+
 # Fail if >5% regression vs baseline
-./cmd/benchreport/benchreport compare --against baseline --fail-above 5
+./cmd/benchreport/benchreport compare --against baseline --n 5 --fail-above 5
 ```
 
 ## 6. Profiling
@@ -199,9 +203,9 @@ git commit -m "bench: update baseline after reducing allocations"
 
 ```
 --against MODE    prev, avg, baseline (default: prev)
---n N             Runs to average (for avg mode)
+--n N             Runs to average (avg = last N vs prev N; baseline = last N history vs baseline avg)
 --fail-above PCT  Fail if regression exceeds threshold
---focus SIZES     Focus on specific sizes (e.g., 100k,1m)
+--filter SIZES    Filter on specific sizes (e.g., 100k,1m)
 --process NAME    bytes | read | stat (default: bytes)
 --json            Output as JSON
 ```

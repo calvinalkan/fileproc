@@ -112,12 +112,15 @@ func hasSuffix[S byteSeq](name S, suffix string) bool {
 		return true
 	}
 
-	if len(name) < len(suffix) {
+	nameLen := len(name)
+	suffixLen := len(suffix)
+
+	if nameLen < suffixLen {
 		return false
 	}
 
-	start := len(name) - len(suffix)
-	for i := range len(suffix) {
+	start := nameLen - suffixLen
+	for i := range suffixLen {
 		if name[start+i] != suffix[i] {
 			return false
 		}
@@ -179,14 +182,4 @@ func (b *nameBatch) copyName(name []byte) {
 	start := len(b.storage)
 	b.storage = append(b.storage, name...) // name already includes NUL
 	b.names = append(b.names, b.storage[start:len(b.storage)])
-}
-
-// nameLen returns the length of the filename EXCLUDING the NUL terminator.
-// Use this when calculating buffer sizes or path lengths.
-func nameLen(name []byte) int {
-	if len(name) == 0 {
-		return 0
-	}
-
-	return len(name) - 1
 }

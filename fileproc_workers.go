@@ -50,6 +50,14 @@ type fileProcOut[T any] struct {
 	errs    *[]error
 }
 
+func relPathString(relPrefix []byte) string {
+	if len(relPrefix) == 0 {
+		return "."
+	}
+
+	return string(relPrefix)
+}
+
 type dirPipelineArgs struct {
 	// One of dirPath or dirPathBytes must be set for openDirFromReaddir.
 	// dirPathBytes is NUL-terminated (tree traversal).
@@ -88,15 +96,9 @@ func (p processor[T]) processFilesSequential(
 ) ([]*T, []error) {
 	dirPath := pathWithNul(dir)
 
-	dh, err := openDir(dirPath)
-	if err != nil {
-		dirRel := "."
-		if len(relPrefix) > 0 {
-			dirRel = string(relPrefix)
-		}
-
-		ioErr := &IOError{Path: dirRel, Op: "open", Err: err}
-		if notifier.ioErr(ioErr) {
+	dh, ioErr, ok := openDirForFiles(dirPath, relPrefix, notifier)
+	if !ok {
+		if ioErr != nil {
 			return nil, []error{ioErr}
 		}
 
@@ -111,17 +113,41 @@ func (p processor[T]) processFilesSequential(
 		// dataBuf, dataArena, worker.buf start zero-valued, grow as needed.
 	}
 
-	results := make([]*T, 0, len(names))
-
-	var allErrs []error
-
 	cfg := fileProcCfg[T]{
 		fn:       p.fn,
 		notifier: notifier,
 	}
 
-	out := fileProcOut[T]{results: &results, errs: &allErrs}
+	return processFilesWithHandle(ctx, dh, relPrefix, names, cfg, bufs)
+}
 
+func openDirForFiles(dirPath []byte, relPrefix []byte, notifier *errNotifier) (dirHandle, *IOError, bool) {
+	dh, err := openDir(dirPath)
+	if err == nil {
+		return dh, nil, true
+	}
+
+	ioErr := &IOError{Path: relPathString(relPrefix), Op: "open", Err: err}
+	if notifier.ioErr(ioErr) {
+		return dirHandle{}, ioErr, false
+	}
+
+	return dirHandle{}, nil, false
+}
+
+func processFilesWithHandle[T any](
+	ctx context.Context,
+	dh dirHandle,
+	relPrefix []byte,
+	names [][]byte,
+	cfg fileProcCfg[T],
+	bufs *workerBufs,
+) ([]*T, []error) {
+	results := make([]*T, 0, len(names))
+
+	var allErrs []error
+
+	out := fileProcOut[T]{results: &results, errs: &allErrs}
 	processFilesInto(ctx, dh, relPrefix, names, cfg, bufs, out)
 
 	return results, allErrs

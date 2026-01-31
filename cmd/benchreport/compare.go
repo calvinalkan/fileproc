@@ -16,9 +16,9 @@ Usage:
 
 Options:
   --against MODE    Comparison mode: prev, avg, baseline (default: prev)
-  --n N             For avg mode, number of runs to average (default: 5)
+  --n N             Runs to average for avg/baseline (avg = last N vs prev N; baseline = last N history vs baseline avg)
   --fail-above PCT  Exit with error if regression exceeds PCT percent
-  --focus SIZES     Comma-separated sizes to focus on (e.g. 100k,1m)
+  --filter SIZES    Comma-separated sizes to filter on (e.g. 100k,1m)
   --process NAME    Benchmark process to compare: bytes | read | stat | all (default: all)
   --history FILE    Path to history.jsonl (default: .benchmarks/history.jsonl)
   --baseline FILE   Baseline file (default: .benchmarks/baseline.jsonl)
@@ -26,22 +26,25 @@ Options:
   -h, --help        Show this help
 
 Comparison Modes:
-  prev      Compare latest vs previous run in history
-  avg       Compare latest vs rolling average of last N runs
-  baseline  Compare latest vs baseline file (avg if multiple entries)
+  prev      Compare latest vs previous run in history (ignores -n)
+  avg       Compare avg of last N runs vs avg of previous N runs
+  baseline  Compare avg of last N runs vs baseline average
 
 Examples:
   # Compare latest vs previous run
   benchreport compare
 
-  # Compare latest vs average of last 5 runs
+  # Compare avg of last 5 runs vs avg of previous 5 runs
   benchreport compare --against avg --n 5
 
-  # Compare vs baseline, fail if any regression > 5%
-  benchreport compare --against baseline --fail-above 5
+  # Compare avg of last 5 runs vs baseline average
+  benchreport compare --against baseline --n 5
+
+  # Compare latest run vs baseline average
+  benchreport compare --against baseline --n 1
 
   # Focus only on large datasets
-  benchreport compare --focus 100k,1m
+  benchreport compare --filter 100k,1m
 `
 
 type CompareResult struct {
@@ -55,6 +58,7 @@ type CompareResult struct {
 }
 
 type Comparison struct {
+	LatestDesc      string          `json:"latest_desc,omitempty"`
 	LatestTS        string          `json:"latest_ts"`
 	LatestRev       string          `json:"latest_rev"`
 	TargetDesc      string          `json:"target_desc"`
@@ -68,9 +72,9 @@ func runCompare(args []string) error {
 	fs.Usage = func() { fmt.Fprint(os.Stderr, compareUsage) }
 
 	against := fs.String("against", "prev", "comparison mode: prev, avg, baseline")
-	n := fs.Int("n", 5, "number of runs for avg mode")
+	n := fs.Int("n", 5, "number of runs to average (avg/baseline)")
 	failAbove := fs.Float64("fail-above", 0, "fail if regression exceeds this percent")
-	focus := fs.String("focus", "", "comma-separated sizes to focus on")
+	filter := fs.String("filter", "", "comma-separated sizes to filter on")
 	process := fs.String("process", "all", "benchmark process to compare: bytes | read | stat | all")
 	historyFile := fs.String("history", ".benchmarks/history.jsonl", "path to history file")
 	baselineFile := fs.String("baseline", ".benchmarks/baseline.jsonl", "path to baseline file")
@@ -81,10 +85,10 @@ func runCompare(args []string) error {
 		return fmt.Errorf("parse flags: %w", parseErr)
 	}
 
-	return compare(*against, *n, *failAbove, *focus, *process, *historyFile, *baselineFile, *outputJSON)
+	return compare(*against, *n, *failAbove, *filter, *process, *historyFile, *baselineFile, *outputJSON)
 }
 
-func compare(against string, n int, failAbove float64, focus, process, historyFile, baselineFile string, outputJSON bool) error {
+func compare(against string, n int, failAbove float64, filter, process, historyFile, baselineFile string, outputJSON bool) error {
 	// Load history
 	history, err := loadHistory(historyFile)
 	if err != nil {
@@ -95,7 +99,12 @@ func compare(against string, n int, failAbove float64, focus, process, historyFi
 		return fmt.Errorf("no runs in history file: %s (run bench_regress.sh first)", historyFile)
 	}
 
+	if n < 1 {
+		return fmt.Errorf("n must be >= 1 (got %d)", n)
+	}
+
 	latest := history[len(history)-1]
+	latestDesc := "latest run"
 
 	// Get target based on mode
 	var (
@@ -113,15 +122,19 @@ func compare(against string, n int, failAbove float64, focus, process, historyFi
 		targetDesc = "previous run"
 
 	case "avg":
-		if len(history) < 2 {
-			return fmt.Errorf("need at least 2 runs in history for avg comparison (have %d)", len(history))
+		if len(history) < n*2 {
+			return fmt.Errorf("need at least %d runs in history for avg comparison (have %d)", n*2, len(history))
 		}
-		// Average last N runs excluding latest
-		available := history[:len(history)-1]
-		count := min(n, len(available))
-		toAvg := available[len(available)-count:]
+
+		latest = averageSummaries(history[len(history)-n:])
+		latestDesc = fmt.Sprintf("avg of last %d runs", n)
+		latest.Timestamp = ""
+
+		available := history[:len(history)-n]
+		toAvg := available[len(available)-n:]
 		target = averageSummaries(toAvg)
-		targetDesc = fmt.Sprintf("avg of last %d runs", count)
+		targetDesc = fmt.Sprintf("avg of previous %d runs", n)
+		target.Timestamp = ""
 
 	case "baseline":
 		baselines, loadErr := loadBaselineSet(baselineFile)
@@ -133,29 +146,34 @@ func compare(against string, n int, failAbove float64, focus, process, historyFi
 			return fmt.Errorf("baseline file is empty: %s", baselineFile)
 		}
 
-		if len(baselines) == 1 {
-			target = baselines[0]
-			targetDesc = "baseline"
-		} else {
-			target = averageSummaries(baselines)
-			targetDesc = fmt.Sprintf("baseline avg (%d runs)", len(baselines))
+		latestCount := min(n, len(history))
+		if latestCount > 1 {
+			latest = averageSummaries(history[len(history)-latestCount:])
+			latestDesc = fmt.Sprintf("avg of last %d runs", latestCount)
+			latest.Timestamp = ""
 		}
+
+		target = averageSummaries(baselines)
+		targetDesc = fmt.Sprintf("baseline avg (%d runs)", len(baselines))
+		target.Timestamp = ""
 
 	default:
 		return fmt.Errorf("unknown mode: %s (expected: prev, avg, baseline)", against)
 	}
 
-	// Build focus filter
-	var focusSizes []string
-	if focus != "" {
-		focusSizes = strings.Split(focus, ",")
+	// Build size filter
+	var filterSizes []string
+	if filter != "" {
+		filterSizes = strings.Split(filter, ",")
 	}
 
 	// Compare
-	comparison, err := buildComparison(&latest, &target, targetDesc, focusSizes, process)
+	comparison, err := buildComparison(&latest, &target, targetDesc, filterSizes, process)
 	if err != nil {
 		return err
 	}
+
+	comparison.LatestDesc = latestDesc
 
 	if outputJSON {
 		enc := json.NewEncoder(os.Stdout)
@@ -271,7 +289,7 @@ func averageSummaries(summaries []Summary) Summary {
 	}
 }
 
-func buildComparison(latest, target *Summary, targetDesc string, focusSizes []string, process string) (Comparison, error) {
+func buildComparison(latest, target *Summary, targetDesc string, filterSizes []string, process string) (Comparison, error) {
 	// Get benchmarks for the requested process, optionally filtered
 	var (
 		benchmarks      []CompareResult
@@ -290,11 +308,11 @@ func buildComparison(latest, target *Summary, targetDesc string, focusSizes []st
 	orderedBenches := benchmarksForProcess(process)
 
 	for _, name := range orderedBenches {
-		// Apply focus filter
-		if len(focusSizes) > 0 {
+		// Apply size filter
+		if len(filterSizes) > 0 {
 			matched := false
 
-			for _, size := range focusSizes {
+			for _, size := range filterSizes {
 				if strings.Contains(name, "_"+size+"_") {
 					matched = true
 
@@ -337,16 +355,11 @@ func buildComparison(latest, target *Summary, targetDesc string, focusSizes []st
 		latestRev = latestRev[:8]
 	}
 
-	targetTS := target.Timestamp
-	if targetTS == "" {
-		targetTS = targetDesc
-	}
-
 	return Comparison{
 		LatestTS:        latest.Timestamp,
 		LatestRev:       latestRev,
 		TargetDesc:      targetDesc,
-		TargetTS:        targetTS,
+		TargetTS:        target.Timestamp,
 		Benchmarks:      benchmarks,
 		WorstRegression: worstRegression,
 	}, nil
@@ -384,22 +397,35 @@ func printComparison(c *Comparison) error {
 	fmt.Println("Benchmark Comparison")
 	fmt.Println("============================================================")
 	fmt.Println()
-	fmt.Printf("Latest:  %s (%s)\n", c.LatestTS, c.LatestRev)
-	fmt.Printf("Target:  %s (%s)\n", c.TargetTS, c.TargetDesc)
+
+	if c.LatestTS == "" {
+		if c.LatestDesc != "" {
+			fmt.Printf("Latest:  %s\n", c.LatestDesc)
+		} else {
+			fmt.Print("Latest:  avg\n")
+		}
+	} else {
+		fmt.Printf("Latest:  %s (%s)\n", c.LatestTS, c.LatestRev)
+	}
+
+	if c.TargetTS == "" {
+		fmt.Printf("Target:  %s\n", c.TargetDesc)
+	} else {
+		fmt.Printf("Target:  %s (%s)\n", c.TargetTS, c.TargetDesc)
+	}
+
 	fmt.Println()
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprint(w, "Benchmark\tMean(ms)\tBase(ms)\tΔ%\tfiles/s\tΔ%\n")
-	fmt.Fprint(w, "--------\t--------\t--------\t--\t-------\t--\n")
+	fmt.Fprint(w, "Benchmark\tMean(ms)\tBase(ms)\tΔ%\n")
+	fmt.Fprint(w, "--------\t--------\t--------\t--\n")
 
 	for _, benchmark := range c.Benchmarks {
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n",
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n",
 			benchmark.Name,
 			fmtMs(benchmark.LatestMeanMs),
 			fmtMs(benchmark.TargetMeanMs),
-			fmtPct(benchmark.MeanChangePct),
-			fmtFPS(benchmark.LatestFPS),
-			fmtPct(benchmark.FPSChangePct),
+			fmtPctColored(benchmark.MeanChangePct),
 		)
 	}
 
@@ -409,7 +435,8 @@ func printComparison(c *Comparison) error {
 	}
 
 	fmt.Println()
-	fmt.Println("Legend: Δ% = change from target (positive = slower/regression)")
+	fmt.Println("Legend: Δ% = mean change from target (positive = slower/regression)")
+	fmt.Println("        red >= +1% regression, green <= -1% improvement")
 
 	return nil
 }
@@ -430,26 +457,26 @@ func fmtMs(v float64) string {
 	return fmt.Sprintf("%.2f", v)
 }
 
-func fmtFPS(v float64) string {
-	if v == 0 {
-		return "N/A"
-	}
-
-	if v >= 1_000_000 {
-		return fmt.Sprintf("%.1fM", v/1_000_000)
-	}
-
-	if v >= 1_000 {
-		return fmt.Sprintf("%.1fK", v/1_000)
-	}
-
-	return fmt.Sprintf("%.0f", v)
-}
-
 func fmtPct(v float64) string {
 	if v > 0 {
 		return fmt.Sprintf("+%.1f%%", v)
 	}
 
 	return fmt.Sprintf("%.1f%%", v)
+}
+
+func fmtPctColored(v float64) string {
+	s := fmtPct(v)
+	if _, ok := os.LookupEnv("NO_COLOR"); ok {
+		return s
+	}
+
+	switch {
+	case v >= 1.0:
+		return "\x1b[31m" + s + "\x1b[0m"
+	case v <= -1.0:
+		return "\x1b[32m" + s + "\x1b[0m"
+	default:
+		return s
+	}
 }

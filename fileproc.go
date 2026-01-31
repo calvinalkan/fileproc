@@ -89,7 +89,7 @@ import (
 // By default, only the specified directory is processed. Use [WithRecursive]
 // to process subdirectories recursively.
 //
-// f.RelPath() returns the path relative to the root. Results are unordered
+// f.RelPathBorrowed() returns the path relative to the root. Results are unordered
 // when processed with multiple workers.
 //
 // To stop processing on error, use [WithOnError] with a cancelable context:
@@ -753,11 +753,10 @@ func (p processor[T]) processTree(
 
 				// Small/medium directory: process files directly.
 				if ctx.Err() == nil && len(bufs.batch.names) > 0 {
-					dh, err := openDir(job.abs)
-					if err != nil {
-						ioErr := &IOError{Path: dirRel, Op: "open", Err: err}
-						if notifier.ioErr(ioErr) {
-							workerErrs[workerID] = append(workerErrs[workerID], ioErr)
+					dh, openErr, ok := openDirForFiles(job.abs, job.rel, notifier)
+					if !ok {
+						if openErr != nil {
+							workerErrs[workerID] = append(workerErrs[workerID], openErr)
 						}
 
 						if readErr != nil {
@@ -770,18 +769,12 @@ func (p processor[T]) processTree(
 						return
 					}
 
-					var (
-						dirResults []*T
-						dirErrs    []error
-					)
-
 					cfg := fileProcCfg[T]{
 						fn:       p.fn,
 						notifier: notifier,
 					}
-					out := fileProcOut[T]{results: &dirResults, errs: &dirErrs}
 
-					processFilesInto(ctx, dh, job.rel, bufs.batch.names, cfg, bufs, out)
+					dirResults, dirErrs := processFilesWithHandle(ctx, dh, job.rel, bufs.batch.names, cfg, bufs)
 					_ = dh.closeHandle()
 
 					if len(dirErrs) > 0 {
