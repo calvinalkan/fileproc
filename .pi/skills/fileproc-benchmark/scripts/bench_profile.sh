@@ -34,6 +34,8 @@ MEM=false
 STRACE=false
 REPEAT=10
 WORKERS=""
+SCAN_WORKERS=""
+CHUNK_SIZE=""
 GC=""
 PROCESS="bytes"
 OUT_DIR=".benchmarks/profiles"
@@ -54,6 +56,8 @@ Options:
   --strace          Syscall analysis (summary + full trace to file)
   --repeat N        Iterations in single process (default: $REPEAT)
   --workers N       Worker count override
+  --scan-workers N  Scan worker count override
+  --chunk-size N    Entries per chunk override
   --gc N            GC percent override
   --process NAME    Process mode: bytes | read | stat (default: $PROCESS)
   --out DIR         Output directory (default: $OUT_DIR)
@@ -82,6 +86,8 @@ while [[ $# -gt 0 ]]; do
     --strace) STRACE=true; shift ;;
     --repeat) REPEAT="$2"; shift 2 ;;
     --workers) WORKERS="$2"; shift 2 ;;
+    --scan-workers) SCAN_WORKERS="$2"; shift 2 ;;
+    --chunk-size) CHUNK_SIZE="$2"; shift 2 ;;
     --gc) GC="$2"; shift 2 ;;
     --process) PROCESS="$2"; shift 2 ;;
     --out) OUT_DIR="$2"; shift 2 ;;
@@ -169,6 +175,14 @@ if [[ -n "$WORKERS" ]]; then
   CMD+=(-workers "$WORKERS")
 fi
 
+if [[ -n "$SCAN_WORKERS" ]]; then
+  CMD+=(-scan-workers "$SCAN_WORKERS")
+fi
+
+if [[ -n "$CHUNK_SIZE" ]]; then
+  CMD+=(-chunk-size "$CHUNK_SIZE")
+fi
+
 if [[ -n "$GC" ]]; then
   CMD+=(-gc "$GC")
 fi
@@ -187,6 +201,8 @@ echo
 echo "  dir:      $DIR"
 echo "  repeat:   $REPEAT"
 echo "  workers:  ${WORKERS:-<default>}"
+echo "  scan_workers: ${SCAN_WORKERS:-<default>}"
+echo "  chunk_size: ${CHUNK_SIZE:-<default>}"
 echo "  gc:       ${GC:-<default>}"
 echo "  process:  ${PROCESS}"
 echo

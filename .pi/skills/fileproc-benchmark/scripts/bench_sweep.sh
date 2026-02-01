@@ -31,6 +31,9 @@ WORKERS_DEFAULT="1,2,4,8,16"
 WORKERS_DEFAULT_LARGE="6,8,12,16,24"  # 100k/1m: skip low worker counts
 CASES=""
 PROCESS="bytes"
+SCAN_WORKERS=""
+CHUNK_SIZE=""
+CHUNK_SIZES=""  # comma-separated list for sweeping
 VERBOSE=false
 
 # Small datasets are very fast, so run more iterations for stability.
@@ -52,6 +55,9 @@ usage() {
   echo "  --runs N          Base runs per combination (default: $RUNS)"
   echo "  --warmup N        Warmup runs (default: $WARMUP)"
   echo "  --process NAME    Process mode: bytes | read | stat (default: $PROCESS)"
+  echo "  --scan-workers N  Scan worker count override"
+  echo "  --chunk-size N    Entries per chunk override (single value)"
+  echo "  --chunk-sizes L   Comma-separated chunk sizes to sweep (e.g., 32,64,128,256)"
   echo "  --verbose, -v     Show full hyperfine output (default: summary table only)"
   echo ""
   echo "Defaults per case size:"
@@ -70,6 +76,8 @@ usage() {
   echo "  ./bench_sweep.sh --case flat_100k,flat_1m"
   echo "  ./bench_sweep.sh --case flat_100k -v       # verbose/interactive"
   echo "  ./bench_sweep.sh --workers 4,8,16,24,32    # override for all"
+  echo "  ./bench_sweep.sh --case flat_100k --chunk-sizes 32,64,128,256"
+  echo "  ./bench_sweep.sh --case flat_100k --workers 8,16 --chunk-sizes 64,128  # 2D grid"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -79,6 +87,9 @@ while [[ $# -gt 0 ]]; do
     --runs) RUNS="$2"; shift 2 ;;
     --warmup) WARMUP="$2"; shift 2 ;;
     --process) PROCESS="$2"; shift 2 ;;
+    --scan-workers) SCAN_WORKERS="$2"; shift 2 ;;
+    --chunk-size) CHUNK_SIZE="$2"; shift 2 ;;
+    --chunk-sizes) CHUNK_SIZES="$2"; shift 2 ;;
     --verbose|-v) VERBOSE=true; shift 1 ;;
     -h|--help)
       usage
@@ -152,6 +163,12 @@ echo "runs_base:   $RUNS (warmup: $WARMUP)"
 echo "runs_1k:     $((RUNS * MULT_1K)) (base × $MULT_1K)"
 echo "runs_5k:     $((RUNS * MULT_5K)) (base × $MULT_5K)"
 echo "process:     $PROCESS"
+echo "scan_workers: ${SCAN_WORKERS:-<default>}"
+if [[ -n "$CHUNK_SIZES" ]]; then
+  echo "chunk_sizes: $CHUNK_SIZES (sweep)"
+else
+  echo "chunk_size:  ${CHUNK_SIZE:-<default>}"
+fi
 echo
 
 echo "building..."
@@ -218,12 +235,32 @@ for c in "${CASE_ARR[@]}"; do
     tmp_json=$(mktemp)
     hf_args+=(--style none --export-json "$tmp_json")
   fi
+
+  extra_flags=""
+  if [[ -n "$SCAN_WORKERS" ]]; then
+    extra_flags+=" -scan-workers $SCAN_WORKERS"
+  fi
   
-  # Add each worker count with a short name
+  # Build command list: workers × chunk-sizes grid (or just workers if no chunk-sizes)
   IFS=',' read -ra WORKER_ARR <<< "$case_workers"
-  for w in "${WORKER_ARR[@]}"; do
-    hf_args+=(-n "w=$w" "$BIN -dir $dir $tree_flag -process $PROCESS -workers $w")
-  done
+  
+  if [[ -n "$CHUNK_SIZES" ]]; then
+    # 2D sweep: workers × chunk-sizes
+    IFS=',' read -ra CHUNK_ARR <<< "$CHUNK_SIZES"
+    for w in "${WORKER_ARR[@]}"; do
+      for cs in "${CHUNK_ARR[@]}"; do
+        hf_args+=(-n "w=$w,c=$cs" "$BIN -dir $dir $tree_flag -process $PROCESS -workers $w -chunk-size $cs$extra_flags")
+      done
+    done
+  else
+    # 1D sweep: workers only
+    if [[ -n "$CHUNK_SIZE" ]]; then
+      extra_flags+=" -chunk-size $CHUNK_SIZE"
+    fi
+    for w in "${WORKER_ARR[@]}"; do
+      hf_args+=(-n "w=$w" "$BIN -dir $dir $tree_flag -process $PROCESS -workers $w$extra_flags")
+    done
+  fi
   
   hyperfine "${hf_args[@]}"
   

@@ -59,10 +59,11 @@ NESTED_1M=".data/tickets_nested1_1m"
 # If these are left empty, the corresponding flag is not passed.
 #
 # You can also override via environment variables, e.g.
-#   WORKERS=16 ./bench_regress.sh
-WORKERS="${WORKERS-}" # -workers
-READ="${READ-}"       # -read
-GC="${GC-}"           # -gc
+#   WORKERS=16 SCAN_WORKERS=4 CHUNK_SIZE=256 ./bench_regress.sh
+WORKERS="${WORKERS-}"           # -workers
+SCAN_WORKERS="${SCAN_WORKERS-}" # -scan-workers
+CHUNK_SIZE="${CHUNK_SIZE-}"     # -chunk-size
+GC="${GC-}"                     # -gc
 
 # Optional: pin GOMAXPROCS for the benchmark process.
 GOMAXPROCS=""
@@ -81,6 +82,8 @@ while [[ $# -gt 0 ]]; do
     --tag) TAG="$2"; shift 2 ;;
 
     --workers) WORKERS="$2"; shift 2 ;;
+    --scan-workers) SCAN_WORKERS="$2"; shift 2 ;;
+    --chunk-size) CHUNK_SIZE="$2"; shift 2 ;;
 
     --flat-1k) FLAT_1K="$2"; shift 2 ;;
     --nested-1k) NESTED_1K="$2"; shift 2 ;;
@@ -91,8 +94,6 @@ while [[ $# -gt 0 ]]; do
     --nested-100k) NESTED_100K="$2"; shift 2 ;;
     --flat-1m) FLAT_1M="$2"; shift 2 ;;
     --nested-1m) NESTED_1M="$2"; shift 2 ;;
-
-    --read) READ="$2"; shift 2 ;;
 
     --gc) GC="$2"; shift 2 ;;
     --gomaxprocs) GOMAXPROCS="$2"; shift 2 ;;
@@ -270,8 +271,9 @@ META="$RUN_DIR/meta.txt"
   fi
 
   echo "workers: ${WORKERS:-<default>}"
+  echo "scan_workers: ${SCAN_WORKERS:-<default>}"
+  echo "chunk_size: ${CHUNK_SIZE:-<default>}"
   echo "gc: ${GC:-<default>}"
-  echo "read: ${READ:-<default>}"
   echo "gomaxprocs: ${GOMAXPROCS:-<default>}"
   echo "cpu_set: ${CPU_SET:-<none>}"
   echo "power_source: $POWER_SOURCE"
@@ -327,11 +329,14 @@ cmd_for() {
   # -expect is auto-derived from .data/meta.json
   local cmd="${PREFIX}$BIN -dir $dir $tree_flag -process {process}"
 
-  if [[ -n "$READ" ]]; then
-    cmd+=" -read $READ"
-  fi
   if [[ -n "$WORKERS" ]]; then
     cmd+=" -workers $WORKERS"
+  fi
+  if [[ -n "$SCAN_WORKERS" ]]; then
+    cmd+=" -scan-workers $SCAN_WORKERS"
+  fi
+  if [[ -n "$CHUNK_SIZE" ]]; then
+    cmd+=" -chunk-size $CHUNK_SIZE"
   fi
   if [[ -n "$GC" ]]; then
     cmd+=" -gc $GC"
@@ -365,7 +370,8 @@ echo "runs_base:  $RUNS (warmup: $WARMUP)"
 echo "runs_1k:    $((RUNS*SMALL_RUN_MULT_1K)) (base*$SMALL_RUN_MULT_1K)"
 echo "runs_5k:    $((RUNS*SMALL_RUN_MULT_5K)) (base*$SMALL_RUN_MULT_5K)"
 echo "workers:    ${WORKERS:-<default>}"
-echo "read:       ${READ:-<default>}"
+echo "scan_workers: ${SCAN_WORKERS:-<default>}"
+echo "chunk_size: ${CHUNK_SIZE:-<default>}"
 echo "gc:         ${GC:-<default>}"
 echo "gomaxprocs: ${GOMAXPROCS:-<default>}"
 echo "cpu_set:    ${CPU_SET:-<none>}"

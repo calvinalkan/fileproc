@@ -37,7 +37,7 @@ func openat(dirfd int, name nulTermName) (int, error) {
 		fd, _, errno := syscall.Syscall6(
 			syscall.SYS_OPENAT,
 			uintptr(dirfd),
-			uintptr(unsafe.Pointer(name.Ptr())),
+			uintptr(unsafe.Pointer(name.ptr())),
 			uintptr(unix.O_RDONLY|unix.O_CLOEXEC|unix.O_LARGEFILE|unix.O_NOFOLLOW|unix.O_NONBLOCK),
 			0, 0, 0,
 		)
@@ -54,7 +54,7 @@ func openat(dirfd int, name nulTermName) (int, error) {
 }
 
 // ============================================================================
-// Directory enumeration (readDirBatchImpl)
+// Directory enumeration (readDirBatch)
 // ============================================================================
 
 // linux_dirent64 offsets (from linux/dirent.h):
@@ -78,14 +78,14 @@ const (
 
 var errInvalidDirent = errors.New("invalid dirent")
 
-// readDirBatchImpl reads directory entries using getdents64 (syscall.ReadDirent)
+// readDirBatch reads directory entries using getdents64 (syscall.ReadDirent)
 // and appends matching file names to batch.
 //
 // Names appended to batch include a trailing NUL terminator.
 //
 // If reportSubdir is non-nil, it is called for each discovered subdirectory
 // entry name (without a trailing NUL).
-func readDirBatchImpl(dh dirHandle, dirPath nulTermPath, buf []byte, suffix string, batch *pathArena, reportSubdir reportSubdirFunc) error {
+func readDirBatch(dh dirHandle, dirPath nulTermPath, buf []byte, suffix string, batch *pathArena, reportSubdir reportSubdirFunc) error {
 	// Retry ReadDirent on EINTR without an upper bound, matching Go's stdlib.
 	var (
 		read int
@@ -148,7 +148,7 @@ func readDirBatchImpl(dh dirHandle, dirPath nulTermPath, buf []byte, suffix stri
 			}
 
 		case syscall.DT_REG:
-			if name.HasSuffix(suffix) {
+			if name.hasSuffix(suffix) {
 				batch.addPath(dirPath, name)
 			}
 
@@ -171,7 +171,7 @@ func readDirBatchImpl(dh dirHandle, dirPath nulTermPath, buf []byte, suffix stri
 				break
 			}
 
-			if info.isReg && name.HasSuffix(suffix) {
+			if info.isReg && name.hasSuffix(suffix) {
 				batch.addPath(dirPath, name)
 			}
 
@@ -192,8 +192,11 @@ func isDotEntry(name []byte) bool {
 }
 
 type classifyResult struct {
-	isDir     bool
-	isReg     bool
+	// isDir reports whether the entry is a directory.
+	isDir bool
+	// isReg reports whether the entry is a regular file.
+	isReg bool
+	// isSymlink reports whether the entry is a symlink.
 	isSymlink bool
 }
 
@@ -207,7 +210,7 @@ func classifyAt(dirfd int, name nulTermName) (classifyResult, error) {
 		_, _, errno := syscall.Syscall6(
 			syscall.SYS_NEWFSTATAT,
 			uintptr(dirfd),
-			uintptr(unsafe.Pointer(name.Ptr())),
+			uintptr(unsafe.Pointer(name.ptr())),
 			uintptr(unsafe.Pointer(&st)),
 			unix.AT_SYMLINK_NOFOLLOW,
 			0, 0,
@@ -243,11 +246,13 @@ func classifyAt(dirfd int, name nulTermName) (classifyResult, error) {
 
 // dirHandle wraps an open directory for getdents64/openat-based operations.
 type dirHandle struct {
+	// fd is the raw directory file descriptor for getdents/openat.
 	fd int
 }
 
 // fileHandle wraps an open file descriptor.
 type fileHandle struct {
+	// fd is the raw file descriptor used for reads.
 	fd int
 }
 
@@ -258,7 +263,7 @@ func openDir(path nulTermPath) (dirHandle, error) {
 		fd, _, errno := syscall.Syscall6(
 			syscall.SYS_OPENAT,
 			atFDCWD,
-			uintptr(unsafe.Pointer(path.Ptr())),
+			uintptr(unsafe.Pointer(path.ptr())),
 			uintptr(unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_LARGEFILE|unix.O_NOFOLLOW),
 			0, 0, 0,
 		)
@@ -274,7 +279,7 @@ func openDir(path nulTermPath) (dirHandle, error) {
 	}
 }
 
-func (d dirHandle) close() error {
+func (d dirHandle) closeHandle() error {
 	if d.fd < 0 {
 		return nil
 	}
@@ -310,7 +315,7 @@ func (d dirHandle) statFile(name nulTermName) (Stat, statKind, error) {
 		_, _, errno := syscall.Syscall6(
 			syscall.SYS_NEWFSTATAT,
 			uintptr(d.fd),
-			uintptr(unsafe.Pointer(name.Ptr())),
+			uintptr(unsafe.Pointer(name.ptr())),
 			uintptr(unsafe.Pointer(&st)),
 			unix.AT_SYMLINK_NOFOLLOW,
 			0, 0,
@@ -400,7 +405,7 @@ func (f fileHandle) readInto(buf []byte) (int, bool, error) {
 	return bytesRead, false, nil
 }
 
-func (f fileHandle) close() error {
+func (f fileHandle) closeHandle() error {
 	if f.fd < 0 {
 		return nil
 	}

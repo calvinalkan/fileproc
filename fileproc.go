@@ -1,7 +1,71 @@
-// Package fileproc provides fast parallel file processing.
+// Package fileproc provides ultra-fast parallel file processing with highly-efficient memory management.
+// and platform-specific IO fast paths where available (for example Linux
+// getdents/openat) while falling back to portable APIs on other platforms.
+package fileproc
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"path/filepath"
+	"strings"
+)
+
+// Process scans a directory and invokes fn for each matching regular file.
 //
-// It uses platform-specific fast paths where available (for example Linux
-// getdents/openat) and falls back to portable APIs on other platforms.
+// By default, only the specified directory is scanned. Use [WithRecursive] to
+// include subdirectories. Use [WithSuffix] to filter by name suffix (empty
+// suffix matches all files).
+//
+// Callbacks may run concurrently; results are unordered.
+//
+// Each callback receives:
+//   - *File: lazy access to path, metadata, and content (AbsPathBorrowed, Stat,
+//     Bytes, Read, Fd).
+//   - *FileWorker: reusable low-level memory helpers (Buf, RetainBytes).
+//
+// File and FileWorker data are only valid during the callback; do not retain
+// *File or any borrowed buffers/slices beyond the callback.
+//
+// # Errors:
+//   - Directory open/readdir errors are reported as [IOError].
+//   - Errors returned by fn are wrapped as [ProcessError].
+//   - File/dir close errors are ignored.
+//   - Other errors may be returned for invalid inputs (e.g., NUL in path/suffix).
+//   - If an entry changes type between scan and use (e.g., becomes a directory
+//     or symlink), [File] methods return a skip error that Process silently
+//     ignores when returned by the callback.
+//
+// To stop processing on error, use [WithOnError] with a cancelable context:
+//
+//	ctx, cancel := context.WithCancelCause(ctx)
+//	results, errs := Process(ctx, path, fn, WithOnError(func(err error, _, _ int) bool {
+//	        cancel(err)
+//	        return true
+//	}))
+//
+// # Cancellation
+//
+// Cancellation stops processing as soon as possible. Process returns whatever
+// results and errors were already produced/collected before cancellation was
+// observed. It does not guarantee that all already-discovered files are
+// processed before returning.
+//
+// Cancellation itself is NOT ADDED to the error slice; check ctx.Err() (or
+// context.Cause(ctx) when using [context.WithCancelCause]).
+//
+// # Results and errors
+//
+// Process returns ([]*T, []error). Results are the non-nil values returned by fn.
+// Errors include [IOError] and [ProcessError], collected per [WithOnError], plus
+// any immediate validation errors returned before processing starts. If OnError
+// is nil, all errors are collected.
+//
+// # Concurrent Modifications
+//
+// Files or directories created during processing (e.g., by a callback) may or
+// may not be seen depending on timing. Do not rely on newly created entries
+// being processed in the same call.
 //
 // # Symlinks
 //
@@ -25,71 +89,82 @@
 //
 // # Usage
 //
-// [Process] provides a *File for lazy access to stat/content and a *Worker for
-// reusable temporary buffers. Use [File.Bytes] for full-content reads or
+// [Process] provides a *File for lazy access to stat/content and a *FileWorker
+// for reusable temporary buffers. Use [File.Bytes] for full-content reads or
 // [File.Read] for streaming access.
 //
-// # Architecture
+// Example:
 //
-// The package provides a single entry point: [Process]. It supports
-// single-directory and recursive tree processing based on [WithRecursive].
+//	type Result struct {
+//	    Size   int64
+//	    Prefix []byte
+//	}
 //
-// Processing uses a tiered strategy based on file count:
+//	opt := fileproc.WithSizeHint(4 * 1024)
 //
-//	Files ≤ SmallFileThreshold:  Sequential file processing (no pipeline workers)
-//	Files > SmallFileThreshold:  Streaming pipeline (overlapped readdir + processing)
+//	results, errs := fileproc.Process(ctx, dir, func(f *fileproc.File, w *fileproc.FileWorker) (*Result, error) {
+//	    st, err := f.Stat()
+//	    if err != nil {
+//	        return nil, err
+//	    }
 //
-// # Memory Architecture
+//	    data, err := f.Bytes(opt)
+//	    if err != nil {
+//	        return nil, err
+//	    }
 //
-// Buffers are allocated at orchestration points and passed down to workers.
-// The implementation is designed to avoid per-file allocations in steady state;
-// allocations may still occur when internal slices/arenas grow.
+//	    prefix := data
+//	    if len(prefix) > 16 {
+//	        prefix = prefix[:16]
+//	    }
 //
-//	┌─────────────────────────────────────────────────────────────────────────┐
-//	│ ALLOCATION POINTS                                                       │
-//	├─────────────────────────────────────────────────────────────────────────┤
-//	│                                                                         │
-//	│ Non-recursive (processDir):                                             │
-//	│   - dirBuf: 32KB directory-entry buffer on Linux (also used as a        │
-//	│     sizing heuristic on other platforms)                                │
-//	│   - pathArena: for collecting paths                                     │
-//	│   - Pipeline workers allocate their own buffers for:                    │
-//	│       • Worker.Buf (callback scratch space)                             │
-//	│       • File.Bytes arena (when used)                                   │
-//	│                                                                         │
-//	│ Recursive (processTree):                                               │
-//	│   - per-worker results/errors slices (merged at the end)                │
-//	│   - Per tree worker (allocated once, reused for ALL directories):       │
-//	│       • dirBuf  (32KB): Linux dirent buffer / sizing heuristic          │
-//	│       • Worker.Buf (callback scratch space)                             │
-//	│       • pathArena: collecting paths                                     │
-//	│       • freeArenas: channel-as-freelist for pipeline arenas           │
-//	│                                                                         │
-//	└─────────────────────────────────────────────────────────────────────────┘
-//
-// Rough memory budget for recursive mode with 8 workers (excluding results
-// and other overhead), assuming defaults:
-//
-//	8 × (32KB dirBuf + 6×(≈64KB arena storage + ≈75KB name headers)) ≈ 5–6MB
-package fileproc
+//	    return &Result{
+//	        Size:   st.Size,
+//	        Prefix: w.RetainBytes(prefix),
+//	    }, nil
+//	}, fileproc.WithRecursive(), fileproc.WithSuffix(".log"))
+func Process[T any](ctx context.Context, path string, fn ProcessFunc[T], opts ...Option) ([]*T, []error) {
+	if ctx.Err() != nil {
+		return nil, nil
+	}
 
-import (
-	"context"
-	"errors"
-	"fmt"
-	"path/filepath"
-	"strings"
-)
+	if strings.IndexByte(path, 0) >= 0 {
+		return nil, []error{&IOError{Path: ".", Op: "open", Err: errors.New("contains NUL byte")}}
+	}
+
+	path, err := filepath.Abs(path)
+	if err != nil {
+		// fails only os.getwd()
+		return nil, []error{fmt.Errorf("file absolute path: %w", err)}
+	}
+
+	cfg := applyOptions(opts)
+	if strings.IndexByte(cfg.Suffix, 0) >= 0 {
+		return nil, []error{fmt.Errorf("invalid suffix: %w", errors.New("contains NUL byte"))}
+	}
+
+	proc := processor[T]{
+		fn:          fn,
+		fileWorkers: cfg.Workers,
+		scanWorkers: cfg.ScanWorkers,
+		chunkSize:   cfg.ChunkSize,
+		suffix:      cfg.Suffix,
+		recursive:   cfg.Recursive,
+		errNotify:   newErrNotifier(cfg.OnError),
+	}
+	rootPath := newNulTermPath(path)
+
+	return proc.process(ctx, rootPath)
+}
 
 // ProcessFunc is called for each file.
 //
 // ProcessFunc may be called concurrently and must be safe for concurrent use.
 //
-// f provides access to [File] metadata and content. f.AbsPathBorrowed() is
-// ephemeral and only valid during the callback.
+// f provides access to [File] metadata and content (AbsPathBorrowed, Stat, Bytes,
+// Read, Fd). w provides reusable temporary buffers (Buf, RetainBytes).
 //
-// w provides reusable temporary buffer space. w.Buf() returns a slice that is
-// only valid during the callback.
+// Both f and w are only valid during the callback.
 //
 // Callbacks are not invoked for directories, symlinks, or other non-regular
 // files.
@@ -97,89 +172,75 @@ import (
 // Return values:
 //   - (*T, nil): emit the result
 //   - (nil, nil): skip this file silently
-//   - (_, error): skip and report the error as a [ProcessError]
+//   - (_, error): skip and report the error as a [ProcessError], except for
+//     internal skip errors returned by [File] methods (for example when a file
+//     becomes a directory or symlink), which are silently ignored
 //
 // Whether [ProcessError]s (and [IOError]s) are included in the returned error
 // slice depends on [WithOnError]. If OnError is nil, all errors are collected.
 //
 // Panics are not recovered by this package. Callbacks must not panic; if you
 // need to guard against panics, recover inside the callback.
-type ProcessFunc[T any] func(f *File, w *Worker) (*T, error)
+type ProcessFunc[T any] func(f *File, w *FileWorker) (*T, error)
 
-// Process processes files in a directory.
+// FileWorker provides low-level memory helpers to avoid per-callback
+// allocations and reduce GC pressure.
 //
-// By default, only the specified directory is processed. Use [WithRecursive]
-// to process subdirectories recursively.
+// Use Buf for scratch space that can be reused across callbacks, and
+// RetainBytes to copy data into a per-worker arena when you need it to live
+// beyond the current callback.
+type FileWorker struct {
+	// buf is the reusable scratch buffer for the current callback.
+	buf []byte
+	// retain is the append-only arena for retained data.
+	retain []byte
+}
+
+// Buf returns a reusable buffer with at least the requested capacity.
 //
-// f.AbsPathBorrowed() returns the absolute path. Results are unordered
-// when processed with multiple workers.
+// Returns a slice with len=0 and cap>=size, ready for append:
 //
-// To stop processing on error, use [WithOnError] with a cancelable context:
+//	buf := w.Buf(4096)
+//	buf = append(buf, data...)  // no alloc if fits in capacity
 //
-//	ctx, cancel := context.WithCancelCause(ctx)
-//	results, errs := Process(ctx, path, fn, WithOnError(func(err error, _, _ int) bool {
-//	        cancel(err)
-//	        return true
-//	}))
+// For use as a fixed-size read target, expand to full capacity:
 //
-// Returns collected results and any errors ([IOError] or [ProcessError]).
+//	buf := w.Buf(4096)
+//	buf = buf[:cap(buf)]
+//	n, _ := io.ReadFull(r, buf)
 //
-// # Cancellation
+// The capacity grows to accommodate the largest request seen across all
+// files processed by this worker, then stabilizes.
 //
-// Cancellation stops processing as soon as possible. Process returns whatever
-// results and errors were already produced/collected before cancellation was
-// observed. It does not guarantee that all already-discovered files are
-// processed before returning.
-//
-// Cancellation itself is not added to the error slice; check ctx.Err() (or
-// context.Cause(ctx) when using [context.WithCancelCause]).
-//
-// # Concurrent Modifications
-//
-// Files or directories created during processing (e.g., by a callback) may or
-// may not be seen depending on timing. Do not rely on newly created entries
-// being processed in the same call.
-func Process[T any](ctx context.Context, path string, fn ProcessFunc[T], opts ...Option) ([]*T, []error) {
-	if strings.IndexByte(path, 0) >= 0 {
-		return nil, []error{&IOError{Path: ".", Op: "open", Err: errContainsNUL}}
+// The returned slice is only valid during the current callback.
+func (w *FileWorker) Buf(size int) []byte {
+	if cap(w.buf) < size {
+		w.buf = make([]byte, 0, size)
 	}
 
-	path, err := filepath.Abs(path)
-	if err != nil {
-		// fails only os.getwd()
-		return nil, []error{fmt.Errorf("file absolute path: %w", errContainsNUL)}
+	return w.buf[:0]
+}
+
+// RetainBytes copies b into a per-worker arena and returns a stable subslice.
+//
+// The returned slice remains valid until [Process] returns; if the caller keeps
+// the slice, it remains valid until GC (standard Go slice lifetime).
+func (w *FileWorker) RetainBytes(b []byte) []byte {
+	if len(b) == 0 {
+		return []byte{}
 	}
 
-	if ctx.Err() != nil {
-		return nil, nil
-	}
+	start := len(w.retain)
+	w.retain = append(w.retain, b...)
 
-	cfg := applyOptions(opts)
-	if strings.IndexByte(cfg.Suffix, 0) >= 0 {
-		return nil, []error{fmt.Errorf("invalid suffix: %w", errContainsNUL)}
-	}
-
-	proc := processor[T]{
-		fn:                 fn,
-		workers:            cfg.Workers,
-		suffix:             cfg.Suffix,
-		smallFileThreshold: cfg.SmallFileThreshold,
-		errNotify:          newErrNotifier(cfg.OnError),
-	}
-	rootPath := newNulTermPath(path)
-
-	if cfg.Recursive {
-		return proc.processRecursive(ctx, rootPath)
-	}
-
-	return proc.processSingleDir(ctx, rootPath)
+	return w.retain[start:]
 }
 
 // IOError is returned when a file system operation fails.
 type IOError struct {
 	// Path is the absolute path for the failed operation.
 	Path string
-	// Op is the operation that failed: "open", "read", "close", or "readdir".
+	// Op is the operation that failed, i.e. "open", "read", or "readdir".
 	Op string
 	// Err is the underlying error.
 	Err error
@@ -193,7 +254,7 @@ func (e *IOError) Unwrap() error {
 	return e.Err
 }
 
-// ProcessError is returned when a user callback ([ProcessFunc]) returns an error.
+// ProcessError is returned when [ProcessFunc] returns an error.
 type ProcessError struct {
 	// Path is the absolute file path (owned, not borrowed).
 	Path string
@@ -208,5 +269,3 @@ func (e *ProcessError) Error() string {
 func (e *ProcessError) Unwrap() error {
 	return e.Err
 }
-
-var errContainsNUL = errors.New("contains NUL byte")

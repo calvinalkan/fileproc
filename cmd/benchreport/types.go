@@ -30,10 +30,12 @@ type EnvInfo struct {
 }
 
 type ConfigInfo struct {
-	Workers string `json:"workers"`
-	GC      string `json:"gc"`
-	Read    string `json:"read"`
-	CPUSet  string `json:"cpu_set"`
+	Workers     string `json:"workers"`
+	ScanWorkers string `json:"scan_workers"`
+	ChunkSize   string `json:"chunk_size"`
+	GC          string `json:"gc"`
+	Read        string `json:"read"`
+	CPUSet      string `json:"cpu_set"`
 }
 
 type BenchResult struct {

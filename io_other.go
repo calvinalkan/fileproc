@@ -28,16 +28,16 @@ import (
 const readDirBatchSize = 4096
 
 // ============================================================================
-// Directory enumeration (readDirBatchImpl)
+// Directory enumeration (readDirBatch)
 // ============================================================================
 
-// readDirBatchImpl enumerates directory entries using (*os.File).ReadDir.
+// readDirBatch enumerates directory entries using (*os.File).ReadDir.
 //
 // Names appended to batch include their trailing NUL terminator.
 //
 // If reportSubdir is non-nil, it is called for each discovered subdirectory
 // entry name (without a trailing NUL).
-func readDirBatchImpl(dh dirHandle, dirPath nulTermPath, _ []byte, suffix string, batch *pathArena, reportSubdir reportSubdirFunc) error {
+func readDirBatch(dh dirHandle, dirPath nulTermPath, _ []byte, suffix string, batch *pathArena, reportSubdir reportSubdirFunc) error {
 	entries, err := dh.f.ReadDir(readDirBatchSize)
 	for _, e := range entries {
 		// Use Type() instead of IsDir() to avoid following symlinks.
@@ -65,7 +65,7 @@ func readDirBatchImpl(dh dirHandle, dirPath nulTermPath, _ []byte, suffix string
 		// When Type() is unknown, lstat to avoid following symlinks and to
 		// reliably detect directories and regular files.
 		if typ&fs.ModeType == 0 {
-			if reportSubdir == nil && !name.HasSuffix(suffix) {
+			if reportSubdir == nil && !name.hasSuffix(suffix) {
 				continue
 			}
 
@@ -85,7 +85,7 @@ func readDirBatchImpl(dh dirHandle, dirPath nulTermPath, _ []byte, suffix string
 				continue
 			}
 
-			if info.Mode().IsRegular() && name.HasSuffix(suffix) {
+			if info.Mode().IsRegular() && name.hasSuffix(suffix) {
 				batch.addPath(dirPath, name)
 			}
 
@@ -97,7 +97,7 @@ func readDirBatchImpl(dh dirHandle, dirPath nulTermPath, _ []byte, suffix string
 			continue
 		}
 
-		if !name.HasSuffix(suffix) {
+		if !name.hasSuffix(suffix) {
 			continue
 		}
 
@@ -119,12 +119,15 @@ func readDirBatchImpl(dh dirHandle, dirPath nulTermPath, _ []byte, suffix string
 
 // dirHandle wraps an open directory for ReadDir and full-path operations.
 type dirHandle struct {
-	f    *os.File
+	// f is the open directory handle used for ReadDir.
+	f *os.File
+	// path is the absolute directory path for filepath.Join.
 	path string
 }
 
 // fileHandle wraps an open file.
 type fileHandle struct {
+	// f is the open file handle for reads.
 	f *os.File
 }
 
@@ -152,7 +155,7 @@ func openDir(path nulTermPath) (dirHandle, error) {
 	return dirHandle{f: f, path: p}, nil
 }
 
-func (d dirHandle) close() error {
+func (d dirHandle) closeHandle() error {
 	if d.f == nil {
 		return nil
 	}
@@ -172,7 +175,8 @@ func (d dirHandle) openFile(name nulTermName) (fileHandle, error) {
 		return fileHandle{}, os.ErrNotExist
 	}
 
-	fullPath := filepath.Join(d.path, name.String())
+	nameLen := name.lenWithoutNul()
+	fullPath := filepath.Join(d.path, string(name[:nameLen]))
 
 	f, err := os.Open(fullPath)
 	if err != nil {
@@ -187,7 +191,8 @@ func (d dirHandle) statFile(name nulTermName) (Stat, statKind, error) {
 		return Stat{}, statKindOther, os.ErrNotExist
 	}
 
-	fullPath := filepath.Join(d.path, name.String())
+	nameLen := name.lenWithoutNul()
+	fullPath := filepath.Join(d.path, string(name[:nameLen]))
 
 	info, err := os.Lstat(fullPath)
 	if err != nil {
@@ -249,7 +254,7 @@ func (f fileHandle) Read(buf []byte) (int, error) {
 	return n, fmt.Errorf("read: %w", err)
 }
 
-func (f fileHandle) close() error {
+func (f fileHandle) closeHandle() error {
 	if f.f == nil {
 		return nil
 	}

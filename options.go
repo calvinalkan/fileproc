@@ -6,10 +6,25 @@ import "runtime"
 // Options are applied in order.
 type Option func(*options)
 
-// WithWorkers sets the worker count for concurrent processing.
-func WithWorkers(n int) Option {
+// WithFileWorkers sets the file worker count for concurrent processing.
+//
+// File workers execute user callbacks for file chunks. Higher values can
+// increase throughput if there are enough work units and I/O headroom, but
+// also increase contention and memory usage. Values <= 0 use defaults.
+func WithFileWorkers(n int) Option {
 	return func(o *options) {
 		o.Workers = n
+	}
+}
+
+// WithScanWorkers sets the worker count for directory scanning.
+//
+// Scan workers read directory entries and emit fixed-size chunks. Higher
+// values increase discovery rate but can increase open dir handles and
+// memory pressure. Values <= 0 use defaults.
+func WithScanWorkers(n int) Option {
+	return func(o *options) {
+		o.ScanWorkers = n
 	}
 }
 
@@ -22,24 +37,28 @@ func WithSuffix(suffix string) Option {
 }
 
 // WithRecursive enables recursive processing.
+//
+// When disabled, discovered subdirectories are ignored.
 func WithRecursive() Option {
 	return func(o *options) {
 		o.Recursive = true
 	}
 }
 
-// WithSmallFileThreshold sets the file-count cutoff below which sequential
-// processing is used instead of pipelined workers.
-func WithSmallFileThreshold(n int) Option {
+// WithChunkSize sets the number of entries (files) per work unit.
+//
+// Smaller sizes increase parallelism but add scheduling overhead. Larger
+// sizes reduce overhead but can leave workers idle for small directories.
+func WithChunkSize(n int) Option {
 	return func(o *options) {
-		o.SmallFileThreshold = n
+		o.ChunkSize = n
 	}
 }
 
 // WithOnError registers an error handler for [IOError] and [ProcessError].
 //
 // ioErrs and procErrs are cumulative counts including the current error.
-// The handler may be called concurrently from multiple goroutines.
+// The handler is serialized across goroutines.
 //
 // Return value controls error collection:
 //   - true:  collect the error in the returned []error slice
@@ -66,13 +85,21 @@ func WithOnError(fn func(err error, ioErrs, procErrs int) bool) Option {
 }
 
 type options struct {
-	Workers            int
-	Suffix             string
-	Recursive          bool
-	SmallFileThreshold int
-	OnError            func(err error, ioErrs, procErrs int) (collect bool)
+	// Workers is the file worker count.
+	Workers int
+	// ScanWorkers is the directory scanning worker count.
+	ScanWorkers int
+	// ChunkSize is the number of entries per work unit.
+	ChunkSize int
+	// Suffix filters files by name suffix.
+	Suffix string
+	// Recursive enables recursive traversal.
+	Recursive bool
+	// OnError handles IO and callback errors.
+	OnError func(err error, ioErrs, procErrs int) (collect bool)
 }
 
+// applyOptions merges option values and applies defaults.
 func applyOptions(opts []Option) options {
 	cfg := options{}
 
@@ -80,10 +107,6 @@ func applyOptions(opts []Option) options {
 		if opt != nil {
 			opt(&cfg)
 		}
-	}
-
-	if cfg.SmallFileThreshold <= 0 {
-		cfg.SmallFileThreshold = defaultSmallFileThreshold
 	}
 
 	if cfg.Recursive {
@@ -98,9 +121,22 @@ func applyOptions(opts []Option) options {
 		cfg.Workers = maxWorkers
 	}
 
+	if cfg.ScanWorkers <= 0 {
+		cfg.ScanWorkers = defaultScanWorkers(cfg.Workers)
+	}
+
+	if cfg.ScanWorkers > maxWorkers {
+		cfg.ScanWorkers = maxWorkers
+	}
+
+	if cfg.ChunkSize <= 0 {
+		cfg.ChunkSize = defaultChunkSize
+	}
+
 	return cfg
 }
 
+// defaultWorkers returns the default file worker count.
 func defaultWorkers() int {
 	w := max((runtime.GOMAXPROCS(0)*2)/3, 4)
 
@@ -116,4 +152,9 @@ func defaultWorkers() int {
 // Formula: NumCPU/2, clamped to [4, 16].
 func defaultRecursiveWorkers() int {
 	return min(max(runtime.NumCPU()/2, 4), 16)
+}
+
+// defaultScanWorkers returns the default scan worker count.
+func defaultScanWorkers(workers int) int {
+	return max(1, min(4, workers/2))
 }
