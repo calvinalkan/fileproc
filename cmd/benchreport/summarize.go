@@ -160,10 +160,12 @@ func summarize(runDir, historyFile string, maxHistory int, noHistory bool) error
 			EnergyPerfPref: meta["energy_perf_pref"],
 		},
 		Config: ConfigInfo{
-			Workers: meta["workers"],
-			GC:      meta["gc"],
-			Read:    meta["read"],
-			CPUSet:  meta["cpu_set"],
+			Workers:     meta["workers"],
+			ScanWorkers: meta["scan_workers"],
+			ChunkSize:   meta["chunk_size"],
+			GC:          meta["gc"],
+			Read:        meta["read"],
+			CPUSet:      meta["cpu_set"],
 		},
 		Results: results,
 	}

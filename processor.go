@@ -3,935 +3,573 @@ package fileproc
 // processor.go contains the directory processing pipeline and worker orchestration
 // used by [Process].
 //
-// This file has no build tags - it works on all platforms by calling into
-// platform-specific I/O functions (openDir, openFile, etc.).
+// Model: decoupled scan (discovery) and file processing. Directory reads use
+// large buffers for syscall efficiency; work units are fixed-size chunks of
+// entries, independent of readdir batch size.
 //
-// # Memory Architecture
+// # How It Works
 //
-// This package uses a "allocate at orchestration points, pass down to workers"
-// pattern to minimize allocations in the hot path (per-file processing).
+// This pipeline has three roles: a coordinator goroutine, scan workers, and
+// file workers.
 //
-//	┌─────────────────────────────────────────────────────────────────────────┐
-//	│ ALLOCATION HIERARCHY                                                    │
-//	├─────────────────────────────────────────────────────────────────────────┤
-//	│                                                                         │
-//	│  Process()                      ← Entry point                           │
-//	│    │                                                                    │
-//	│    ├─► processDir()                  ← Allocates: dirBuf, pathArena     │
-//	│    │     │                                                              │
-//	│    │     ├─► processDirNames() ← Allocates: worker bufs         │
-//	│    │     │     └─► processFilesInto()   ← Uses passed buffers           │
-//	│    │     │                                                              │
-//	│    │     └─► runDirPipeline()       ← Allocates: freeArenas channel   │
-//	│    │           ├─► producer            ← Uses passed dirBuf             │
-//	│    │           └─► workers             ← Each allocates per-worker bufs │
-//	│    │                                                                    │
-//	│    └─► processTree()                 ← Allocates: per-worker bufs slices│
-//	│          │                                                              │
-//	│          └─► [N tree workers]        ← Each allocates ALL buffers once  │
-//	│                └─► processFilesInto()  ← Uses worker's buffers          │
-//	│                                                                         │
-//	└─────────────────────────────────────────────────────────────────────────┘
+// 1) Coordinator goroutine: owns the directory queue and is the only sender on
+//    scanQueue. It receives scanEvents (subdir discovered / dir done), tracks
+//    pending work, and decides when scanning is complete.
+// 2) Scan workers: open a directory, readDirBatch into a pathArena, split the
+//    entries into fixed-size chunks, enqueue those chunks on fileJobs, and
+//    report subdirectories via scanEvents (if recursive).
+// 3) File workers: drain fileJobs, process each chunk sequentially, and call
+//    the user callback with reusable buffers.
+//
+// dirLease keeps a directory handle open while any chunks for that directory
+// are in flight. arena.pending counts outstanding chunks plus the scan worker's
+// dispatch reference; the arena returns to the pool only after all refs drop.
+//
+// Backpressure:
+//   - fileJobs is bounded to cap in-flight arenas and memory.
+//   - scanQueue is unbuffered so the coordinator controls scheduling.
+//   - arenaPool is bounded to cap retained arena memory.
+//
+// Cancellation:
+//   - coordinator stops dispatching and closes scanQueue
+//   - scan workers exit, fileJobs closes, file workers drain and release
+//
+// # Dataflow (single directory or recursive)
+//
+//   scanEvents (subdir/done) ────────────────┐
+//                                           v
+//   [Coordinator] ── dirJobs ──> scanQueue ──> [Scan workers]
+//        ^                                      │
+//        │                                      │ readDirBatch
+//        │                                      v
+//        │                             pathArena + dirLease
+//        │                                      │ chunkSize
+//        │                                      v
+//        └─────────── scanEvents <── subdirs ── fileJobs ──> [File workers] ──> ProcessFunc
 
 import (
 	"context"
 	"errors"
 	"io"
-	"os"
 	"sync"
+	"sync/atomic"
 )
 
-// processor owns per-call configuration and orchestration state.
+// processor keeps per-call config so orchestration stays allocation-free.
 type processor[T any] struct {
-	// fn is the user callback invoked per file.
+	// fn is the user callback; kept on the processor to avoid per-call captures.
 	fn ProcessFunc[T]
-	// workers is the file-processing worker count (pipeline + tree).
-	workers int
-	// suffix filters files by name suffix.
+	// fileWorkers bounds callback concurrency to avoid oversubscribing I/O/CPU.
+	fileWorkers int
+	// scanWorkers allows discovery to run ahead without flooding the system.
+	scanWorkers int
+	// chunkSize controls parallelism granularity independent of readdir size.
+	chunkSize int
+	// suffix filters before enqueueing to avoid wasted work.
 	suffix string
-	// smallFileThreshold switches between sequential and pipelined processing when a directory contains >= this many files.
-	smallFileThreshold int
-	// errNotify routes IO and callback errors to WithOnError, if any.
+	// recursive skips subdir enqueue when false to keep discovery cheap.
+	recursive bool
+	// errNotify serializes error reporting for deterministic counts.
 	errNotify *errNotifier
 }
 
 type reportSubdirFunc func(nulTermName)
 
-// dirScan bundles the inputs needed to enumerate a single directory.
-type dirScan struct {
-	// path is a NUL-terminated absolute dir path for syscalls and error messages.
+type dirJob struct {
+	// path stays NUL-terminated to avoid per-job string allocations.
 	path nulTermPath
-	// handle is the open directory handle used for readDirBatch/openat.
+}
+
+type scanEvent struct {
+	// path carries newly discovered subdirs without creating a second channel.
+	path nulTermPath
+	// done lets the coordinator track pending work accurately.
+	done bool
+}
+
+type fileChunk struct {
+	// arena owns the backing storage so entries survive past readdir.
+	arena *pathArena
+	// start/end avoid copying slices per chunk.
+	start int
+	end   int
+	// lease keeps openat-safe handles alive while chunks are processed.
+	lease *dirLease
+}
+
+// dirLease keeps a directory handle alive while file chunks are processed.
+type dirLease struct {
+	// dh stays open so openat/statat can use names without full paths.
+	dh dirHandle
+	// base is used for error messages and AbsPathBorrowed.
+	base nulTermPath
+	// refs prevents premature close while chunks are in flight.
+	refs atomic.Int32
+}
+
+func (l *dirLease) dec() {
+	if l.refs.Add(-1) == 0 {
+		_ = l.dh.closeHandle()
+	}
+}
+
+// workerBufs is per-worker to eliminate per-file allocations in hot paths.
+type workerBufs struct {
+	// fileBytesBuf reuses a single read buffer to avoid per-file allocs.
+	fileBytesBuf []byte
+
+	// pathScratch avoids per-callback path allocations when needed.
+	pathScratch []byte
+
+	// file is reused to avoid per-file heap allocations.
+	file File
+
+	// worker is reused to preserve scratch/retain arenas across files.
+	worker FileWorker
+}
+
+type dirScan struct {
+	// path stays NUL-terminated to feed syscalls without allocs.
+	path nulTermPath
+	// handle stays open for openat/statat during processing.
 	handle dirHandle
-	// dirEntryBuf is the directory-entry scratch buffer (Linux getdents).
+	// dirEntryBuf is reused to avoid per-read allocations on Linux.
 	dirEntryBuf []byte
-	// reportSubdir is optional; when set, it receives discovered subdirectories.
+	// reportSubdir is optional to skip recursion overhead in non-recursive mode.
 	reportSubdir reportSubdirFunc
 }
 
-// workerBufs holds pre-allocated buffers that a worker reuses across all
-// files and directories it processes. Passed by pointer to avoid copying
-// and to allow growable fields (pathArena) to expand.
-//
-// Lifetime: created once per worker goroutine, lives until worker exits.
-type workerBufs struct {
-	// dirEntryBuf holds raw directory-entry bytes on Linux (getdents64/ReadDirent
-	// parsing). On other platforms directory reading uses os.File.ReadDir and
-	// dirEntryBuf is not used by readdir itself (its capacity is still used as a
-	// sizing heuristic for batching).
-	// Sized at 32KB - large enough to read many entries per syscall,
-	// small enough to stay in L1 cache.
-	// Reused: reset for each directory.
-	dirEntryBuf []byte
-
-	// pathsArena collects pathsArena read from a directory (arena-style storage).
-	// Reused: reset for each directory, internal capacity preserved.
-	// See pathsArena comments for the arena allocation pattern.
-	pathsArena pathArena
-
-	// fileBytesBuf is temporary buffer for File.Bytes() read syscall.
-	// Sized to st.Size+1, grows to max file size seen. Reused across files.
-	fileBytesBuf []byte
-
-	// fileBytesArena is append-only storage for File.Bytes() results.
-	// Each Bytes() result is a subslice. Grows across all files, never
-	// shrinks. GC'd when results are released.
-	fileBytesArena []byte
-
-	// file is a reusable File struct for callbacks.
-	// Reset for each file to avoid per-file heap allocation.
-	file File
-
-	// worker is a reusable Worker struct for callbacks.
-	worker Worker
-}
-
-// Internal constants for buffer sizes and limits.
+// Internal constants keep tuning knobs centralized.
 const (
 	// dirReadBufSize is the size of the directory-entry read buffer.
 	// On Linux it backs getdents64/ReadDirent parsing. On other platforms the
-	// code uses os.File.ReadDir and this size is primarily used as a sizing
-	// heuristic for batching.
+	// backend ignores this buffer and uses os.File.ReadDir instead; the size
+	// is only used as a sizing heuristic for arena storage.
+	//
+	// Benchmarked 32/64/128/256KB on flat and nested dirs (1k–1m files):
+	// 32KB consistently fastest (~7-13% over 128KB), likely due to L1 cache.
 	dirReadBufSize = 32 * 1024
 
-	// maxWorkers caps worker counts (tree traversal workers and non-recursive
-	// pipeline workers) to avoid excessive goroutine/memory overhead.
+	// maxWorkers caps scan/file worker counts to avoid excessive goroutine/memory overhead.
 	maxWorkers = 256
 
 	// defaultReadBufSize is the initial buffer size for file reads and
 	// buffer growth heuristics.
 	defaultReadBufSize = 512
 
-	// defaultSmallFileThreshold is the default for WithSmallFileThreshold.
-	// Below this file count, sequential file processing beats pipelined workers.
-	defaultSmallFileThreshold = 1500
-
-	// maxPipelineQueue caps the number of arenas buffered between the readdir
-	// producer and file-processing workers in non-recursive pipelined mode.
+	// defaultChunkSize is the default number of entries per work unit.
 	//
-	// This prevents excessive memory usage when Workers is set very high.
-	// When the cap is hit, the producer blocks until workers catch up.
-	maxPipelineQueue = maxWorkers
+	// Benchmarked 16–512 on flat dirs (5k–1m files): optimal chunk size
+	// scales with file count (5k→64, 100k→128, 1m→512). 128 is a good
+	// middle ground: ~1% off optimal for 100k, ~3% for 1m.
+	defaultChunkSize = 128
 
-	// pipelineArenaCount is the number of pathArena objects to pre-allocate
-	// for the pipelining free-list when running in tree worker context.
-	// Formula: 1 (producer) + 4 (channel buffer) + 1 (worker) = 6
-	// (Tree workers use Workers=1 for pipelining within a directory).
-	pipelineArenaCount = 6
+	// defaultQueueFactor controls file job queue depth as a multiple of file workers.
+	defaultQueueFactor = 4
 )
 
-// ============================================================================
-// TOP-LEVEL PROCESSING
-// ============================================================================
-
-// processSingleDir processes files in a single directory (non-recursive).
-//
-// Allocations (one-shot, not pooled):
-//   - dirBuf (32KB): for reading directory entries
-//   - pathArena: for collecting paths
-//
-// For large directories, switches to runDirPipeline which allocates
-// additional buffers per worker.
-func (p processor[T]) processSingleDir(
-	ctx context.Context,
-	dirPath nulTermPath,
-) ([]*T, []error) {
-	dirHandle, openErr := openDir(dirPath)
-	if openErr != nil {
-		ioErr := &IOError{Path: dirPath.String(), Op: "open", Err: openErr}
-		if p.errNotify.ioErr(ioErr) {
-			return nil, []error{ioErr}
-		}
-
+func (p processor[T]) process(ctx context.Context, root nulTermPath) ([]*T, []error) {
+	if ctx.Err() != nil {
 		return nil, nil
 	}
 
-	defer func() { _ = dirHandle.close() }()
+	// Bound backlog so memory stays predictable while still feeding workers.
+	queueDepth := max(p.fileWorkers*defaultQueueFactor, 16)
 
-	dirBuf := make([]byte, 0, dirReadBufSize)
-	pathsArena := &pathArena{}
-	pathsArena.reset(cap(dirBuf) * 2)
+	// Unbuffered keeps scheduling centralized in the coordinator.
+	// It prevents scan workers from running ahead without coordinator visibility.
+	scanQueue := make(chan dirJob)
 
-	dirScan := dirScan{
-		path:         dirPath,
-		handle:       dirHandle,
-		dirEntryBuf:  dirBuf[:cap(dirBuf)],
-		reportSubdir: nil, // all subdirs are ignored when this is nil.
-	}
+	// Buffer avoids discovery stalls when coordinator is busy.
+	// Size is small but enough to absorb bursts from multiple scanners.
+	scanEvents := make(chan scanEvent, p.scanWorkers*64)
 
-	return p.processDirAdaptive(ctx, dirScan, pathsArena, p.workers, nil, 0, nil)
-}
+	// Backpressure here throttles scanning instead of unbounded arena growth.
+	// This keeps memory bounded while still allowing a steady backlog.
+	fileJobs := make(chan fileChunk, queueDepth)
 
-// processRecursive processes a directory tree with parallel workers.
-//
-// Each tree worker:
-//   - Owns all its buffers (allocated once at goroutine start)
-//   - Processes directories from the jobs channel
-//   - Reuses buffers across ALL directories it processes
-//   - Discovers subdirectories and reports them via the events channel
-//
-// Memory architecture:
-//
-//	┌─────────────────────────────────────────────────────────────────────────┐
-//	│ processRecursive                                                        │
-//	│   │                                                                     │
-//	│   │ per-worker results/errors slices (merged at the end)                │
-//	│   │                                                                     │
-//	│   └─► [N tree workers] each owns:                                       │
-//	│         │                                                               │
-//	│         │ dirBuf  [32KB]  ← reused for ALL directories                  │
-//	│         │ Worker.Buf  ← reused for ALL files                            │
-//	│         │ pathArena       ← reused for ALL directories                  │
-//	│         │ freeArenas     ← channel-as-freelist for large dirs           │
-//	│         │                                                               │
-//	│         └─► for job := range jobs:                                      │
-//	│               pathArena.reset()  ← amortized reuse (may grow)           │
-//	│               processFilesInto() ← uses worker's buffers                │
-//	│                                                                         │
-//	└─────────────────────────────────────────────────────────────────────────┘
-func (p processor[T]) processRecursive(
-	ctx context.Context,
-	root nulTermPath,
-) ([]*T, []error) {
-	// Per-worker result slices - no mutex contention for results.
-	// Each worker appends to its own slice, merged at the end.
-	//
-	// We build these via append (instead of make(len=p.workers)) to keep
-	// golangci-lint's makezero happy while still allowing workerID indexing.
-	workerResults := make([][]*T, 0, p.workers)
-	workerErrs := make([][]error, 0, p.workers)
+	// Covers buffered + in-flight chunks + scanner hold; +1 keeps producer moving.
+	arenaCount := queueDepth + p.fileWorkers + p.scanWorkers + 1
+	// Reuse arenas to avoid per-directory allocations.
+	pool := newArenaPool(arenaCount)
 
-	for range p.workers {
+	// Per-worker slices avoid hot-path locks during append.
+	workerResults := make([][]*T, 0, p.fileWorkers)
+
+	workerErrs := make([][]error, 0, p.fileWorkers)
+	for range p.fileWorkers {
 		workerResults = append(workerResults, nil)
 		workerErrs = append(workerErrs, nil)
 	}
 
-	type dirJob struct {
-		absPath nulTermPath
+	// Per-scan-worker slices keep error collection lock-free.
+	scanErrs := make([][]error, 0, p.scanWorkers)
+	for range p.scanWorkers {
+		scanErrs = append(scanErrs, nil)
 	}
 
-	type treeEvent struct {
-		job  dirJob
-		done bool
+	// releaseChunk centralizes cleanup so every path returns leases and arenas.
+	// This avoids refcount leaks across success, cancellation, and error paths.
+	releaseChunk := func(chunk fileChunk) {
+		if chunk.lease != nil {
+			chunk.lease.dec()
+		}
+
+		if chunk.arena == nil {
+			return
+		}
+
+		// Only return the arena after the last chunk finishes.
+		if chunk.arena.pending.Add(-1) == 0 {
+			pool.put(chunk.arena)
+		}
 	}
 
-	// ========================================================================
-	// COORDINATOR GOROUTINE: Dynamic Work Distribution
-	// ========================================================================
+	// sendChunk hides enqueue + cancellation handling behind one callsite.
+	// If we can't enqueue, we immediately release ownership to prevent leaks.
+	sendChunk := func(chunk fileChunk) bool {
+		select {
+		case fileJobs <- chunk:
+			return true
+		case <-ctx.Done():
+			// If we can't enqueue, release immediately to avoid leaks.
+			releaseChunk(chunk)
+
+			return false
+		}
+	}
+
+	// sendScanEvent is a signal for discovery + completion.
+	// It drops on cancellation to avoid deadlocks during shutdown.
+	sendScanEvent := func(ev scanEvent) {
+		select {
+		case scanEvents <- ev:
+		case <-ctx.Done():
+		}
+	}
+
+	// ============================================================================
+	// COORDINATOR GOROUTINE: DIRECTORY SCHEDULING
+	// ============================================================================
 	//
-	// THE PROBLEM: We don't know the tree structure upfront
-	//
-	// Unlike processing a flat list of files, tree traversal discovers work
-	// dynamically. When a worker processes directory "foo/", it might find
-	// subdirectories "foo/bar/" and "foo/baz/" that also need processing.
-	// We can't pre-partition the work because we don't know it exists yet.
-	//
-	// THE SOLUTION: A coordinator that acts as a work queue manager
-	//
-	// The coordinator maintains a queue of directories to process. Workers
-	// pull directories from this queue, process them, and push any discovered
-	// subdirectories back. The coordinator routes work between these flows.
-	//
-	// CHANNEL ROLES:
-	//
-	//   workerPullDirJobsChan   ←── coordinator sends directories for workers to process
-	//   workerPushEvents ──► workers send newly-discovered subdirs or completion signals
-	//
-	// WHY EVENTS?
-	//
-	// We need both "found subdir" and "done directory" signals to keep an
-	// accurate pending count. An event channel carries both kinds of signals,
-	// reducing channel count while keeping the same coordinator semantics.
-	//
-	// `pendingDirJobs` counts queued + in-flight directories. Incremented on
-	// discovery, decremented on completion (not dispatch). Only when it hits
-	// zero do we know the entire tree has been processed.
-	//
-	workerPullDirJobsChan := make(chan dirJob)             // workers pull from here
-	workerPushEvents := make(chan treeEvent, p.workers*64) // workers push discovered subdirs/completions here
+	// Owns the directory queue and is the only sender on scanQueue.
+	// Receives scanEvents from scanners and feeds new work until pending hits zero.
+	// Centralizing scheduling avoids shared-queue locks and keeps accounting exact.
 	var coordWG sync.WaitGroup
 	coordWG.Go(func() {
-		dirJobQueue := make([]dirJob, 0, 1024) // typical tree breadth; grows if needed
+		scanQueueClosed := false
 
-		// Seed queue with the root directory itself, this starts the tree walk.
-		dirJobQueue = append(dirJobQueue, dirJob{absPath: root})
+		// Slice queue avoids mutex contention of a shared queue.
+		queue := make([]dirJob, 0, 1024)
+		// Start with the root directory.
+		queue = append(queue, dirJob{path: root})
+		pending := len(queue)
 
-		pendingDirJobs := len(dirJobQueue)
-
-		dirJobQueueClosed := false
-
-		// Drain buffered events to avoid premature termination when pending hits zero.
-		// Only discovery events matter here—done events are ignored because we've
-		// already accounted for all completions (pending is zero).
 		drainEvents := func(pending int, queue []dirJob) (int, []dirJob) {
 			for {
 				select {
-				case ev := <-workerPushEvents:
+				case ev := <-scanEvents:
 					if ev.done {
 						continue
 					}
 
-					pending++
+					if p.recursive {
+						pending++
 
-					queue = append(queue, ev.job)
+						queue = append(queue, dirJob{path: ev.path})
+					}
 				default:
+					// Drain buffered discoveries before declaring completion.
 					return pending, queue
 				}
 			}
 		}
 
-		// ====================================================================
-		// MAIN COORDINATION LOOP
-		// ====================================================================
-		//
-		// This select multiplexes three events:
-		//
-		// 1. DISCOVERY: Worker found a subdirectory → add to queue
-		//    This grows our work dynamically as we explore the tree.
-		//
-		// 2. COMPLETION: Worker finished a directory → track progress
-		//    When pending hits zero, the entire tree has been processed.
-		//
-		// 3. DISPATCH: Send next directory to an available worker
-		//    This is conditional - only enabled when queue is non-empty.
-		//    The "nil channel" trick (jobCh is nil when queue empty) makes
-		//    the send case block forever, effectively disabling it.
-		//
-		// WHY NOT A SIMPLER DESIGN?
-		//
-		// A naive approach might use a mutex-protected queue that workers
-		// access directly. But this creates contention - workers would
-		// fight over the lock. Benchmarks showed that channels were faster.
-		//
-		for pendingDirJobs > 0 {
-			cancelled := ctx.Err() != nil
-
-			if cancelled {
-				// Discard queued work on cancellation - no point dispatching jobs
-				// that workers will skip due to ctx.Err().
-				if len(dirJobQueue) > 0 {
-					pendingDirJobs -= len(dirJobQueue)
-					dirJobQueue = dirJobQueue[:0]
+		for pending > 0 {
+			if ctx.Err() != nil {
+				// Stop dispatching; scanners will exit on closed queue.
+				if !scanQueueClosed {
+					close(scanQueue)
 				}
 
-				if !dirJobQueueClosed {
-					close(workerPullDirJobsChan)
-
-					dirJobQueueClosed = true
-				}
+				return
 			}
 
-			// Nil channel trick: when jobCh is nil, the send case blocks forever,
-			// effectively disabling dispatch when cancelled or queue is empty.
 			var (
-				nextJob dirJob
-				jobCh   chan dirJob
+				next  dirJob
+				jobCh chan dirJob
 			)
 
-			if !cancelled && len(dirJobQueue) > 0 {
-				nextJob = dirJobQueue[0]
-				jobCh = workerPullDirJobsChan
+			if len(queue) > 0 {
+				next = queue[0]
+				jobCh = scanQueue
 			}
 
 			select {
-			case ev := <-workerPushEvents:
+			case ev := <-scanEvents:
 				if ev.done {
-					pendingDirJobs--
-				} else if !cancelled {
-					pendingDirJobs++
+					pending--
+				} else if p.recursive {
+					pending++
 
-					dirJobQueue = append(dirJobQueue, ev.job)
+					queue = append(queue, dirJob{path: ev.path})
 				}
 
-				if pendingDirJobs == 0 && !cancelled {
-					// events is buffered. Drain any already-discovered work before deciding
-					// that we're done, otherwise pending accounting can terminate early.
-					pendingDirJobs, dirJobQueue = drainEvents(pendingDirJobs, dirJobQueue)
+				if pending == 0 {
+					pending, queue = drainEvents(pending, queue)
 				}
 
-				if pendingDirJobs == 0 && !dirJobQueueClosed {
-					close(workerPullDirJobsChan)
+				if pending == 0 && !scanQueueClosed {
+					// Close once to stop all scanners.
+					close(scanQueue)
 
-					dirJobQueueClosed = true
+					scanQueueClosed = true
 				}
 
-			case jobCh <- nextJob:
-				dirJobQueue = dirJobQueue[1:]
+			case jobCh <- next:
+				// Drop refs to popped dir to avoid retaining large trees in memory.
+				queue[0] = dirJob{}
+				queue = queue[1:]
 			}
 		}
 
-		if !dirJobQueueClosed {
-			close(workerPullDirJobsChan)
+		if !scanQueueClosed {
+			close(scanQueue)
 		}
 	})
 
-	// ========================================================================
-	// TREE WORKER: Directory-Level Parallelism
-	// ========================================================================
+	// ============================================================================
+	// SCAN WORKER POOL: DIRECTORY DISCOVERY
+	// ============================================================================
 	//
-	// PARALLELISM STRATEGY: Why parallelize across directories, not within?
-	//
-	// Consider two approaches for a tree with 100 directories, 50 files each:
-	//
-	//   A) 8 workers, each processes multiple directories sequentially
-	//      → 8 directories processed in parallel at any moment
-	//      → Each worker reads its directory, then reads its files
-	//
-	//   B) 1 worker per directory, but 8 file-workers within each directory
-	//      → 1 directory at a time, 8 files read in parallel
-	//      → Must finish one directory before starting the next
-	//
-	// Approach A wins because:
-	//   - Directory I/O is the bottleneck (readdir syscalls, inode lookups)
-	//   - Files within a directory are often physically close on disk
-	//   - Fewer synchronization points (no coordination within directories)
-	//
-	// BUFFER OWNERSHIP: Why each dirWalkerWorker owns its buffers?
-	//
-	// Alternative: Use sync.Pool to share buffers across workers.
-	// Problem: Pool introduces lock contention and unpredictable lifetimes.
-	//
-	// Our approach: Each dirWalkerWorker allocates buffers once at startup, reuses
-	// them for EVERY directory it processes. A dirWalkerWorker processing 1000
-	// directories allocates the same memory as one processing 10.
-	//
-	// RESULT COLLECTION: Why per-dirWalkerWorker slices instead of shared mutex?
-	//
-	// With a shared results slice, every result append needs a mutex lock.
-	// For 100K files, that's 100K lock/unlock cycles with potential contention.
-	//
-	// Per-dirWalkerWorker slices eliminate contention entirely. Each dirWalkerWorker appends
-	// freely to its own slice. At the end, we merge once - O(workers) locks
-	// instead of O(files).
-	dirWalkerWorker := func(workerID int) {
-		bufs := &workerBufs{
-			dirEntryBuf: make([]byte, 0, dirReadBufSize),
-			// dataBuf, dataArena, worker.buf start zero-valued, grow as needed.
-		}
+	// Each worker scans one directory at a time, producing chunks into fileJobs.
+	// Subdirectories are reported back to the coordinator via scanEvents.
+	// Workers own their buffers to avoid contention and keep readdir hot.
+	var scanWG sync.WaitGroup
+	scanWG.Add(p.scanWorkers)
 
-		// When processing directories recursively, within a single directory, we use Workers=1.
-		// Parallelism is across directories (multiple tree workers), not within each one.
-		dirWorkerCount := 1
+	// Scan workers run one directory at a time to keep readdir + openat scoped.
+	// They publish chunks to fileJobs and subdir events to the coordinator.
+	for scanID := range p.scanWorkers {
+		go func(id int) {
+			defer scanWG.Done()
 
-		// Pre-allocate arenas for pipelining large directories.
-		// Channel-as-freelist: producer/workers grab arenas, return when done.
-		//
-		// Why pipelineArenaCount (6)?
-		//   With Workers=1, we need: 1 (producer holding) + 4 (queued) + 1 (worker holding) = 6.
-		freeArenas := make(chan *pathArena, pipelineArenaCount)
-		for range pipelineArenaCount {
-			freeArenas <- &pathArena{}
-		}
-		pipelineQueueCap := pipelineArenaCount - dirWorkerCount - 1
+			// Reuse the readdir buffer; size also seeds arena capacity.
+			dirBuf := make([]byte, 0, dirReadBufSize)
+			// Heuristic: dirent buffers include metadata; names are usually <= ~1/2.
+			storageCap := cap(dirBuf) * 2
+			localErrs := make([]error, 0, 8)
 
-		// These are passed to processDirAdaptive so it reuses our pre-allocated
-		// resources instead of allocating fresh ones for each directory.
-		reuseFreeArenas := freeArenas
-		reuseQueueCap := pipelineQueueCap
-		reuseSharedBufs := bufs
-
-		// ====================================================================
-		// MAIN WORK LOOP: Process directories until coordinator closes jobs
-		// ====================================================================
-		//
-		// Each iteration processes one directory:
-		//   1. Read directory entries (discovering files AND subdirectories)
-		//   2. Send discovered subdirs to coordinator (dynamic work discovery)
-		//   3. Process files (sequential for small dirs, pipelined for large)
-		//   4. Signal completion to coordinator
-		//
-		// The closure wrapping each job provides defer semantics for cleanup.
-		// Without it, the defer would only run when the worker exits entirely.
-		//
-		for job := range workerPullDirJobsChan {
-			func() {
+			for dirJob := range scanQueue {
 				if ctx.Err() != nil {
-					return
+					break
 				}
 
-				dh, err := openDir(job.absPath)
+				dh, err := openDir(dirJob.path)
 				if err != nil {
-					ioErr := &IOError{Path: job.absPath.String(), Op: "open", Err: err}
+					ioErr := &IOError{Path: dirJob.path.String(), Op: "open", Err: err}
 					if p.errNotify.ioErr(ioErr) {
-						workerErrs[workerID] = append(workerErrs[workerID], ioErr)
+						localErrs = append(localErrs, ioErr)
 					}
+					// Always signal done to keep pending counts accurate.
+					sendScanEvent(scanEvent{done: true})
 
-					return
+					continue
 				}
 
-				defer func() { _ = dh.close() }()
+				// Hold the dir open so openat remains valid for all chunks.
+				dirLease := &dirLease{dh: dh, base: dirJob.path}
+				dirLease.refs.Store(1)
 
-				// ============================================================
-				// SUBDIRECTORY DISCOVERY
-				// ============================================================
-				//
-				// As we read directory entries, the reportSubdir callback fires for
-				// each subdirectory. We immediately send it to the coordinator,
-				// which adds it to the work queue for another worker to process.
-				//
-				// This is how tree traversal discovers work dynamically - we
-				// don't know the full tree structure until we've visited every
-				// directory.
-				//
-				reportSubdir := func(name nulTermName) {
-					// Build child path: parent + sep + name (includes NUL from name).
-					parentLen := job.absPath.LenWithoutNul()
-					childAbs := make([]byte, 0, parentLen+1+len(name))
-
-					childAbs = append(childAbs, job.absPath[:parentLen]...)
-					if parentLen > 0 && job.absPath[parentLen-1] != os.PathSeparator {
-						childAbs = append(childAbs, os.PathSeparator)
-					}
-
-					childAbs = append(childAbs, name...) // includes NUL
-
-					select {
-					// sending data into a channel needs to own its memory, so we need to copy here.
-					case workerPushEvents <- treeEvent{job: dirJob{absPath: childAbs}}:
-					case <-ctx.Done():
+				// no-op unless recursive.
+				reportSubdir := reportSubdirFunc(nil)
+				if p.recursive {
+					reportSubdir = func(name nulTermName) {
+						child := dirJob.path.joinName(name)
+						sendScanEvent(scanEvent{path: child})
 					}
 				}
 
-				bufs.pathsArena.reset(cap(bufs.dirEntryBuf) * 2)
+				for ctx.Err() == nil {
+					// Bounded pool ensures discovery can't run away in memory.
+					arena := pool.get(ctx, storageCap)
+					if arena == nil {
+						// context canceled.
+						break
+					}
 
-				scan := dirScan{
-					path:         job.absPath,
-					handle:       dh,
-					dirEntryBuf:  bufs.dirEntryBuf[:cap(bufs.dirEntryBuf)],
-					reportSubdir: reportSubdir,
+					scan := dirScan{
+						path:         dirJob.path,
+						handle:       dh,
+						dirEntryBuf:  dirBuf[:cap(dirBuf)],
+						reportSubdir: reportSubdir,
+					}
+					buf := scan.dirEntryBuf
+					// readDirBatch expects a full-length buffer, not just capacity.
+					if cap(buf) != len(buf) {
+						buf = buf[:cap(buf)]
+					}
+
+					err := readDirBatch(scan.handle, scan.path, buf, p.suffix, arena, scan.reportSubdir)
+
+					empty := len(arena.entries) == 0
+					if empty {
+						pool.put(arena)
+					} else {
+						// Even on read error, process what we already discovered.
+						chunkCount := int32((len(arena.entries) + p.chunkSize - 1) / p.chunkSize)
+						// +1 holds the arena until the scan worker finishes dispatching.
+						arena.pending.Store(chunkCount + 1)
+						// Keep the dir handle alive until all chunks finish.
+						dirLease.refs.Add(chunkCount)
+
+						sentAll := true
+
+						for start := 0; start < len(arena.entries); start += p.chunkSize {
+							end := min(start+p.chunkSize, len(arena.entries))
+
+							chunk := fileChunk{arena: arena, start: start, end: end, lease: dirLease}
+							if !sendChunk(chunk) {
+								sentAll = false
+								// We couldn't enqueue; release remaining chunk refs now.
+								for rest := start + p.chunkSize; rest < len(arena.entries); rest += p.chunkSize {
+									releaseChunk(fileChunk{arena: arena, start: rest, end: min(rest+p.chunkSize, len(arena.entries)), lease: dirLease})
+								}
+
+								break
+							}
+						}
+
+						// Release the scan worker's arena reference after dispatch.
+						if arena.pending.Add(-1) == 0 {
+							pool.put(arena)
+						}
+
+						if !sentAll {
+							// Context canceled.
+							break
+						}
+					}
+
+					if err != nil {
+						if errors.Is(err, io.EOF) {
+							// Directory fully consumed.
+							break
+						}
+
+						ioErr := &IOError{Path: dirJob.path.String(), Op: "readdir", Err: err}
+						if p.errNotify.ioErr(ioErr) {
+							localErrs = append(localErrs, ioErr)
+						}
+
+						break
+					}
+
+					if empty {
+						// Empty batch usually means everything was filtered; keep reading.
+						continue
+					}
 				}
 
-				// Adaptive processing: switch to pipelined mode when the directory
-				// exceeds SmallFileThreshold, otherwise process sequentially.
-				dirResults, dirErrs := p.processDirAdaptive(
-					ctx,
-					scan,
-					&bufs.pathsArena,
-					dirWorkerCount,
-					reuseFreeArenas,
-					reuseQueueCap,
-					reuseSharedBufs,
-				)
-				if len(dirErrs) > 0 {
-					workerErrs[workerID] = append(workerErrs[workerID], dirErrs...)
-				}
+				// Drop the scanner's lease; chunks keep it alive if needed.
+				dirLease.dec()
+				sendScanEvent(scanEvent{done: true})
+			}
 
-				if len(dirResults) > 0 {
-					workerResults[workerID] = append(workerResults[workerID], dirResults...)
-				}
-			}()
-
-			// Signal coordinator that this directory is done.
-			// Always report completion to avoid pending-count leaks on cancel.
-			workerPushEvents <- treeEvent{done: true}
-		}
+			scanErrs[id] = localErrs
+		}(scanID)
 	}
 
-	// Start tree workers.
-	var wg sync.WaitGroup
-	wg.Add(p.workers)
+	// ============================================================================
+	// FILE WORKER POOL: FILE PROCESSING
+	// ============================================================================
+	//
+	// Workers consume chunks from fileJobs and run callbacks sequentially per chunk.
+	// This keeps buffer reuse efficient while still scaling across workers.
+	// Backpressure from fileJobs throttles scan workers upstream.
+	var fileWG sync.WaitGroup
+	fileWG.Add(p.fileWorkers)
 
-	for i := range p.workers {
+	for workerID := range p.fileWorkers {
 		go func(id int) {
-			defer wg.Done()
+			defer fileWG.Done()
 
-			dirWalkerWorker(id)
-		}(i)
-	}
+			bufs := &workerBufs{}
+			localResults := make([]*T, 0, 64)
+			localErrs := make([]error, 0, 32)
 
-	wg.Wait()
-	coordWG.Wait()
+			for chunk := range fileJobs {
+				if ctx.Err() != nil {
+					// Drain to release arenas/leases after cancellation.
+					releaseChunk(chunk)
 
-	// Merge per-worker results into final slice.
-	totalResults := 0
-	for i := range p.workers {
-		totalResults += len(workerResults[i])
-	}
+					continue
+				}
 
-	results := make([]*T, 0, totalResults)
-	for i := range p.workers {
-		results = append(results, workerResults[i]...)
-	}
-
-	// Merge per-worker errors.
-	totalErrs := 0
-	for i := range p.workers {
-		totalErrs += len(workerErrs[i])
-	}
-
-	allErrs := make([]error, 0, totalErrs)
-	for i := range p.workers {
-		allErrs = append(allErrs, workerErrs[i]...)
-	}
-
-	return results, allErrs
-}
-
-// ============================================================================
-// ADAPTIVE DIRECTORY PROCESSING
-// ============================================================================
-
-// processDirAdaptive decides between sequential and pipelined processing
-// based on SmallFileThreshold, and wires error reporting consistently.
-//
-// ADAPTIVE PROCESSING STRATEGY:
-//
-// We start reading the directory sequentially. If we discover more than
-// SmallFileThreshold files, we switch mid-stream to pipelined processing.
-// The files already read become the "initial" batch for the pipeline.
-//
-// This avoids pipeline setup overhead for small directories while still
-// benefiting from overlap in large ones.
-func (p processor[T]) processDirAdaptive(
-	ctx context.Context,
-	dirScan dirScan,
-	pathArena *pathArena,
-	workerCount int,
-	reuseFreeArenas chan *pathArena,
-	reuseQueueCap int,
-	reuseSharedBufs *workerBufs,
-) ([]*T, []error) {
-	if ctx.Err() != nil {
-		return nil, nil
-	}
-
-	crossedTreshold, readErr := p.readDirUntilThresholdOrEOFIntoArena(ctx, dirScan, pathArena, p.smallFileThreshold)
-
-	if readErr != nil && errors.Is(readErr, io.EOF) {
-		readErr = nil
-	}
-
-	// If no entries are found, return early.
-	if len(pathArena.entries) == 0 {
-		if readErr == nil {
-			return nil, nil
-		}
-
-		ioErr := &IOError{Path: dirScan.path.String(), Op: "readdir", Err: readErr}
-		if p.errNotify.ioErr(ioErr) {
-			return nil, []error{ioErr}
-		}
-
-		return nil, nil
-	}
-
-	var results []*T
-	var errors []error
-
-	if readErr != nil {
-		// If an error occurred while reading from the directory handle, report it aswell,
-		// We keep processing files found before the error regrardless of the error.
-		ioErr := &IOError{Path: dirScan.path.String(), Op: "readdir", Err: readErr}
-		if p.errNotify.ioErr(ioErr) {
-			errors = append(errors, ioErr)
-		}
-	}
-
-	// Recheck if we got a cancellation (ioErr allows the user to cancel early).
-	if ctx.Err() != nil {
-		return nil, nil
-	}
-
-	if crossedTreshold {
-		results, errors = p.processFilesParallel(
-			ctx,
-			dirScan,
-			pathArena.entries,
-			workerCount,
-			reuseQueueCap,
-			reuseFreeArenas,
-			reuseSharedBufs,
-		)
-	} else {
-		var buffers *workerBufs
-		if reuseSharedBufs != nil {
-			buffers = reuseSharedBufs
-		} else {
-			buffers = &workerBufs{
-				// dataBuf, dataArena, worker.buf start zero-valued, grow as needed.
-			}
-		}
-
-		results = make([]*T, 0, len(pathArena.entries))
-
-		p.processFilesSequentiallyInto(ctx, dirScan.handle, pathArena.entries, buffers, &results, &errors)
-	}
-
-	return results, errors
-}
-
-// readDirUntilThresholdOrEOFIntoArena reads directory entries from the opened dir handle
-// into the pathArean until EOF, or until the passed threshold is reached.
-func (p processor[T]) readDirUntilThresholdOrEOFIntoArena(
-	ctx context.Context,
-	dirScan dirScan,
-	arena *pathArena,
-	threshold int,
-) (bool, error) {
-	for {
-		if ctx.Err() != nil {
-			return false, io.EOF
-		}
-
-		err := p.readDirBatch(dirScan, arena)
-		if len(arena.entries) > threshold {
-			if err != nil && !errors.Is(err, io.EOF) {
-				// Best-effort: signal error but keep already-read names.
-				return false, err
+				p.processChunk(ctx, chunk.lease, chunk.arena.entries[chunk.start:chunk.end], bufs, &localResults, &localErrs)
+				releaseChunk(chunk)
 			}
 
-			return true, nil
-		}
-
-		if err == nil {
-			continue
-		}
-
-		if errors.Is(err, io.EOF) {
-			return false, io.EOF
-		}
-
-		return false, err
-	}
-}
-
-func (p processor[T]) processFilesParallel(
-	ctx context.Context,
-	scan dirScan,
-	initialEntries []pathEntry,
-	workerCount int,
-	queueCap int,
-	freeArenas chan *pathArena,
-	sharedBufs *workerBufs,
-) ([]*T, []error) {
-	// If caller didn't supply a pool, allocate a new one sized for this pipeline.
-	if freeArenas == nil {
-		var numArenas int
-		if queueCap == 0 {
-			queueCap, numArenas = pipelineSizing(workerCount)
-		} else {
-			numArenas = workerCount + queueCap + 1
-		}
-
-		freeArenas = make(chan *pathArena, numArenas)
-		for range numArenas {
-			freeArenas <- &pathArena{}
-		}
-	} else if queueCap == 0 {
-		// Derive queue capacity from the provided pool size.
-		// This keeps queue sizing and pool sizing consistent.
-		queueCap = max(cap(freeArenas)-workerCount-1, 0)
-	}
-
-	// Shared pipeline runner for large directories.
-	// Producer enumerates entries into arenas; workers drain arenas.
-	// freeArenas provides bounded arena reuse to avoid allocations.
-	arenaCh := make(chan *pathArena, queueCap)
-	// Producer errors are collected by the producer goroutine and merged later.
-	producerErrs := make([]error, 0, 1)
-
-	// workersDone lets producer/arena-pool exit cleanly when workers stop.
-	workersDone := make(chan struct{})
-	pool := arenaPool{
-		freeArenas: freeArenas,
-		done:       workersDone,
-	}
-
-	sendArena := func(arena *pathArena) bool {
-		if arena == nil {
-			return false
-		}
-
-		if len(arena.entries) == 0 {
-			pool.put(arena)
-
-			return true
-		}
-
-		select {
-		case arenaCh <- arena:
-			return true
-		case <-ctx.Done():
-			pool.put(arena)
-
-			return false
-		case <-workersDone:
-			pool.put(arena)
-
-			return false
-		}
-	}
-
-	var producerWG sync.WaitGroup
-
-	producerWG.Go(func() {
-		defer close(arenaCh)
-
-		storageCap := cap(scan.dirEntryBuf) * 2
-
-		if len(initialEntries) > 0 {
-			arena := pool.get(ctx, storageCap)
-			if arena == nil {
-				return
-			}
-
-			for _, entry := range initialEntries {
-				arena.addPath(scan.path, entry.name)
-			}
-
-			if !sendArena(arena) {
-				return
-			}
-		}
-
-		for {
-			if ctx.Err() != nil {
-				return
-			}
-
-			arena := pool.get(ctx, storageCap)
-			if arena == nil {
-				return
-			}
-
-			err := p.readDirBatch(scan, arena)
-
-			if !sendArena(arena) {
-				return
-			}
-
-			if err == nil {
-				continue
-			}
-
-			if errors.Is(err, io.EOF) {
-				return
-			}
-
-			ioErr := &IOError{Path: scan.path.String(), Op: "readdir", Err: err}
-			if p.errNotify.ioErr(ioErr) {
-				// Producer errors are single-threaded; collect and merge after wait.
-				producerErrs = append(producerErrs, ioErr)
-			}
-
-			return
-		}
-	})
-
-	// Per-worker slices avoid lock contention on hot paths.
-	workerResults := make([][]*T, 0, workerCount)
-
-	workerErrs := make([][]error, 0, workerCount)
-	for range workerCount {
-		workerResults = append(workerResults, nil)
-		workerErrs = append(workerErrs, nil)
-	}
-
-	worker := func(workerID int) {
-		// sharedBufs is only safe when workerCount==1 (tree pipeline).
-		bufs := sharedBufs
-		if bufs == nil {
-			bufs = &workerBufs{
-				// dataBuf, dataArena, worker.buf start zero-valued, grow as needed.
-			}
-		}
-
-		localResults := make([]*T, 0, 64)
-		localErrs := make([]error, 0, 32)
-
-		// Drain arenas even after cancellation to return them to the pool.
-		for arena := range arenaCh {
-			if ctx.Err() != nil {
-				pool.put(arena)
-
-				continue
-			}
-
-			func() {
-				defer pool.put(arena)
-
-				p.processFilesSequentiallyInto(ctx, scan.handle, arena.entries, bufs, &localResults, &localErrs)
-			}()
-		}
-
-		workerResults[workerID] = localResults
-		workerErrs[workerID] = localErrs
-	}
-
-	var wg sync.WaitGroup
-	wg.Add(workerCount)
-
-	for workerID := range workerCount {
-		go func(id int) {
-			defer wg.Done()
-
-			worker(id)
+			workerResults[id] = localResults
+			workerErrs[id] = localErrs
 		}(workerID)
 	}
 
-	go func() {
-		wg.Wait()
-		close(workersDone)
-	}()
+	// ============================================================================
+	// SHUTDOWN AND MERGE
+	// ============================================================================
+	//
+	// Close fileJobs only after scanners exit so workers can drain safely.
+	// Then merge per-worker slices to avoid hot-path locks during processing.
+	//
+	// Shutdown flow (dependency chain):
+	//   coordWG ──> close(scanQueue) ──> scanWG ──> close(fileJobs) ──> fileWG
+	//
+	// The coordinator is the only sender on scanQueue, so we wait for it first.
+	// Scanners exit after scanQueue closes; only then can we close fileJobs so
+	// file workers drain and exit.
+	coordWG.Wait()
+	scanWG.Wait()
+	close(fileJobs)
+	fileWG.Wait()
 
-	producerWG.Wait()
-	wg.Wait()
-
-	// Merge per-worker results/errors without lock contention.
+	// Single merge avoids per-append locking on hot paths.
 	totalResults := 0
-	for i := range workerCount {
+	for i := range p.fileWorkers {
 		totalResults += len(workerResults[i])
 	}
 
 	results := make([]*T, 0, totalResults)
-	for i := range workerCount {
+	for i := range p.fileWorkers {
 		results = append(results, workerResults[i]...)
 	}
 
+	// Single merge avoids per-error locking on hot paths.
 	totalErrs := 0
-	for i := range workerCount {
+	for i := range p.fileWorkers {
 		totalErrs += len(workerErrs[i])
 	}
 
-	totalErrs += len(producerErrs)
+	for i := range p.scanWorkers {
+		totalErrs += len(scanErrs[i])
+	}
 
 	allErrs := make([]error, 0, totalErrs)
-	for i := range workerCount {
+	for i := range p.fileWorkers {
 		allErrs = append(allErrs, workerErrs[i]...)
 	}
 
-	if len(producerErrs) > 0 {
-		allErrs = append(allErrs, producerErrs...)
+	for i := range p.scanWorkers {
+		allErrs = append(allErrs, scanErrs[i]...)
 	}
 
 	return results, allErrs
 }
 
-// processFilesSequentiallyInto is the innermost processing loop.
-func (p processor[T]) processFilesSequentiallyInto(
+func (p processor[T]) processChunk(
 	ctx context.Context,
-	dh dirHandle,
-	entries []pathEntry,
+	dirLease *dirLease,
+	entries []nulTermName,
 	bufs *workerBufs,
 	results *[]*T,
 	errs *[]error,
@@ -941,40 +579,19 @@ func (p processor[T]) processFilesSequentiallyInto(
 		fhOpen bool
 	)
 
-	// Ensure open file handles are closed even if a user callback panics.
-	// We intentionally do not do per-file defers; this is one defer per arena.
 	defer func() {
-		if recovered := recover(); recovered != nil {
-			if fhOpen {
-				_ = openFH.close()
-			}
-
-			panic(recovered)
+		if fhOpen {
+			_ = openFH.closeHandle()
 		}
 	}()
 
-	// closeIfOpen closes the current file handle and reports close errors.
-	// Converts path to string only when reporting an error.
-	closeIfOpen := func(path nulTermPath) bool {
+	closeIfOpen := func() {
 		if !fhOpen {
-			return false
+			return
 		}
 
-		closeErr := openFH.close()
+		_ = openFH.closeHandle()
 		fhOpen = false
-
-		if closeErr != nil {
-			ioErr := &IOError{Path: path.String(), Op: "close", Err: closeErr}
-			if p.errNotify.ioErr(ioErr) {
-				*errs = append(*errs, ioErr)
-			}
-
-			if ctx.Err() != nil {
-				return true
-			}
-		}
-
-		return false
 	}
 
 	for _, entry := range entries {
@@ -982,104 +599,47 @@ func (p processor[T]) processFilesSequentiallyInto(
 			return
 		}
 
+		// Reuse scratch to avoid per-file allocations.
 		bufs.worker.buf = bufs.worker.buf[:0]
 
-		// Reuse File struct from workerBufs to avoid per-file heap allocation.
 		bufs.file = File{
-			dh:        dh,
-			name:      entry.name,
-			path:      entry.path,
-			fh:        &openFH,
-			fhOpen:    &fhOpen,
-			dataBuf:   &bufs.fileBytesBuf,
-			dataArena: &bufs.fileBytesArena,
+			dh:          dirLease.dh,
+			name:        entry,
+			base:        dirLease.base,
+			fh:          &openFH,
+			fhOpen:      &fhOpen,
+			dataBuf:     &bufs.fileBytesBuf,
+			pathScratch: &bufs.pathScratch,
+			pathBuilt:   false,
 		}
 
 		val, fnErr := p.fn(&bufs.file, &bufs.worker)
 		if fnErr != nil {
-			// Silent skip for race conditions (file became dir/symlink)
 			if errors.Is(fnErr, errSkipFile) {
+				// Skip races (file became dir/symlink) without surfacing error.
 				if fhOpen {
-					_ = openFH.close()
+					_ = openFH.closeHandle()
 					fhOpen = false
 				}
 
 				continue
 			}
 
-			procErr := &ProcessError{Path: entry.path.String(), Err: fnErr}
+			procErr := &ProcessError{Path: dirLease.base.joinNameString(entry), Err: fnErr}
 			if p.errNotify.callbackErr(procErr) {
 				*errs = append(*errs, procErr)
 			}
 
-			// Callback may have opened file; ensure handle closed on error.
-			if closeIfOpen(entry.path) {
-				return
-			}
+			closeIfOpen()
 
 			continue
 		}
 
-		if closeIfOpen(entry.path) {
-			return
-		}
+		closeIfOpen()
 
 		if val != nil {
 			*results = append(*results, val)
 		}
-	}
-}
-
-// ============================================================================
-// HELPERS
-// ============================================================================
-
-func (p processor[T]) readDirBatch(scan dirScan, arena *pathArena) error {
-	// Expand buffer to full capacity—it's often passed as zero-length with
-	// pre-allocated capacity, but the syscall needs actual space to write into.
-	buf := scan.dirEntryBuf
-	if cap(buf) != len(buf) {
-		buf = buf[:cap(buf)]
-	}
-
-	return readDirBatch(scan.handle, scan.path, buf, p.suffix, arena, scan.reportSubdir)
-}
-
-func pipelineSizing(workerCount int) (int, int) {
-	// Bound buffering so high worker counts can't over-allocate arenas.
-	queueCap := min(workerCount*4, maxPipelineQueue)
-
-	// Needed arenas: 1 (producer) + queueCap (channel buffer) + workers (in-flight).
-	numArenas := workerCount + queueCap + 1
-
-	return queueCap, numArenas
-}
-
-// arenaPool wraps a free-list channel with cancellation awareness.
-type arenaPool struct {
-	freeArenas chan *pathArena
-	done       <-chan struct{}
-}
-
-func (p arenaPool) get(ctx context.Context, storageCap int) *pathArena {
-	select {
-	case arena := <-p.freeArenas:
-		arena.reset(storageCap)
-
-		return arena
-	case <-ctx.Done():
-		return nil
-	case <-p.done:
-		return nil
-	}
-}
-
-func (p arenaPool) put(arena *pathArena) {
-	arena.reset(0)
-
-	select {
-	case p.freeArenas <- arena:
-	default:
 	}
 }
 
@@ -1090,10 +650,14 @@ func (p arenaPool) put(arena *pathArena) {
 // errNotifier tracks error counts and calls OnError callback.
 // Zero value is valid (no-op). Safe for concurrent use.
 type errNotifier struct {
-	mu           sync.Mutex
-	ioErrs       int
+	// mu serializes error count updates and handler execution.
+	mu sync.Mutex
+	// ioErrs counts IO errors observed so far.
+	ioErrs int
+	// callbackErrs counts callback errors observed so far.
 	callbackErrs int
-	onError      func(err error, ioErrs, callbackErrs int) bool
+	// onError is the user-provided handler (serialized).
+	onError func(err error, ioErrs, callbackErrs int) bool
 }
 
 func newErrNotifier(onError func(err error, ioErrs, procErrs int) bool) *errNotifier {
@@ -1114,9 +678,10 @@ func (n *errNotifier) ioErr(err error) bool {
 	n.mu.Lock()
 	n.ioErrs++
 	ioCount, procCount := n.ioErrs, n.callbackErrs
+	collect := n.onError(err, ioCount, procCount)
 	n.mu.Unlock()
 
-	return n.onError(err, ioCount, procCount)
+	return collect
 }
 
 // callbackErr increments process error count and calls callback.
@@ -1129,7 +694,8 @@ func (n *errNotifier) callbackErr(err error) bool {
 	n.mu.Lock()
 	n.callbackErrs++
 	ioCount, callbackCount := n.ioErrs, n.callbackErrs
+	collect := n.onError(err, ioCount, callbackCount)
 	n.mu.Unlock()
 
-	return n.onError(err, ioCount, callbackCount)
+	return collect
 }

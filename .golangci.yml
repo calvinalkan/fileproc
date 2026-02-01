@@ -277,6 +277,13 @@ linters:
         linters:
           - gosec
 
+      # G115 int->int32: chunkCount bounded by arena size (256KB / ~30 bytes
+      # per entry = ~8500 max)
+      - path: processor\.go
+        text: "G115:"
+        linters:
+          - gosec
+
       - path: _test\.go
         linters:
           - dupl
@@ -306,27 +313,6 @@ linters:
         text: "G306:" # file permissions > 0600
         linters:
           - gosec
-      - path: main\.go
-        text: "G204:"
-        linters:
-          - gosec
-      - path: sandbox\.go
-        text: "G204:" # sandbox executes bwrap by design
-        linters:
-          - gosec
-      - path: command\.go
-        text: "G204:" # sandbox command execution
-        linters:
-          - gosec
-      - path: cmd_multicall\.go
-        text: "G204:" # multicall dispatcher executes wrapper commands
-        linters:
-          - gosec
-      # rand.Read requires pre-sized slice
-      - path: cmd_exec\.go
-        text: "slice .* does not have non-zero initial length"
-        linters:
-          - makezero
 
 formatters:
   enable:

@@ -1,6 +1,10 @@
 package fileproc
 
-import "os"
+import (
+	"context"
+	"os"
+	"sync/atomic"
+)
 
 // ============================================================================
 // Path types
@@ -53,19 +57,61 @@ func (p nulTermPath) String() string {
 	return string(p)
 }
 
-// Ptr returns a pointer to the first byte for use with syscalls.
+// ptr returns a pointer to the first byte for use with syscalls.
 // The caller must ensure p is non-empty.
-func (p nulTermPath) Ptr() *byte {
+func (p nulTermPath) ptr() *byte {
 	return &p[0]
 }
 
-// LenWithoutNul returns the path length excluding the trailing NUL.
-func (p nulTermPath) LenWithoutNul() int {
+// lenWithoutNul returns the path length excluding the trailing NUL.
+func (p nulTermPath) lenWithoutNul() int {
 	if len(p) > 0 && p[len(p)-1] == 0 {
 		return len(p) - 1
 	}
 
 	return len(p)
+}
+
+// joinName appends a NUL-terminated name to p and returns a new NUL-terminated path.
+// Used to build child directory paths without string allocations.
+func (p nulTermPath) joinName(name nulTermName) nulTermPath {
+	parentLen := p.lenWithoutNul()
+	child := make([]byte, 0, parentLen+1+len(name))
+
+	if parentLen > 0 {
+		child = append(child, p[:parentLen]...)
+		if p[parentLen-1] != os.PathSeparator {
+			child = append(child, os.PathSeparator)
+		}
+	}
+
+	child = append(child, name...) // includes NUL
+
+	return child
+}
+
+// joinNameString joins p and name and returns a string without the trailing NUL.
+// Used for error messages and logging.
+func (p nulTermPath) joinNameString(name nulTermName) string {
+	parentLen := p.lenWithoutNul()
+	nameLen := name.lenWithoutNul()
+
+	sep := 0
+	if parentLen > 0 && p[parentLen-1] != os.PathSeparator {
+		sep = 1
+	}
+
+	buf := make([]byte, 0, parentLen+sep+nameLen)
+	if parentLen > 0 {
+		buf = append(buf, p[:parentLen]...)
+		if sep == 1 {
+			buf = append(buf, os.PathSeparator)
+		}
+	}
+
+	buf = append(buf, name[:nameLen]...)
+
+	return string(buf)
 }
 
 // nulTermName is a NUL-terminated entry name for syscalls.
@@ -77,18 +123,8 @@ func (p nulTermPath) LenWithoutNul() int {
 // Stored in pathArena entries and File.name.
 type nulTermName []byte
 
-// String returns the name without the trailing NUL.
-// Used in io_unix.go and io_other.go backends.
-func (n nulTermName) String() string {
-	if len(n) > 0 && n[len(n)-1] == 0 {
-		return string(n[:len(n)-1])
-	}
-
-	return string(n)
-}
-
-// LenWithoutNul returns the name length excluding the trailing NUL.
-func (n nulTermName) LenWithoutNul() int {
+// lenWithoutNul returns the name length excluding the trailing NUL.
+func (n nulTermName) lenWithoutNul() int {
 	if len(n) > 0 && n[len(n)-1] == 0 {
 		return len(n) - 1
 	}
@@ -96,30 +132,20 @@ func (n nulTermName) LenWithoutNul() int {
 	return len(n)
 }
 
-// Ptr returns a pointer to the first byte for use with syscalls.
+// ptr returns a pointer to the first byte for use with syscalls.
 // The caller must ensure n is non-empty.
-func (n nulTermName) Ptr() *byte {
+func (n nulTermName) ptr() *byte {
 	return &n[0]
 }
 
-// Bytes returns the name without the trailing NUL as a byte slice.
-// The returned slice shares memory with n; do not modify.
-func (n nulTermName) Bytes() []byte {
-	if len(n) > 0 && n[len(n)-1] == 0 {
-		return n[:len(n)-1]
-	}
-
-	return n
-}
-
-// HasSuffix reports whether the filename ends with suffix.
+// hasSuffix reports whether the filename ends with suffix.
 // Empty suffix matches all filenames.
-func (n nulTermName) HasSuffix(suffix string) bool {
+func (n nulTermName) hasSuffix(suffix string) bool {
 	if suffix == "" {
 		return true
 	}
 
-	nameLen := n.LenWithoutNul()
+	nameLen := n.lenWithoutNul()
 	suffixLen := len(suffix)
 
 	if nameLen < suffixLen {
@@ -140,16 +166,16 @@ func (n nulTermName) HasSuffix(suffix string) bool {
 // pathArena: Arena-Style Allocation for Directory Entries
 // ============================================================================
 //
-// pathArena collects full paths using an "arena" allocation pattern that
+// pathArena collects entry names using an "arena" allocation pattern that
 // minimizes heap allocations when reading directories with many files.
 //
 // THE PROBLEM:
 //
-// A naive implementation would allocate each path separately:
+// A naive implementation would allocate each name separately:
 //
-//	paths := []string{}
+//	names := []string{}
 //	for _, entry := range dirEntries {
-//	    paths = append(paths, filepath.Join(dir, entry.Name())) // ALLOCATES per file
+//	    names = append(names, entry.Name()) // ALLOCATES per file
 //	}
 //
 // For a directory with 1000 files, this causes 1000+ allocations. When
@@ -157,25 +183,25 @@ func (n nulTermName) HasSuffix(suffix string) bool {
 //
 // THE SOLUTION: Arena-Style Storage
 //
-// Instead of allocating each path separately, we pack all paths into a single
+// Instead of allocating each name separately, we pack all names into a single
 // contiguous byte buffer ("storage"), then create slices that point into this
 // buffer ("entries"). This reduces allocations from O(files) to O(1).
 //
 // MEMORY LAYOUT:
 //
-// After appending "/root/file1", "/root/file2", and "/root/doc":
+// After appending "file1", "file2", and "doc":
 //
 //	storage (one contiguous []byte allocation, includes trailing NULs):
-//	┌───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┐
-//	│ / │ r │ o │ o │ t │ / │ f │ 1 │\0 │ / │ r │ o │ o │ t │ / │ f │ 2 │\0 │ / │ r │ o │ o │ t │ / │ d │\0 │
-//	└───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───┘
-//	  0   1   2   3   4   5   6   7   8   9  10  11  12  13  14  15  16  17  18  19  20  21  22  23  24  25
-//	  ▲                               ▲   ▲                               ▲   ▲                           ▲
-//	  │                               │   │                               │   │                           │
-//	  └─────── entries[0] ────────────┘   └─────── entries[1] ────────────┘   └────── entries[2] ───────────┘
-//	        storage[0:9]                        storage[9:18]                     storage[18:26]
+//	┌───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┐
+//	│ f │ i │ l │ e │ 1 │\0 │ f │ i │ l │ e │ 2 │\0 │ d │\0 │
+//	└───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───┘
+//	  0   1   2   3   4   5   6   7   8   9  10  11  12  13
+//	  ▲                   ▲   ▲                   ▲   ▲   ▲
+//	  │                   │   │                   │   │   │
+//	  └── entries[0] ─────┘   └── entries[1] ─────┘   └ entries[2]
+//	      storage[0:6]             storage[6:12]          storage[12:14]
 //
-//	entries ([]pathEntry - slice of headers, NOT new allocations):
+//	entries ([]nulTermName - slice of headers, NOT new allocations):
 //	┌─────────────────┬─────────────────┬─────────────────┐
 //	│ ptr=&storage[0] │ ptr=&storage[9] │ ptr=&storage[18]│
 //	│ len=9, cap=9    │ len=9, cap=9    │ len=8, cap=8    │
@@ -189,8 +215,8 @@ func (n nulTermName) HasSuffix(suffix string) bool {
 // WHY NUL TERMINATORS?
 //
 // The NUL byte (\0) after each name is required for Unix syscalls. By storing
-// the NUL as part of each path and name slice, we can pass names directly to
-// syscalls without any conversion or allocation.
+// the NUL as part of each name slice, we can pass names directly to syscalls
+// without any conversion or allocation.
 //
 // ALLOCATION COMPARISON:
 //
@@ -206,35 +232,31 @@ func (n nulTermName) HasSuffix(suffix string) bool {
 //
 //	// For syscalls (NUL included, ready to use):
 //	fd, err := unix.Openat(dirfd, &name[0], flags, 0)
-//
-//	// For display/logging (exclude NUL):
-//	fmt.Println(path.String()) // "/root/file1"
 type pathArena struct {
 	// storage is the arena: a single contiguous byte buffer that holds
-	// all paths packed together with NUL terminators between them.
+	// all names packed together with NUL terminators between them.
 	// Pre-sized to avoid growth during directory reading.
 	storage []byte
 
 	// entries contains headers pointing into storage. Each entry provides
-	// both full path and basename (both NUL-terminated). These are NOT
-	// separate allocations - they're just "views" into storage.
-	entries []pathEntry
-}
+	// the basename (NUL-terminated). These are NOT separate allocations -
+	// they're just "views" into storage.
+	entries []nulTermName
 
-type pathEntry struct {
-	path nulTermPath // NUL-terminated full path
-	name nulTermName // NUL-terminated basename (slice into path)
+	// pending tracks in-flight chunk refs plus the scan worker's dispatch ref.
+	pending atomic.Int32
 }
 
 // reset prepares the arena for reuse, preserving allocated capacity.
 //
-// The storageCap parameter hints at expected total bytes for all paths.
+// The storageCap parameter hints at expected total bytes for all names.
 // Typically set to len(dirBuf) * 2, estimating that names occupy about
-// half of the raw dirent data returned by getdents64 (prefix added later).
+// half of the raw dirent data returned by getdents64.
 //
 // After reset, the arena is empty but retains its backing arrays, enabling
 // zero-allocation reuse across multiple directories.
 func (b *pathArena) reset(storageCap int) {
+	b.pending.Store(0)
 	// Grow storage capacity if needed, otherwise just reset length to 0.
 	// The backing array is retained for reuse.
 	if storageCap > 0 && cap(b.storage) < storageCap {
@@ -254,30 +276,52 @@ func (b *pathArena) reset(storageCap int) {
 	// But for typical directories, this eliminates all entries slice growth.
 	namesCap := storageCap / 20
 	if namesCap > 0 && cap(b.entries) < namesCap {
-		b.entries = make([]pathEntry, 0, namesCap)
+		b.entries = make([]nulTermName, 0, namesCap)
 	} else {
 		b.entries = b.entries[:0]
 	}
 }
 
-// addPath appends a full path and basename to the arena.
-// dirPath and name must include their trailing NUL terminators.
-func (b *pathArena) addPath(dirPath nulTermPath, name nulTermName) {
+// addPath appends a basename to the arena.
+// name must include its trailing NUL terminator.
+func (b *pathArena) addPath(_ nulTermPath, name nulTermName) {
 	start := len(b.storage)
-	dirLen := dirPath.LenWithoutNul()
+	b.storage = append(b.storage, name...) // name already includes NUL
+	stored := b.storage[start:len(b.storage)]
+	b.entries = append(b.entries, nulTermName(stored))
+}
 
-	if dirLen > 0 {
-		b.storage = append(b.storage, dirPath[:dirLen]...)
-		if dirPath[dirLen-1] != os.PathSeparator {
-			b.storage = append(b.storage, os.PathSeparator)
-		}
+// arenaPool wraps a free-list channel with cancellation awareness.
+type arenaPool struct {
+	// free is bounded to cap retained arena memory.
+	free chan *pathArena
+}
+
+func newArenaPool(n int) arenaPool {
+	p := arenaPool{free: make(chan *pathArena, n)}
+	for range n {
+		p.free <- &pathArena{}
 	}
 
-	nameStart := len(b.storage)
-	b.storage = append(b.storage, name...) // name already includes NUL
-	full := b.storage[start:len(b.storage)]
-	b.entries = append(b.entries, pathEntry{
-		path: full,
-		name: full[nameStart-start:],
-	})
+	return p
+}
+
+func (p arenaPool) get(ctx context.Context, storageCap int) *pathArena {
+	select {
+	case arena := <-p.free:
+		arena.reset(storageCap)
+
+		return arena
+	case <-ctx.Done():
+		return nil
+	}
+}
+
+func (p arenaPool) put(arena *pathArena) {
+	arena.reset(0)
+
+	select {
+	case p.free <- arena:
+	default:
+	}
 }

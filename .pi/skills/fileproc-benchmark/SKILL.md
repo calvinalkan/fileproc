@@ -168,6 +168,8 @@ git commit -m "bench: update baseline after reducing allocations"
 --warmup N        Warmup runs (default: 5)
 --tag TAG         Tag for this run
 --workers N       Override worker count
+--scan-workers N  Override scan worker count
+--chunk-size N    Override entries per chunk
 --gc N            Override GC percent
 --require-ac      Fail if on battery
 --verbose         Show full hyperfine output
@@ -184,6 +186,8 @@ git commit -m "bench: update baseline after reducing allocations"
 --strace          Syscall analysis
 --repeat N        Iterations (default: 10)
 --workers N       Override workers
+--scan-workers N  Override scan workers
+--chunk-size N    Override entries per chunk
 --process NAME    bytes | read | stat (default: bytes)
 --help            Show detailed help
 ```
@@ -193,6 +197,8 @@ git commit -m "bench: update baseline after reducing allocations"
 ```
 --case CASES      Comma-separated cases (default: all)
 --workers LIST    Worker counts to test
+--scan-workers N  Scan worker count override
+--chunk-size N    Entries per chunk override
 --runs N          Runs per combination
 --process NAME    bytes | read | stat (default: bytes)
 --verbose         Show full output

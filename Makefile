@@ -21,7 +21,6 @@ lint:
 
 test:
 	go test -race ./...
-	go test -race -tags fileproc_testhooks ./...
 
 clean:
 	rm -f $(shell find cmd -maxdepth 2 -type f -executable 2>/dev/null)

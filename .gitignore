@@ -17,3 +17,4 @@ cmd/benchreport/benchreport
 
 # symlinked from pi directory
 .codex/skills
+/fileproc.test

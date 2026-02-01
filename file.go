@@ -2,6 +2,7 @@ package fileproc
 
 import (
 	"errors"
+	"os"
 	"syscall"
 )
 
@@ -10,10 +11,14 @@ import (
 // ModTime is expressed as Unix nanoseconds to avoid time.Time allocations
 // in hot paths. Use time.Unix(0, st.ModTime) to convert when needed.
 type Stat struct {
-	Size    int64
+	// Size is the file size in bytes.
+	Size int64
+	// ModTime is the modification time in Unix nanoseconds.
 	ModTime int64
-	Mode    uint32
-	Inode   uint64
+	// Mode is the file mode bits (os.FileMode).
+	Mode uint32
+	// Inode is the inode number when available (0 on platforms without it).
+	Inode uint64
 }
 
 // File provides access to a file being processed by [Process].
@@ -25,18 +30,34 @@ type Stat struct {
 // Bytes() and Read() are mutually exclusive per file. Calling one after
 // the other returns an error.
 type File struct {
-	dh        dirHandle
-	name      nulTermName
-	path      nulTermPath
-	st        Stat
-	statDone  bool
-	fh        *fileHandle
-	fhOpen    *bool
-	dataBuf   *[]byte // temporary read buffer (reused across files)
-	dataArena *[]byte // append-only arena for Bytes() results
-	mode      fileMode
-	openErr   error
-	statErr   error
+	// dh is the open directory handle used for openat/statat.
+	dh dirHandle
+	// name is the NUL-terminated basename for openat/statat.
+	name nulTermName
+	// base is the NUL-terminated directory path for building absolute paths.
+	base nulTermPath
+	// path caches the built absolute path (no trailing NUL).
+	path []byte
+	// pathScratch is a reusable buffer for building absolute paths.
+	pathScratch *[]byte
+	// pathBuilt tracks whether path is populated for this file.
+	pathBuilt bool
+	// st caches the file stat result.
+	st Stat
+	// statDone tracks whether stat has been attempted.
+	statDone bool
+	// fh points at the currently open file handle.
+	fh *fileHandle
+	// fhOpen indicates whether fh is open.
+	fhOpen *bool
+	// dataBuf is the temporary read buffer reused across files.
+	dataBuf *[]byte
+	// mode tracks the Bytes/Read usage state.
+	mode fileMode
+	// openErr caches open errors for lazy open.
+	openErr error
+	// statErr caches stat errors for lazy stat.
+	statErr error
 }
 
 // AbsPathBorrowed returns the absolute file path (without the trailing NUL).
@@ -44,11 +65,40 @@ type File struct {
 // The returned slice is ephemeral and only valid during the callback.
 // Copy if you need to retain it.
 func (f *File) AbsPathBorrowed() []byte {
-	if len(f.path) > 0 && f.path[len(f.path)-1] == 0 {
-		return f.path[:len(f.path)-1]
+	if f.pathBuilt {
+		return f.path
 	}
 
-	return f.path
+	baseLen := f.base.lenWithoutNul()
+	nameLen := f.name.lenWithoutNul()
+
+	sep := 0
+	if baseLen > 0 && f.base[baseLen-1] != os.PathSeparator {
+		sep = 1
+	}
+
+	needed := baseLen + sep + nameLen
+
+	buf := *f.pathScratch
+	if cap(buf) < needed {
+		buf = make([]byte, 0, needed)
+	}
+
+	buf = buf[:0]
+	if baseLen > 0 {
+		buf = append(buf, f.base[:baseLen]...)
+		if sep == 1 {
+			buf = append(buf, os.PathSeparator)
+		}
+	}
+
+	buf = append(buf, f.name[:nameLen]...)
+
+	*f.pathScratch = buf
+	f.path = buf
+	f.pathBuilt = true
+
+	return buf
 }
 
 // Stat returns file metadata.
@@ -57,7 +107,20 @@ func (f *File) AbsPathBorrowed() []byte {
 // return the cached value with no additional I/O.
 //
 // Returns zero Stat and an error if the stat syscall fails (e.g., file was
-// deleted or became a non-regular file).
+// deleted or became a non-regular file). If the file is now a directory or
+// symlink, Stat returns a skip error that Process ignores when returned by the
+// callback.
+//
+// Example (inside Process callback):
+//
+//	st, err := f.Stat()
+//	if err != nil {
+//	    return nil, err
+//	}
+//	if st.Size == 0 {
+//	    return nil, nil
+//	}
+//	return &Result{Size: st.Size}, nil
 func (f *File) Stat() (Stat, error) {
 	if !f.statDone {
 		f.lazyStat()
@@ -68,6 +131,7 @@ func (f *File) Stat() (Stat, error) {
 
 // BytesOption configures the behavior of [File.Bytes].
 type BytesOption struct {
+	// sizeHint is the expected file size to pre-size buffers.
 	sizeHint int
 }
 
@@ -88,7 +152,7 @@ type BytesOption struct {
 //	// Pre-create option outside the processing loop (zero allocation)
 //	opt := fileproc.WithSizeHint(4096)
 //
-//	fileproc.Process(ctx, dir, func(f *fileproc.File, _ *fileproc.Worker) (*T, error) {
+//	fileproc.Process(ctx, dir, func(f *fileproc.File, _ *fileproc.FileWorker) (*T, error) {
 //	    data, err := f.Bytes(opt)
 //	    // ...
 //	}, opts)
@@ -98,15 +162,20 @@ func WithSizeHint(size int) BytesOption {
 
 // Bytes reads and returns the full file content.
 //
-// The returned slice points into an internal arena and remains valid until
-// Process returns. Subslices share the same lifetime.
+// The returned slice points into a reusable buffer and is only valid during
+// the callback. To retain data beyond the callback, copy it or use
+// [FileWorker.RetainBytes].
 //
 // Empty files return a non-nil empty slice ([]byte{}, nil).
 //
-// Single-use: Bytes can only be called once per File.
-// Returns error if called after [File.Read], or on I/O failure.
+// Single-use: Bytes can only be called once per File and is mutually exclusive
+// with [File.Read].
 //
-// Memory: content is retained in the arena until Process returns.
+// Returns error if called after [File.Read], or on I/O failure. If the file
+// changes type (becomes a directory or symlink) between scan and read, Bytes
+// returns a skip error that Process ignores when returned by the callback.
+//
+// Memory: content is stored in a reusable buffer; it is not retained.
 // For large files or memory-constrained use cases, consider [File.Read]
 // with streaming processing instead.
 //
@@ -118,6 +187,15 @@ func WithSizeHint(size int) BytesOption {
 //
 // For workloads with known/uniform file sizes, use [WithSizeHint] to avoid
 // buffer resizing without the overhead of a stat syscall.
+//
+// Example (inside Process callback):
+//
+//	data, err := f.Bytes()
+//	if err != nil {
+//	    return nil, err
+//	}
+//	keep := w.RetainBytes(data)
+//	return &Result{Len: len(keep)}, nil
 func (f *File) Bytes(opts ...BytesOption) ([]byte, error) {
 	if f.mode == fileModeReader {
 		return nil, errBytesAfterRead
@@ -127,13 +205,13 @@ func (f *File) Bytes(opts ...BytesOption) ([]byte, error) {
 		return nil, errBytesAlreadyCalled
 	}
 
-	f.mode = fileModeBytes
-
 	// Open file if needed.
 	openErr := f.open()
 	if openErr != nil {
 		return nil, openErr
 	}
+
+	f.mode = fileModeBytes
 
 	// Buffer size priority: stat > sizeHint > default.
 	maxInt := int(^uint(0) >> 1)
@@ -211,11 +289,7 @@ func (f *File) Bytes(opts ...BytesOption) ([]byte, error) {
 		return []byte{}, nil
 	}
 
-	// Copy to arena, return subslice.
-	start := len(*f.dataArena)
-	*f.dataArena = append(*f.dataArena, buf[:n]...)
-
-	return (*f.dataArena)[start:], nil
+	return buf[:n], nil
 }
 
 // Read implements io.Reader for streaming access.
@@ -224,19 +298,43 @@ func (f *File) Bytes(opts ...BytesOption) ([]byte, error) {
 // retaining the full content. Data read via Read() is NOT arena-allocated;
 // caller provides and manages the buffer.
 //
-// Returns error if called after Bytes().
+// Read may be called multiple times until it returns io.EOF. It is mutually
+// exclusive with [File.Bytes] and returns an error if Bytes was used first.
+//
+// If the file changes type (becomes a directory or symlink) between scan and
+// read, Read returns a skip error that Process ignores when returned by the
+// callback.
 //
 // Lazy: file is opened on first Read() call.
+//
+// Example (inside Process callback):
+//
+//	buf := w.Buf(32 * 1024)
+//	buf = buf[:cap(buf)]
+//	for {
+//	    n, err := f.Read(buf)
+//	    if n > 0 {
+//	        // consume buf[:n]
+//	    }
+//	    if err != nil {
+//	        if errors.Is(err, io.EOF) {
+//	            break
+//	        }
+//	        return nil, err
+//	    }
+//	}
 func (f *File) Read(p []byte) (int, error) {
 	if f.mode == fileModeBytes {
 		return 0, errReadAfterBytes
 	}
 
-	f.mode = fileModeReader
+	if f.mode != fileModeReader {
+		err := f.open()
+		if err != nil {
+			return 0, err
+		}
 
-	err := f.open()
-	if err != nil {
-		return 0, err
+		f.mode = fileModeReader
 	}
 
 	n, err := f.fh.Read(p)
@@ -264,41 +362,6 @@ func (f *File) Fd() uintptr {
 	}
 
 	return f.fh.fdValue()
-}
-
-// Worker provides reusable temporary buffer space for callback processing.
-//
-// The buffer is reused across files within a worker. It is only valid during
-// the current callback and will be overwritten for the next file.
-//
-// Use for temporary parsing work, not for data that must survive the callback.
-type Worker struct {
-	buf []byte
-}
-
-// Buf returns a reusable buffer with at least the requested capacity.
-//
-// Returns a slice with len=0 and cap>=size, ready for append:
-//
-//	buf := w.Buf(4096)
-//	buf = append(buf, data...)  // no alloc if fits in capacity
-//
-// For use as a fixed-size read target, expand to full capacity:
-//
-//	buf := w.Buf(4096)
-//	buf = buf[:cap(buf)]
-//	n, _ := io.ReadFull(r, buf)
-//
-// The capacity grows to accommodate the largest request seen across all
-// files processed by this worker, then stabilizes.
-//
-// The returned slice is only valid during the current callback.
-func (w *Worker) Buf(size int) []byte {
-	if cap(w.buf) < size {
-		w.buf = make([]byte, 0, size)
-	}
-
-	return w.buf[:0]
 }
 
 var (

@@ -39,11 +39,12 @@ type benchResult struct {
 	Process string `json:"process"`
 	Suffix  string `json:"suffix"`
 
-	ReadSize  int   `json:"read"`
-	Workers   int   `json:"workers"`
-	Repeat    int   `json:"repeat"`
-	GCPercent int   `json:"gc"`
-	Expect    int64 `json:"expect,omitempty"`
+	Workers     int   `json:"workers"`
+	ScanWorkers int   `json:"scan_workers"`
+	ChunkSize   int   `json:"chunk_size"`
+	Repeat      int   `json:"repeat"`
+	GCPercent   int   `json:"gc"`
+	Expect      int64 `json:"expect,omitempty"`
 
 	Visited      uint64        `json:"visited"`
 	Matched      uint64        `json:"matched"`
@@ -66,27 +67,29 @@ type benchResult struct {
 }
 
 const (
-	processBytes = "bytes"
-	processRead  = "read"
-	processStat  = "stat"
+	processBytes    = "bytes"
+	processRead     = "read"
+	processStat     = "stat"
+	defaultReadSize = 2048
 )
 
 type benchFlags struct {
-	dir        string
-	tree       bool
-	process    string
-	suffix     string
-	readSize   int
-	workers    int
-	repeat     int
-	gcPercent  int
-	expect     int64
-	quiet      bool
-	caseName   string
-	notes      string
-	out        string
-	cpuProfile string
-	memProfile string
+	dir         string
+	tree        bool
+	process     string
+	suffix      string
+	workers     int
+	scanWorkers int
+	chunkSize   int
+	repeat      int
+	gcPercent   int
+	expect      int64
+	quiet       bool
+	caseName    string
+	notes       string
+	out         string
+	cpuProfile  string
+	memProfile  string
 }
 
 func parseFlags() *benchFlags {
@@ -96,8 +99,9 @@ func parseFlags() *benchFlags {
 	flag.BoolVar(&flags.tree, "tree", false, "scan recursively")
 	flag.StringVar(&flags.process, "process", "bytes", "process mode: bytes | read | stat")
 	flag.StringVar(&flags.suffix, "suffix", ".md", "file suffix filter (empty = all files)")
-	flag.IntVar(&flags.readSize, "read", 2048, "bytes to read per file (read mode only)")
 	flag.IntVar(&flags.workers, "workers", 0, "worker count (0=auto)")
+	flag.IntVar(&flags.scanWorkers, "scan-workers", 0, "scan worker count (0=auto)")
+	flag.IntVar(&flags.chunkSize, "chunk-size", 0, "entries per chunk (0=auto)")
 	flag.IntVar(&flags.repeat, "repeat", 1, "repeat the scan N times per invocation")
 	flag.IntVar(&flags.gcPercent, "gc", -1, "if >=0, call debug.SetGCPercent(gc)")
 	flag.Int64Var(&flags.expect, "expect", -1, "if >=0, require visited count to match (per scan)")
@@ -202,10 +206,18 @@ func run(flags *benchFlags) int {
 	}
 
 	if flags.workers != 0 {
-		opts = append(opts, fileproc.WithWorkers(flags.workers))
+		opts = append(opts, fileproc.WithFileWorkers(flags.workers))
 	}
 
-	processFn := makeProcessFn(selectedProcess, flags.readSize)
+	if flags.scanWorkers != 0 {
+		opts = append(opts, fileproc.WithScanWorkers(flags.scanWorkers))
+	}
+
+	if flags.chunkSize != 0 {
+		opts = append(opts, fileproc.WithChunkSize(flags.chunkSize))
+	}
+
+	processFn := makeProcessFn(selectedProcess)
 
 	var visited uint64
 
@@ -325,8 +337,9 @@ func run(flags *benchFlags) int {
 		Tree:         flags.tree,
 		Process:      selectedProcess,
 		Suffix:       flags.suffix,
-		ReadSize:     flags.readSize,
 		Workers:      flags.workers,
+		ScanWorkers:  flags.scanWorkers,
+		ChunkSize:    flags.chunkSize,
 		Repeat:       flags.repeat,
 		GCPercent:    flags.gcPercent,
 		Expect:       flags.expect,
@@ -412,12 +425,12 @@ func parseProcess(processFlag string) (string, error) {
 	}
 }
 
-func makeProcessFn(process string, readSize int) fileproc.ProcessFunc[struct{}] {
+func makeProcessFn(process string) fileproc.ProcessFunc[struct{}] {
 	var one struct{}
 
 	switch process {
 	case processStat:
-		return func(f *fileproc.File, _ *fileproc.Worker) (*struct{}, error) {
+		return func(f *fileproc.File, _ *fileproc.FileWorker) (*struct{}, error) {
 			_, err := f.Stat()
 			if err != nil {
 				return nil, fmt.Errorf("stat: %w", err)
@@ -427,8 +440,8 @@ func makeProcessFn(process string, readSize int) fileproc.ProcessFunc[struct{}] 
 		}
 
 	case processRead:
-		return func(f *fileproc.File, w *fileproc.Worker) (*struct{}, error) {
-			buf := w.Buf(readSize)
+		return func(f *fileproc.File, w *fileproc.FileWorker) (*struct{}, error) {
+			buf := w.Buf(defaultReadSize)
 			buf = buf[:cap(buf)]
 
 			_, err := f.Read(buf)
@@ -440,7 +453,7 @@ func makeProcessFn(process string, readSize int) fileproc.ProcessFunc[struct{}] 
 		}
 
 	case processBytes:
-		return func(f *fileproc.File, _ *fileproc.Worker) (*struct{}, error) {
+		return func(f *fileproc.File, _ *fileproc.FileWorker) (*struct{}, error) {
 			_, err := f.Bytes()
 			if err != nil {
 				return nil, fmt.Errorf("bytes: %w", err)
@@ -450,7 +463,7 @@ func makeProcessFn(process string, readSize int) fileproc.ProcessFunc[struct{}] 
 		}
 
 	default:
-		return func(_ *fileproc.File, _ *fileproc.Worker) (*struct{}, error) {
+		return func(_ *fileproc.File, _ *fileproc.FileWorker) (*struct{}, error) {
 			return nil, fmt.Errorf("unknown process mode: %s", process)
 		}
 	}

@@ -23,17 +23,17 @@ import (
 )
 
 // ============================================================================
-// Directory enumeration (readDirBatchImpl)
+// Directory enumeration (readDirBatch)
 // ============================================================================
 
 const readDirBatchSize = 4096
 
-// readDirBatchImpl enumerates directory entries using (*os.File).ReadDir.
+// readDirBatch enumerates directory entries using (*os.File).ReadDir.
 //
 // Names appended to batch include their trailing NUL terminator.
 //
 // If reportSubdir is non-nil, it is called for each discovered subdirectory.
-func readDirBatchImpl(dh dirHandle, dirPath nulTermPath, _ []byte, suffix string, batch *pathArena, reportSubdir reportSubdirFunc) error {
+func readDirBatch(dh dirHandle, dirPath nulTermPath, _ []byte, suffix string, batch *pathArena, reportSubdir reportSubdirFunc) error {
 	entries, err := dh.f.ReadDir(readDirBatchSize)
 	for _, e := range entries {
 		// Use Type() instead of IsDir() to avoid following symlinks.
@@ -61,7 +61,7 @@ func readDirBatchImpl(dh dirHandle, dirPath nulTermPath, _ []byte, suffix string
 		// When Type() is unknown (common on some filesystems), we must lstat to
 		// enforce "skip symlinks and non-regular files" semantics.
 		if typ&fs.ModeType == 0 {
-			if reportSubdir == nil && !name.HasSuffix(suffix) {
+			if reportSubdir == nil && !name.hasSuffix(suffix) {
 				continue
 			}
 
@@ -76,7 +76,7 @@ func readDirBatchImpl(dh dirHandle, dirPath nulTermPath, _ []byte, suffix string
 					reportSubdir(name)
 				}
 			case statKindReg:
-				if name.HasSuffix(suffix) {
+				if name.hasSuffix(suffix) {
 					batch.addPath(dirPath, name)
 				}
 			default:
@@ -91,7 +91,7 @@ func readDirBatchImpl(dh dirHandle, dirPath nulTermPath, _ []byte, suffix string
 			continue
 		}
 
-		if !name.HasSuffix(suffix) {
+		if !name.hasSuffix(suffix) {
 			continue
 		}
 
@@ -138,12 +138,15 @@ func classifyAt(dirfd int, name string) (statKind, error) {
 
 // dirHandle wraps an open directory for ReadDir/openat-based operations.
 type dirHandle struct {
+	// fd is the raw directory file descriptor for openat/fstatat.
 	fd int
-	f  *os.File
+	// f is the os.File wrapper used for ReadDir.
+	f *os.File
 }
 
 // fileHandle wraps an open file descriptor.
 type fileHandle struct {
+	// fd is the raw file descriptor used for reads.
 	fd int
 }
 
@@ -154,7 +157,7 @@ func openDir(path nulTermPath) (dirHandle, error) {
 	for {
 		fd, _, errno := syscall.Syscall(
 			unix.SYS_OPEN,
-			uintptr(unsafe.Pointer(path.Ptr())),
+			uintptr(unsafe.Pointer(path.ptr())),
 			uintptr(unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW),
 			0,
 		)
@@ -169,7 +172,7 @@ func openDir(path nulTermPath) (dirHandle, error) {
 	}
 }
 
-func (d dirHandle) close() error {
+func (d dirHandle) closeHandle() error {
 	if d.f == nil {
 		return nil
 	}
@@ -189,7 +192,7 @@ func openat(dirfd int, name nulTermName) (int, error) {
 		fd, _, errno := syscall.Syscall6(
 			unix.SYS_OPENAT,
 			uintptr(dirfd),
-			uintptr(unsafe.Pointer(name.Ptr())),
+			uintptr(unsafe.Pointer(name.ptr())),
 			uintptr(unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK),
 			0, 0, 0,
 		)
@@ -221,7 +224,8 @@ func (d dirHandle) statFile(name nulTermName) (Stat, statKind, error) {
 		return Stat{}, statKindOther, syscall.ENOENT
 	}
 
-	nameStr := name.String()
+	nameLen := name.lenWithoutNul()
+	nameStr := string(name[:nameLen])
 
 	var st unix.Stat_t
 	for {
@@ -306,7 +310,7 @@ func (f fileHandle) readInto(buf []byte) (int, bool, error) {
 	return bytesRead, false, nil
 }
 
-func (f fileHandle) close() error {
+func (f fileHandle) closeHandle() error {
 	if f.fd < 0 {
 		return nil
 	}
