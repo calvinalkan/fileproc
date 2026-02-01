@@ -10,7 +10,7 @@ package fileproc
 //     raw dirent64 structures in-place (low allocation).
 //   - File opens use openat(2) relative to an open directory fd.
 //
-// The pipeline and worker orchestration code (fileproc.go, fileproc_workers.go)
+// The pipeline and worker orchestration code (fileproc.go, processor.go)
 // is OS-agnostic and relies on the functions and types provided here.
 
 import (
@@ -85,7 +85,7 @@ var errInvalidDirent = errors.New("invalid dirent")
 //
 // If reportSubdir is non-nil, it is called for each discovered subdirectory
 // entry name (without a trailing NUL).
-func readDirBatchImpl(dh dirHandle, dirPath nulTermPath, buf []byte, suffix string, batch *pathArena, reportSubdir func(nulTermName)) error {
+func readDirBatchImpl(dh dirHandle, dirPath nulTermPath, buf []byte, suffix string, batch *pathArena, reportSubdir reportSubdirFunc) error {
 	// Retry ReadDirent on EINTR without an upper bound, matching Go's stdlib.
 	var (
 		read int
@@ -274,7 +274,7 @@ func openDir(path nulTermPath) (dirHandle, error) {
 	}
 }
 
-func (d dirHandle) closeHandle() error {
+func (d dirHandle) close() error {
 	if d.fd < 0 {
 		return nil
 	}
@@ -400,7 +400,7 @@ func (f fileHandle) readInto(buf []byte) (int, bool, error) {
 	return bytesRead, false, nil
 }
 
-func (f fileHandle) closeHandle() error {
+func (f fileHandle) close() error {
 	if f.fd < 0 {
 		return nil
 	}

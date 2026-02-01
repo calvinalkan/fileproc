@@ -7,7 +7,7 @@ import "io"
 // ============================================================================
 //
 // The file processor pipeline (processDir/processTree and the worker/pipeline
-// code in fileproc_workers.go) is written against a small set of unexported,
+// code in processor.go) is written against a small set of unexported,
 // platform-dependent functions and types.
 //
 // Those symbols form an internal *backend contract* that each supported OS
@@ -60,21 +60,21 @@ import "io"
 // Function signatures required by the pipeline.
 var (
 	_ func(nulTermPath) (dirHandle, error)                                              = openDir
-	_ func(dirHandle, nulTermPath, []byte, string, *pathArena, func(nulTermName)) error = readDirBatchImpl
+	_ func(dirHandle, nulTermPath, []byte, string, *pathArena, reportSubdirFunc) error = readDirBatchImpl
 )
 
 // Method sets required by the pipeline.
 // These interfaces are only used for compile-time checking.
 type (
 	ioDirHandle interface {
-		closeHandle() error
+		close() error
 		openFile(name nulTermName) (fileHandle, error)
 		statFile(name nulTermName) (Stat, statKind, error)
 	}
 
 	ioFileHandle interface {
 		io.Reader
-		closeHandle() error
+		close() error
 		readInto(buf []byte) (n int, isDir bool, err error)
 		fdValue() uintptr
 	}

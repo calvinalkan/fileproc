@@ -24,7 +24,7 @@ import "sync/atomic"
 
 // readDirBatchHook enables deterministic error-injection in tests without
 // adding explicit dependencies to the hot path.
-type readDirBatchHookFn func(dirHandle, nulTermPath, []byte, string, *pathArena, func(nulTermName)) error
+type readDirBatchHookFn func(dirHandle, nulTermPath, []byte, string, *pathArena, reportSubdirFunc) error
 
 var readDirBatchHook atomic.Pointer[readDirBatchHookFn]
 
@@ -54,7 +54,7 @@ func setReadDirBatchHook(hook readDirBatchHookFn) func() {
 
 // readDirBatch wraps the backend implementation and optionally diverts to the
 // test hook. The call signature matches the backend contract exactly.
-func readDirBatch(dh dirHandle, dirPath nulTermPath, buf []byte, suffix string, batch *pathArena, reportSubdir func(nulTermName)) error {
+func readDirBatch(dh dirHandle, dirPath nulTermPath, buf []byte, suffix string, batch *pathArena, reportSubdir reportSubdirFunc) error {
 	if hook := readDirBatchHook.Load(); hook != nil {
 		return (*hook)(dh, dirPath, buf, suffix, batch, reportSubdir)
 	}
@@ -63,4 +63,4 @@ func readDirBatch(dh dirHandle, dirPath nulTermPath, buf []byte, suffix string, 
 }
 
 // Compile-time guard: wrapper signature must match the backend contract.
-var _ func(dirHandle, nulTermPath, []byte, string, *pathArena, func(nulTermName)) error = readDirBatch
+var _ func(dirHandle, nulTermPath, []byte, string, *pathArena, reportSubdirFunc) error = readDirBatch

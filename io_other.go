@@ -37,7 +37,7 @@ const readDirBatchSize = 4096
 //
 // If reportSubdir is non-nil, it is called for each discovered subdirectory
 // entry name (without a trailing NUL).
-func readDirBatchImpl(dh dirHandle, dirPath nulTermPath, _ []byte, suffix string, batch *pathArena, reportSubdir func(nulTermName)) error {
+func readDirBatchImpl(dh dirHandle, dirPath nulTermPath, _ []byte, suffix string, batch *pathArena, reportSubdir reportSubdirFunc) error {
 	entries, err := dh.f.ReadDir(readDirBatchSize)
 	for _, e := range entries {
 		// Use Type() instead of IsDir() to avoid following symlinks.
@@ -152,7 +152,7 @@ func openDir(path nulTermPath) (dirHandle, error) {
 	return dirHandle{f: f, path: p}, nil
 }
 
-func (d dirHandle) closeHandle() error {
+func (d dirHandle) close() error {
 	if d.f == nil {
 		return nil
 	}
@@ -249,7 +249,7 @@ func (f fileHandle) Read(buf []byte) (int, error) {
 	return n, fmt.Errorf("read: %w", err)
 }
 
-func (f fileHandle) closeHandle() error {
+func (f fileHandle) close() error {
 	if f.f == nil {
 		return nil
 	}

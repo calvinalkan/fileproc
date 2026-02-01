@@ -25,22 +25,18 @@ type Stat struct {
 // Bytes() and Read() are mutually exclusive per file. Calling one after
 // the other returns an error.
 type File struct {
-	dh   dirHandle
-	name nulTermName // NUL-terminated filename
-
-	path     nulTermPath // NUL-terminated full path
-	st       Stat
-	statDone bool
-
-	fh     *fileHandle
-	fhOpen *bool
-
+	dh        dirHandle
+	name      nulTermName
+	path      nulTermPath
+	st        Stat
+	statDone  bool
+	fh        *fileHandle
+	fhOpen    *bool
 	dataBuf   *[]byte // temporary read buffer (reused across files)
 	dataArena *[]byte // append-only arena for Bytes() results
-
-	mode    fileMode
-	openErr error
-	statErr error
+	mode      fileMode
+	openErr   error
+	statErr   error
 }
 
 // AbsPathBorrowed returns the absolute file path (without the trailing NUL).
