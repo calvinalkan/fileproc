@@ -326,6 +326,13 @@ func (p processor[T]) process(ctx context.Context, root nulTermPath) ([]*T, []er
 					scanQueueClosed = true
 				}
 
+			case <-ctx.Done():
+				if !scanQueueClosed {
+					close(scanQueue)
+				}
+
+				return
+
 			case jobCh <- next:
 				// Drop refs to popped dir to avoid retaining large trees in memory.
 				queue[0] = dirJob{}
@@ -362,6 +369,9 @@ func (p processor[T]) process(ctx context.Context, root nulTermPath) ([]*T, []er
 
 			for dirJob := range scanQueue {
 				if ctx.Err() != nil {
+					// Ensure coordinator can drain pending work on cancel.
+					sendScanEvent(scanEvent{done: true})
+
 					break
 				}
 
@@ -617,10 +627,14 @@ func (p processor[T]) processChunk(
 		if fnErr != nil {
 			if errors.Is(fnErr, errSkipFile) {
 				// Skip races (file became dir/symlink) without surfacing error.
-				if fhOpen {
-					_ = openFH.closeHandle()
-					fhOpen = false
-				}
+				closeIfOpen()
+
+				continue
+			}
+
+			if errors.Is(fnErr, ErrSkip) {
+				// User explicitly requested skip.
+				closeIfOpen()
 
 				continue
 			}
@@ -637,9 +651,20 @@ func (p processor[T]) processChunk(
 
 		closeIfOpen()
 
-		if val != nil {
-			*results = append(*results, val)
+		if val == nil {
+			// nil result without ErrSkip is a programming error.
+			procErr := &ProcessError{
+				Path: dirLease.base.joinNameString(entry),
+				Err:  errors.New("callback returned nil result without ErrSkip"),
+			}
+			if p.errNotify.callbackErr(procErr) {
+				*errs = append(*errs, procErr)
+			}
+
+			continue
 		}
+
+		*results = append(*results, val)
 	}
 }
 

@@ -11,6 +11,10 @@ import (
 	"strings"
 )
 
+// ErrSkip signals that the callback wants to skip this file without error.
+// Modeled after filepath.SkipDir.
+var ErrSkip = errors.New("skip")
+
 // Process scans a directory and invokes fn for each matching regular file.
 //
 // By default, only the specified directory is scanned. Use [WithRecursive] to
@@ -171,10 +175,11 @@ func Process[T any](ctx context.Context, path string, fn ProcessFunc[T], opts ..
 //
 // Return values:
 //   - (*T, nil): emit the result
-//   - (nil, nil): skip this file silently
-//   - (_, error): skip and report the error as a [ProcessError], except for
-//     internal skip errors returned by [File] methods (for example when a file
-//     becomes a directory or symlink), which are silently ignored
+//   - (_, ErrSkip): skip this file silently
+//   - (nil, nil): treated as error (use ErrSkip to skip intentionally)
+//   - (_, error): report as a [ProcessError], except for internal skip errors
+//     returned by [File] methods (for example when a file becomes a directory
+//     or symlink), which are silently ignored
 //
 // Whether [ProcessError]s (and [IOError]s) are included in the returned error
 // slice depends on [WithOnError]. If OnError is nil, all errors are collected.

@@ -1510,12 +1510,21 @@ func Test_File_Read_And_Bytes_Return_Error_When_Called_In_Different_Order(t *tes
 			name: "BytesThenRead",
 			first: func(f *fileproc.File) error {
 				_, err := f.Bytes()
-				return err
+				if err != nil {
+					return fmt.Errorf("bytes: %w", err)
+				}
+
+				return nil
 			},
 			second: func(f *fileproc.File) error {
-				buf := make([]byte, 4)
-				_, err := f.Read(buf)
-				return err
+				var buf [4]byte
+
+				_, err := f.Read(buf[:])
+				if err != nil {
+					return fmt.Errorf("read: %w", err)
+				}
+
+				return nil
 			},
 			wantFirst:  false,
 			wantSecond: true,
@@ -1523,13 +1532,22 @@ func Test_File_Read_And_Bytes_Return_Error_When_Called_In_Different_Order(t *tes
 		{
 			name: "ReadThenBytes",
 			first: func(f *fileproc.File) error {
-				buf := make([]byte, 4)
-				_, err := f.Read(buf)
-				return err
+				var buf [4]byte
+
+				_, err := f.Read(buf[:])
+				if err != nil {
+					return fmt.Errorf("read: %w", err)
+				}
+
+				return nil
 			},
 			second: func(f *fileproc.File) error {
 				_, err := f.Bytes()
-				return err
+				if err != nil {
+					return fmt.Errorf("bytes: %w", err)
+				}
+
+				return nil
 			},
 			wantFirst:  false,
 			wantSecond: true,
@@ -1537,17 +1555,21 @@ func Test_File_Read_And_Bytes_Return_Error_When_Called_In_Different_Order(t *tes
 	}
 
 	for _, tc := range cases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
 			results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, _ *fileproc.FileWorker) (*struct{}, error) {
 				firstErr := tc.first(f)
+
 				secondErr := tc.second(f)
 				if (firstErr != nil) != tc.wantFirst {
-					return nil, fmt.Errorf("first call error=%v", firstErr)
+					return nil, fmt.Errorf("first call error=%w", firstErr)
 				}
+
 				if (secondErr != nil) != tc.wantSecond {
-					return nil, fmt.Errorf("second call error=%v", secondErr)
+					return nil, fmt.Errorf("second call error=%w", secondErr)
 				}
+
 				return &struct{}{}, nil
 			}, opts...)
 

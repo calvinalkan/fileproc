@@ -66,7 +66,7 @@ func writeFlatFiles(
 
 	paths := make([]string, 0, n)
 
-	for i := 0; i < n; i++ {
+	for i := range n {
 		rel := pathFn(i)
 		if rel == "" {
 			continue
@@ -91,13 +91,11 @@ func writeNestedFiles(
 	filesPerDir int,
 	pathFn func(dir, file int) string,
 	contentFn func(dir, file int) []byte,
-) []string {
+) {
 	t.Helper()
 
-	paths := make([]string, 0, dirs*filesPerDir)
-
-	for dir := 0; dir < dirs; dir++ {
-		for file := 0; file < filesPerDir; file++ {
+	for dir := range dirs {
+		for file := range filesPerDir {
 			rel := pathFn(dir, file)
 			if rel == "" {
 				continue
@@ -109,11 +107,8 @@ func writeNestedFiles(
 			}
 
 			writeFile(t, root, rel, data)
-			paths = append(paths, filepath.Join(root, rel))
 		}
 	}
-
-	return paths
 }
 
 func writeSymlink(t *testing.T, root, targetRel, linkRel string) {
@@ -138,7 +133,8 @@ func writeSymlink(t *testing.T, root, targetRel, linkRel string) {
 func makeUnreadable(t *testing.T, path string) {
 	t.Helper()
 
-	if err := os.Chmod(path, 0); err != nil {
+	err := os.Chmod(path, 0)
+	if err != nil {
 		t.Fatalf("chmod: %v", err)
 	}
 }

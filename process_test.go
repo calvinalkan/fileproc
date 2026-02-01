@@ -379,8 +379,9 @@ func Test_Process_Returns_No_Results_When_No_Work(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
 			ctx, root := tt.setup(t)
 			count := 0
 
@@ -433,7 +434,7 @@ func Test_Process_Propagates_Panic_When_Callback_Panics(t *testing.T) {
 	}
 }
 
-func Test_Process_Skips_Result_When_Callback_Returns_Nil(t *testing.T) {
+func Test_Process_Skips_Result_When_Callback_Returns_ErrSkip(t *testing.T) {
 	t.Parallel()
 
 	root := t.TempDir()
@@ -444,9 +445,7 @@ func Test_Process_Skips_Result_When_Callback_Returns_Nil(t *testing.T) {
 	results, errs := fileproc.Process(t.Context(), root, func(_ *fileproc.File, _ *fileproc.FileWorker) (*struct{}, error) {
 		count++
 
-		var result *struct{}
-
-		return result, nil
+		return nil, fileproc.ErrSkip
 	}, fileproc.WithFileWorkers(1))
 
 	if len(errs) != 0 {
@@ -757,6 +756,7 @@ func Test_Process_Reads_Content_When_Using_Concurrent_Workers(t *testing.T) {
 		content := fmt.Sprintf("data-%03d", i)
 		path := filepath.Join(root, fmt.Sprintf("f-%03d.txt", i))
 		wantData[path] = content
+
 		return []byte(content)
 	})
 
@@ -960,7 +960,7 @@ func Test_Process_Processes_All_Files_When_Using_Recursive_Concurrent_Workers(t 
 		}
 
 		return filepath.Join(fmt.Sprintf("d%02d", dir), "nested", "n.txt")
-	}, func(dir, file int) []byte {
+	}, func(_, file int) []byte {
 		if file == 0 {
 			return []byte("x")
 		}

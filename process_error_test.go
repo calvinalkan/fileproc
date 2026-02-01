@@ -69,7 +69,9 @@ func Test_Process_Returns_IOError_When_Root_Invalid(t *testing.T) {
 				writeFile(t, root, "target.txt", []byte("data"))
 
 				symPath := filepath.Join(root, "link.txt")
-				if err := os.Symlink(filepath.Join(root, "target.txt"), symPath); err != nil {
+
+				err := os.Symlink(filepath.Join(root, "target.txt"), symPath)
+				if err != nil {
 					t.Fatalf("symlink: %v", err)
 				}
 
@@ -79,8 +81,9 @@ func Test_Process_Returns_IOError_When_Root_Invalid(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
 			root := t.TempDir()
 			path, wantPath := tt.setup(t, root)
 
@@ -393,6 +396,7 @@ func Test_Process_Counts_Errors_Correctly_When_Mixed_IO_And_Process_Errors_Concu
 		switch {
 		case errors.As(err, &ioErr):
 			ioSeen = true
+
 			assertIOError(t, err, filepath.Join(root, "blocked"), openOp)
 		case errors.As(err, &procErr):
 			procSeen = true
@@ -548,5 +552,57 @@ func Test_Process_Drops_IOErrors_When_OnError_Returns_False(t *testing.T) {
 
 	if ioErrWrap == nil {
 		t.Fatal("expected wrapped errno in IOError")
+	}
+}
+
+func Test_Process_Skips_File_When_Callback_Returns_ErrSkip(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	writeFile(t, root, "keep.txt", []byte("keep"))
+	writeFile(t, root, "skip.txt", []byte("skip"))
+
+	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, _ *fileproc.FileWorker) (*string, error) {
+		path := string(f.AbsPathBorrowed())
+		if strings.HasSuffix(path, "skip.txt") {
+			return nil, fileproc.ErrSkip
+		}
+
+		return &path, nil
+	}, fileproc.WithFileWorkers(1))
+
+	if len(errs) != 0 {
+		t.Fatalf("expected no errors, got %v", errs)
+	}
+
+	assertStringSlicesEqual(t, resultPaths(results), []string{filepath.Join(root, "keep.txt")})
+}
+
+func Test_Process_Does_Not_Report_Error_When_Callback_Returns_ErrSkip(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	writeFile(t, root, "skip.txt", []byte("skip"))
+
+	onErrorCalled := false
+
+	results, errs := fileproc.Process(t.Context(), root, func(_ *fileproc.File, _ *fileproc.FileWorker) (*string, error) {
+		return nil, fileproc.ErrSkip
+	}, fileproc.WithOnError(func(_ error, _, _ int) bool {
+		onErrorCalled = true
+
+		return true
+	}))
+
+	if len(results) != 0 {
+		t.Fatalf("expected no results, got %d", len(results))
+	}
+
+	if len(errs) != 0 {
+		t.Fatalf("expected no errors, got %v", errs)
+	}
+
+	if onErrorCalled {
+		t.Fatal("OnError should not be called for ErrSkip")
 	}
 }

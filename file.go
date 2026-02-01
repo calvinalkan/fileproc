@@ -118,7 +118,7 @@ func (f *File) AbsPathBorrowed() []byte {
 //	    return nil, err
 //	}
 //	if st.Size == 0 {
-//	    return nil, nil
+//	    return nil, fileproc.ErrSkip
 //	}
 //	return &Result{Size: st.Size}, nil
 func (f *File) Stat() (Stat, error) {

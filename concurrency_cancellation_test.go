@@ -15,39 +15,6 @@ import (
 	"github.com/calvinalkan/fileproc"
 )
 
-func collectPtrs(t *testing.T, ch <-chan uintptr, want int, timeout time.Duration) map[uintptr]struct{} {
-	t.Helper()
-
-	ptrs := make(map[uintptr]struct{}, want)
-	deadline := time.Now().Add(timeout)
-
-	for len(ptrs) < want && time.Now().Before(deadline) {
-		select {
-		case p := <-ch:
-			ptrs[p] = struct{}{}
-		case <-time.After(5 * time.Millisecond):
-		}
-	}
-
-	return ptrs
-}
-
-func spinGosched(iterations int) {
-	for i := 0; i < iterations; i++ {
-		runtime.Gosched()
-	}
-}
-
-func waitForCount(timeout time.Duration, want int64, get func() int64) bool {
-	deadline := time.Now().Add(timeout)
-
-	for get() < want && time.Now().Before(deadline) {
-		runtime.Gosched()
-	}
-
-	return get() >= want
-}
-
 func Test_Concurrency_Multiple_Workers_Have_Independent_Arenas_When_Parallel(t *testing.T) {
 	t.Parallel()
 
@@ -235,6 +202,8 @@ func Test_Process_Does_Not_Share_DataBuffers_When_Using_Concurrent_Workers(t *te
 	t.Parallel()
 
 	t.Run("TreeWorkers", func(t *testing.T) {
+		t.Parallel()
+
 		root := t.TempDir()
 
 		// Create many directories so all workers can get a job.
@@ -304,11 +273,14 @@ func Test_Process_Does_Not_Share_DataBuffers_When_Using_Concurrent_Workers(t *te
 	})
 
 	t.Run("FileWorkers", func(t *testing.T) {
+		t.Parallel()
+
 		root := t.TempDir()
 
 		const workers = 4
 
 		pad := strings.Repeat("x", testNamePad)
+
 		writeFlatFiles(t, root, testNumFilesBig, func(i int) string {
 			return fmt.Sprintf("f-%04d-%s.txt", i, pad)
 		}, nil)
@@ -419,6 +391,7 @@ func Test_Process_Does_Not_Hang_When_Cancelled_With_Blocked_Callback(t *testing.
 	root := t.TempDir()
 
 	pad := strings.Repeat("x", testNamePad)
+
 	writeFlatFiles(t, root, testNumFilesMed, func(i int) string {
 		return fmt.Sprintf("f-%04d-%s.txt", i, pad)
 	}, nil)
@@ -578,6 +551,7 @@ func Test_Process_Does_Not_Hang_When_Cancelled_In_Recursive_Large_Directory(t *t
 	root := t.TempDir()
 
 	pad := strings.Repeat("x", testNamePad)
+
 	writeFlatFiles(t, root, testNumFilesMed, func(i int) string {
 		return filepath.Join("big", fmt.Sprintf("f-%04d-%s.txt", i, pad))
 	}, nil)
@@ -653,4 +627,92 @@ func Test_Process_Does_Not_Hang_When_Cancelled_In_Recursive_Large_Directory(t *t
 	if len(results) >= testNumFilesMed {
 		t.Fatalf("expected early stop, got %d results", len(results))
 	}
+}
+
+func Test_Process_Does_Not_Hang_When_Cancelled_With_Pending_Dirs(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	writeNestedFiles(t, root, testNumDirs, 1, func(dir, _ int) string {
+		return filepath.Join(fmt.Sprintf("d%03d", dir), "f.txt")
+	}, func(int, int) []byte { return []byte("x") })
+
+	ctx, cancel := context.WithCancelCause(t.Context())
+	t.Cleanup(func() { cancel(nil) })
+
+	stopErr := errors.New("stop")
+	boom := errors.New("boom")
+
+	var fired atomic.Int64
+
+	opts := []fileproc.Option{
+		fileproc.WithRecursive(),
+		fileproc.WithFileWorkers(1),
+		fileproc.WithScanWorkers(1),
+		fileproc.WithChunkSize(1),
+		fileproc.WithOnError(func(err error, _, _ int) bool {
+			if errors.Is(err, boom) || errors.Is(err, stopErr) {
+				cancel(stopErr)
+			}
+
+			return true
+		}),
+	}
+
+	done := make(chan struct{})
+
+	go func() {
+		_, _ = fileproc.Process(ctx, root, func(_ *fileproc.File, _ *fileproc.FileWorker) (*struct{}, error) {
+			if fired.CompareAndSwap(0, 1) {
+				return nil, boom
+			}
+
+			return &struct{}{}, nil
+		}, opts...)
+
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Process did not return after cancellation (possible deadlock with pending dirs)")
+	}
+
+	if !errors.Is(context.Cause(ctx), stopErr) {
+		t.Fatalf("unexpected cancellation cause: %v", context.Cause(ctx))
+	}
+}
+
+func collectPtrs(t *testing.T, ch <-chan uintptr, want int, timeout time.Duration) map[uintptr]struct{} {
+	t.Helper()
+
+	ptrs := make(map[uintptr]struct{}, want)
+	deadline := time.Now().Add(timeout)
+
+	for len(ptrs) < want && time.Now().Before(deadline) {
+		select {
+		case p := <-ch:
+			ptrs[p] = struct{}{}
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+
+	return ptrs
+}
+
+func spinGosched(iterations int) {
+	for range iterations {
+		runtime.Gosched()
+	}
+}
+
+func waitForCount(timeout time.Duration, want int64, get func() int64) bool {
+	deadline := time.Now().Add(timeout)
+
+	for get() < want && time.Now().Before(deadline) {
+		runtime.Gosched()
+	}
+
+	return get() >= want
 }
