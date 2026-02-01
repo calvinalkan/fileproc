@@ -375,24 +375,35 @@ var (
 	errSkipFile = errors.New("skip file")
 )
 
+// fileMode tracks which content access method has been used for a File.
+// It enforces the Bytes/Read exclusivity without extra flags.
 type fileMode uint8
 
+// Zero value means no content access yet.
 const (
-	fileModeNone fileMode = iota
-	fileModeBytes
+	// fileModeBytes indicates Bytes() was used.
+	fileModeBytes fileMode = iota + 1
+	// fileModeReader indicates Read() was used.
 	fileModeReader
 )
 
-// Internal stat classification used by stat-only processing.
+// statKind classifies stat results so callers can skip non-regular files
+// without extra syscalls or mode checks.
 type statKind uint8
 
 const (
+	// statKindReg indicates a regular file.
 	statKindReg statKind = iota
+	// statKindDir indicates a directory.
 	statKindDir
+	// statKindSymlink indicates a symlink.
 	statKindSymlink
+	// statKindOther indicates a non-regular, non-dir, non-symlink entry.
 	statKindOther
 )
 
+// lazyStat performs a single stat call and caches the result.
+// Non-regular files are mapped to errSkipFile so callers can ignore races.
 func (f *File) lazyStat() {
 	st, kind, err := f.dh.statFile(f.name)
 	f.statDone = true
@@ -416,6 +427,8 @@ func (f *File) lazyStat() {
 	f.st = st
 }
 
+// open lazily opens the file and caches the result.
+// Symlink/dir races are normalized to errSkipFile so callers can skip silently.
 func (f *File) open() error {
 	if f.fhOpen != nil && *f.fhOpen {
 		return nil // already open

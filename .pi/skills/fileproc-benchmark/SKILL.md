@@ -49,7 +49,48 @@ Benchmarks support three process modes via `--process`:
 | `read` | `f.Read(buf)` — read into worker buffer |
 | `stat` | `f.Stat()` — metadata only, no content read |
 
-## 4. Commands Reference
+## 4. Watcherbench (watcher)
+
+Benchmark tool for the `watcher` api in `fileproc`.
+
+Common runs:
+
+```bash
+# Scan throughput (recursive, all files)
+./cmd/watcherbench/watcherbench -dir .data/watcherbench/flat_100k -bench=scan -tree -suffix "" -scans 10 -warmup 2
+
+# Change detection: create 5k files per round
+./cmd/watcherbench/watcherbench -dir /tmp/wb -bench=changes -change-mode=create -change-count 5000 -change-rounds 3
+
+# Change detection: modify 1k existing files per round
+./cmd/watcherbench/watcherbench -dir /tmp/wb -bench=changes -change-mode=modify -change-count 1000 -change-rounds 5
+
+# Change detection: mixed churn
+./cmd/watcherbench/watcherbench -dir /tmp/wb -bench=changes -change-mode=mixed \
+  -change-count 3000 -change-mix-create 60 -change-mix-modify 20 -change-mix-delete 20
+
+# Channel mode + backpressure
+./cmd/watcherbench/watcherbench -dir /tmp/wb -bench=scan -mode=channel -event-buffer 0
+```
+
+Profiling + memory:
+
+```bash
+# CPU + heap + memstats samples
+./cmd/watcherbench/watcherbench -dir /tmp/wb -bench=scan -cpuprofile /tmp/wb.cpu.pprof \
+  -memprofile /tmp/wb.heap.pprof -memprofile-gc \
+  -memstats-interval 200ms -memstats-out /tmp/wb.mem.jsonl
+
+# Heap snapshot at measurement start (after warmup)
+./cmd/watcherbench/watcherbench -dir /tmp/wb -bench=scan -memprofile-start /tmp/wb.start.heap.pprof -memprofile-gc
+```
+
+Output:
+- default stdout = table (includes alloc_mib/s, mallocs/s)
+- `-out file.jsonl` for programmatic runs
+- more flags: `./cmd/watcherbench/watcherbench --help`
+
+## 5. Commands Reference
 
 | Task | Command |
 |------|---------|
@@ -68,7 +109,7 @@ Benchmarks support three process modes via `--process`:
 
 All paths are from project root.
 
-## 5. Regression Testing
+## 6. Regression Testing
 
 ```bash
 # Run full regression suite (1k, 5k, 100k, 1m datasets)
@@ -93,7 +134,7 @@ All paths are from project root.
 ./cmd/benchreport/benchreport compare --against baseline --n 5 --fail-above 5
 ```
 
-## 6. Profiling
+## 7. Profiling
 
 ```bash
 # CPU profile - where is time spent?
@@ -112,7 +153,7 @@ All paths are from project root.
 .pi/skills/fileproc-benchmark/scripts/bench_profile.sh --case flat_100k --all
 ```
 
-## 7. Parameter Sweeps
+## 8. Parameter Sweeps
 
 ```bash
 # Sweep worker counts across all cases
@@ -128,7 +169,7 @@ All paths are from project root.
 .pi/skills/fileproc-benchmark/scripts/bench_sweep.sh --case flat_100k --workers 4,8,16,24,32
 ```
 
-## 8. Managing Baseline
+## 9. Managing Baseline
 
 Update baseline after verified improvements:
 
@@ -147,7 +188,7 @@ git add .benchmarks/baseline.jsonl
 git commit -m "bench: update baseline after reducing allocations"
 ```
 
-## 9. File Locations
+## 10. File Locations
 
 | Path | Purpose |
 |------|---------|
@@ -159,7 +200,7 @@ git commit -m "bench: update baseline after reducing allocations"
 | `cmd/benchreport/` | Comparison tool |
 | `cmd/ticketgen/` | Data generator |
 
-## 10. Script Options
+## 11. Script Options
 
 ### bench_regress.sh
 

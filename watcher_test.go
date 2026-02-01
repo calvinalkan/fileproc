@@ -51,9 +51,99 @@ func Test_Watch_Silent_Baseline_When_Default(t *testing.T) {
 
 		// First tick runs baseline scan - should emit no events.
 		watcher.tick()
+
 		events := watcher.drain()
 		if len(events) != 0 {
 			t.Fatalf("expected no baseline events, got %d", len(events))
+		}
+	})
+}
+
+// =============================================================================
+// SCAN TIMING
+// =============================================================================
+
+func Test_Watch_Delays_Scan_When_MinIdle_Enabled(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		root := t.TempDir()
+		minIdle := testInterval * 12
+
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+
+		w, err := fileproc.NewWatcher(root,
+			fileproc.WithInterval(testInterval),
+			fileproc.WithMinIdle(minIdle),
+			fileproc.WithFileWorkers(1),
+			fileproc.WithScanWorkers(1),
+			fileproc.WithChunkSize(8),
+		)
+		if err != nil {
+			t.Fatalf("NewWatcher: %v", err)
+		}
+
+		ch := w.Events(ctx)
+
+		drain := func() []fileproc.Event {
+			var events []fileproc.Event
+
+			for {
+				select {
+				case ev, ok := <-ch:
+					if !ok {
+						return events
+					}
+
+					events = append(events, ev)
+				default:
+					return events
+				}
+			}
+		}
+
+		for range 6 {
+			time.Sleep(testInterval)
+			synctest.Wait()
+
+			if w.Stats().Scans > 0 {
+				break
+			}
+		}
+
+		if w.Stats().Scans != 1 {
+			t.Fatalf("expected baseline scan to complete once, got %d", w.Stats().Scans)
+		}
+
+		filePath := filepath.Join(root, "later.txt")
+		writeFile(t, root, "later.txt", []byte("later"))
+
+		time.Sleep(minIdle / 2)
+		synctest.Wait()
+
+		if len(drain()) != 0 {
+			t.Fatal("expected no events before min idle")
+		}
+
+		if w.Stats().Scans != 1 {
+			t.Fatalf("expected no scan before min idle, got %d", w.Stats().Scans)
+		}
+
+		time.Sleep(minIdle)
+		synctest.Wait()
+
+		events := drain()
+		if len(events) == 0 {
+			t.Fatal("expected event after min idle")
+		}
+
+		if events[0].Type != fileproc.Create || events[0].Path != filePath {
+			t.Fatalf("unexpected event %+v", events[0])
+		}
+
+		if w.Stats().Scans <= 1 {
+			t.Fatal("expected scan after min idle")
 		}
 	})
 }
@@ -142,9 +232,11 @@ func Test_Watch_Emits_Delete_When_File_Removed(t *testing.T) {
 			ev(fileproc.Create, filePath),
 		)
 
-		if err := os.Remove(filePath); err != nil {
+		err := os.Remove(filePath)
+		if err != nil {
 			t.Fatalf("remove: %v", err)
 		}
+
 		watcher.assertEvents(t,
 			ev(fileproc.Delete, filePath),
 		)
@@ -169,6 +261,7 @@ func Test_Watch_Emits_No_Event_When_File_Created_And_Deleted_Between_Scans(t *te
 
 		// Next scan should see nothing.
 		watcher.tick()
+
 		events := watcher.drain()
 		if len(events) != 0 {
 			t.Fatalf("expected no events for ephemeral file, got %d", len(events))
@@ -193,7 +286,8 @@ func Test_Watch_Emits_Delete_And_Create_When_File_Renamed(t *testing.T) {
 		watcher.assertEvent(t, ev(fileproc.Create, oldPath, mustStat(t, oldPath)))
 
 		// Rename the file.
-		if err := os.Rename(oldPath, newPath); err != nil {
+		err := os.Rename(oldPath, newPath)
+		if err != nil {
 			t.Fatalf("rename: %v", err)
 		}
 
@@ -274,9 +368,11 @@ func Test_Watch_Emits_Modify_When_File_Permissions_Change(t *testing.T) {
 			ev(fileproc.Create, filePath),
 		)
 
-		if err := os.Chmod(filePath, 0o400); err != nil {
+		err := os.Chmod(filePath, 0o400)
+		if err != nil {
 			t.Fatalf("chmod: %v", err)
 		}
+
 		watcher.assertEvents(t,
 			ev(fileproc.Modify, filePath),
 		)
@@ -327,7 +423,7 @@ func Test_Watch_Event_Stat_Matches_File_When_Modified(t *testing.T) {
 		writeFile(t, root, "file.txt", []byte("one"))
 		watcher.assertEvent(t, ev(fileproc.Create, filePath, mustStat(t, filePath)))
 
-		writeFile(t, root, "file.txt", []byte("two two"))
+		writeFile(t, root, "file.txt", []byte("two"))
 		watcher.assertEvent(t, ev(fileproc.Modify, filePath, mustStat(t, filePath)))
 	})
 }
@@ -440,9 +536,11 @@ func Test_Watch_Emits_Delete_When_File_In_Subdir_Removed(t *testing.T) {
 			ev(fileproc.Create, filePath),
 		)
 
-		if err := os.Remove(filePath); err != nil {
+		err := os.Remove(filePath)
+		if err != nil {
 			t.Fatalf("remove: %v", err)
 		}
+
 		watcher.assertEvents(t,
 			ev(fileproc.Delete, filePath),
 		)
@@ -492,9 +590,11 @@ func Test_Watch_Emits_Delete_When_Subdir_Removed(t *testing.T) {
 		)
 
 		// Remove entire subdir.
-		if err := os.RemoveAll(filepath.Join(root, "sub")); err != nil {
+		err := os.RemoveAll(filepath.Join(root, "sub"))
+		if err != nil {
 			t.Fatalf("removeall: %v", err)
 		}
+
 		watcher.assertEvents(t,
 			ev(fileproc.Delete, filepath.Join(root, "sub", "a.txt")),
 			ev(fileproc.Delete, filepath.Join(root, "sub", "b.txt")),
@@ -540,7 +640,9 @@ func Test_Watch_Skips_Symlink_To_Dir_When_Recursive(t *testing.T) {
 		// Create a symlink to another directory.
 		external := t.TempDir()
 		writeFile(t, external, "external.txt", []byte("external"))
-		if err := os.Symlink(external, filepath.Join(root, "linkdir")); err != nil {
+
+		err := os.Symlink(external, filepath.Join(root, "linkdir"))
+		if err != nil {
 			t.Fatalf("symlink: %v", err)
 		}
 
@@ -594,7 +696,9 @@ func Test_Watch_Emits_Delete_When_File_Becomes_Directory(t *testing.T) {
 
 		// Replace file with directory of same name.
 		os.Remove(path)
-		if err := os.Mkdir(path, 0o755); err != nil {
+
+		err := os.Mkdir(path, 0o755)
+		if err != nil {
 			t.Fatalf("mkdir: %v", err)
 		}
 
@@ -611,7 +715,9 @@ func Test_Watch_Emits_Create_When_Directory_Becomes_File(t *testing.T) {
 
 		// Start with a directory.
 		path := filepath.Join(root, "item")
-		if err := os.Mkdir(path, 0o755); err != nil {
+
+		err := os.Mkdir(path, 0o755)
+		if err != nil {
 			t.Fatalf("mkdir: %v", err)
 		}
 
@@ -684,8 +790,9 @@ func Test_Watch_Blocks_Scan_When_Event_Channel_Full(t *testing.T) {
 		writeFile(t, root, "a.txt", []byte("a"))
 		writeFile(t, root, "b.txt", []byte("b"))
 
-		ctx, cancel := context.WithCancel(context.Background())
+		ctx, cancel := context.WithCancel(t.Context())
 		events := make(chan fileproc.Event, 1)
+
 		w, err := fileproc.NewWatcher(
 			root,
 			fileproc.WithOnEvent(func(ev fileproc.Event) { events <- ev }),
@@ -700,15 +807,19 @@ func Test_Watch_Blocks_Scan_When_Event_Channel_Full(t *testing.T) {
 		}
 
 		done := make(chan struct{})
+
 		go func() {
 			w.Watch(ctx, nil)
 			close(done)
 		}()
+
 		defer func() {
 			cancel()
+
 			for range 5 {
 				time.Sleep(testInterval)
 				synctest.Wait()
+
 				select {
 				case <-done:
 					return
@@ -721,9 +832,11 @@ func Test_Watch_Blocks_Scan_When_Event_Channel_Full(t *testing.T) {
 		// First file event fills the buffer, second blocks the scan.
 		time.Sleep(testInterval * 2)
 		synctest.Wait()
+
 		if len(events) != 1 {
 			t.Fatalf("expected 1 buffered event, got %d", len(events))
 		}
+
 		if w.Stats().Scans != 0 {
 			t.Fatalf("expected scan to be blocked, scans=%d", w.Stats().Scans)
 		}
@@ -734,11 +847,13 @@ func Test_Watch_Blocks_Scan_When_Event_Channel_Full(t *testing.T) {
 		// Scan should complete now.
 		time.Sleep(testInterval * 2)
 		synctest.Wait()
+
 		if len(events) != 1 {
 			t.Fatalf("expected 1 buffered event, got %d", len(events))
 		}
+
 		if w.Stats().Scans == 0 {
-			t.Fatalf("expected scan to complete")
+			t.Fatal("expected scan to complete")
 		}
 	})
 }
@@ -750,7 +865,7 @@ func Test_Watch_Detects_Changes_Made_While_Blocked(t *testing.T) {
 		root := t.TempDir()
 		writeFile(t, root, "a.txt", []byte("a"))
 
-		ctx, cancel := context.WithCancel(context.Background())
+		ctx, cancel := context.WithCancel(t.Context())
 		events := make(chan fileproc.Event, 1) // Small buffer to cause blocking.
 
 		w, err := fileproc.NewWatcher(root,
@@ -766,15 +881,19 @@ func Test_Watch_Detects_Changes_Made_While_Blocked(t *testing.T) {
 		}
 
 		done := make(chan struct{})
+
 		go func() {
 			w.Watch(ctx, nil)
 			close(done)
 		}()
+
 		defer func() {
 			cancel()
+
 			for range 5 {
 				time.Sleep(testInterval)
 				synctest.Wait()
+
 				select {
 				case <-done:
 					return
@@ -787,6 +906,7 @@ func Test_Watch_Detects_Changes_Made_While_Blocked(t *testing.T) {
 		// Wait for baseline event to fill the buffer.
 		time.Sleep(testInterval * 2)
 		synctest.Wait()
+
 		if len(events) != 1 {
 			t.Fatalf("expected 1 buffered event, got %d", len(events))
 		}
@@ -808,10 +928,12 @@ func Test_Watch_Detects_Changes_Made_While_Blocked(t *testing.T) {
 		if len(events) != 1 {
 			t.Fatalf("expected 1 event for new file, got %d", len(events))
 		}
+
 		ev = <-events
 		if ev.Type != fileproc.Create {
 			t.Fatalf("expected Create for b.txt, got %v", ev.Type)
 		}
+
 		if !strings.HasSuffix(ev.Path, "b.txt") {
 			t.Fatalf("expected b.txt, got %s", ev.Path)
 		}
@@ -829,7 +951,7 @@ func Test_Events_Uses_Custom_Buffer_Size_When_WithEventBuffer(t *testing.T) {
 			writeFile(t, root, fmt.Sprintf("file%d.txt", i), []byte("x"))
 		}
 
-		ctx, cancel := context.WithCancel(context.Background())
+		ctx, cancel := context.WithCancel(t.Context())
 		defer cancel()
 
 		w, err := fileproc.NewWatcher(root,
@@ -851,17 +973,20 @@ func Test_Events_Uses_Custom_Buffer_Size_When_WithEventBuffer(t *testing.T) {
 
 		// With large buffer, all events should be buffered without blocking.
 		count := 0
+
 		for {
 			select {
 			case _, ok := <-ch:
 				if !ok {
 					t.Fatal("channel closed unexpectedly")
 				}
+
 				count++
 			default:
 				goto done
 			}
 		}
+
 	done:
 		if count != 10 {
 			t.Fatalf("expected 10 events, got %d", count)
@@ -882,7 +1007,8 @@ func Test_Watch_Calls_Callback_When_Using_Watch_Directly(t *testing.T) {
 		writeFile(t, root, "file.txt", []byte("content"))
 		wantStat := mustStat(t, filePath)
 
-		ctx, cancel := context.WithCancel(context.Background())
+		ctx, cancel := context.WithCancel(t.Context())
+
 		var received []fileproc.Event
 
 		w, err := fileproc.NewWatcher(root,
@@ -897,6 +1023,7 @@ func Test_Watch_Calls_Callback_When_Using_Watch_Directly(t *testing.T) {
 		}
 
 		done := make(chan struct{})
+
 		go func() {
 			w.Watch(ctx, func(ev fileproc.Event) {
 				received = append(received, ev)
@@ -914,13 +1041,16 @@ func Test_Watch_Calls_Callback_When_Using_Watch_Directly(t *testing.T) {
 		if len(received) != 1 {
 			t.Fatalf("expected 1 event, got %d", len(received))
 		}
+
 		ev := received[0]
 		if ev.Type != fileproc.Create {
 			t.Fatalf("expected Create, got %v", ev.Type)
 		}
+
 		if ev.Path != filePath {
 			t.Fatalf("expected path %q, got %q", filePath, ev.Path)
 		}
+
 		if ev.Stat != wantStat {
 			t.Fatalf("stat mismatch: got %+v, want %+v", ev.Stat, wantStat)
 		}
@@ -938,10 +1068,13 @@ func Test_Watch_Calls_Callback_Concurrently_When_Multiple_Workers(t *testing.T) 
 			writeFile(t, root, fmt.Sprintf("file%d.txt", i), []byte("content"))
 		}
 
-		ctx, cancel := context.WithCancel(context.Background())
-		var maxConcurrent atomic.Int32
-		var current atomic.Int32
-		var total atomic.Int32
+		ctx, cancel := context.WithCancel(t.Context())
+
+		var (
+			maxConcurrent atomic.Int32
+			current       atomic.Int32
+			total         atomic.Int32
+		)
 
 		w, err := fileproc.NewWatcher(root,
 			fileproc.WithInterval(testInterval),
@@ -955,15 +1088,18 @@ func Test_Watch_Calls_Callback_Concurrently_When_Multiple_Workers(t *testing.T) 
 		}
 
 		done := make(chan struct{})
+
 		go func() {
-			w.Watch(ctx, func(ev fileproc.Event) {
+			w.Watch(ctx, func(_ fileproc.Event) {
 				c := current.Add(1)
+
 				for {
-					max := maxConcurrent.Load()
-					if c <= max || maxConcurrent.CompareAndSwap(max, c) {
+					prevMax := maxConcurrent.Load()
+					if c <= prevMax || maxConcurrent.CompareAndSwap(prevMax, c) {
 						break
 					}
 				}
+
 				time.Sleep(time.Millisecond) // Hold to allow overlap.
 				current.Add(-1)
 				total.Add(1)
@@ -1034,18 +1170,24 @@ func Test_Watch_Calls_OnError_When_Directory_Unreadable(t *testing.T) {
 
 	synctest.Test(t, func(t *testing.T) {
 		root := t.TempDir()
+
 		subdir := filepath.Join(root, "unreadable")
-		if err := os.Mkdir(subdir, 0o755); err != nil {
+
+		err := os.Mkdir(subdir, 0o755)
+		if err != nil {
 			t.Fatalf("mkdir: %v", err)
 		}
+
 		writeFile(t, subdir, "file.txt", []byte("content"))
 
 		var errorCount atomic.Int32
-		ctx, cancel := context.WithCancel(context.Background())
+
+		ctx, cancel := context.WithCancel(t.Context())
 
 		w, err := fileproc.NewWatcher(subdir,
-			fileproc.WithOnError(func(err error, ioErrs, procErrs int) bool {
+			fileproc.WithOnError(func(_ error, _ int, _ int) bool {
 				errorCount.Add(1)
+
 				return true
 			}),
 			fileproc.WithInterval(testInterval),
@@ -1058,6 +1200,7 @@ func Test_Watch_Calls_OnError_When_Directory_Unreadable(t *testing.T) {
 		}
 
 		done := make(chan struct{})
+
 		go func() {
 			w.Watch(ctx, nil)
 			close(done)
@@ -1068,7 +1211,8 @@ func Test_Watch_Calls_OnError_When_Directory_Unreadable(t *testing.T) {
 		synctest.Wait()
 
 		// Make directory unreadable.
-		if err := os.Chmod(subdir, 0o000); err != nil {
+		err = os.Chmod(subdir, 0o000)
+		if err != nil {
 			t.Fatalf("chmod: %v", err)
 		}
 		defer os.Chmod(subdir, 0o755)
@@ -1100,10 +1244,11 @@ func Test_Watch_Stats_Accurate_When_Processing_Files(t *testing.T) {
 		writeFile(t, root, "a.txt", []byte("a"))
 		writeFile(t, root, "b.txt", []byte("b"))
 
-		ctx, cancel := context.WithCancel(context.Background())
+		ctx, cancel := context.WithCancel(t.Context())
+
 		w, err := fileproc.NewWatcher(
 			root,
-			fileproc.WithOnEvent(func(ev fileproc.Event) {}),
+			fileproc.WithOnEvent(func(_ fileproc.Event) {}),
 			fileproc.WithInterval(testInterval),
 			fileproc.WithFileWorkers(1),
 			fileproc.WithScanWorkers(1),
@@ -1115,10 +1260,12 @@ func Test_Watch_Stats_Accurate_When_Processing_Files(t *testing.T) {
 		}
 
 		done := make(chan struct{})
+
 		go func() {
 			w.Watch(ctx, nil)
 			close(done)
 		}()
+
 		defer func() {
 			cancel()
 			time.Sleep(testInterval)
@@ -1133,37 +1280,43 @@ func Test_Watch_Stats_Accurate_When_Processing_Files(t *testing.T) {
 		if stats.Scans < 1 {
 			t.Fatalf("expected at least 1 scan, got %d", stats.Scans)
 		}
+
 		if stats.Creates != 2 {
 			t.Fatalf("expected 2 creates, got %d", stats.Creates)
 		}
+
 		if stats.FilesSeen < 2 {
 			t.Fatalf("expected at least 2 files seen, got %d", stats.FilesSeen)
 		}
 
 		// Modify one file.
 		prevScans := stats.Scans
+
 		writeFile(t, root, "a.txt", []byte("modified"))
 		time.Sleep(testInterval * 2)
 		synctest.Wait()
 
 		stats = w.Stats()
 		if stats.Scans <= prevScans {
-			t.Fatalf("expected more scans after modify")
+			t.Fatal("expected more scans after modify")
 		}
+
 		if stats.Modifies != 1 {
 			t.Fatalf("expected 1 modify, got %d", stats.Modifies)
 		}
 
 		// Delete one file.
 		prevScans = stats.Scans
+
 		os.Remove(filepath.Join(root, "b.txt"))
 		time.Sleep(testInterval * 2)
 		synctest.Wait()
 
 		stats = w.Stats()
 		if stats.Scans <= prevScans {
-			t.Fatalf("expected more scans after delete")
+			t.Fatal("expected more scans after delete")
 		}
+
 		if stats.Deletes != 1 {
 			t.Fatalf("expected 1 delete, got %d", stats.Deletes)
 		}
@@ -1183,7 +1336,8 @@ type testWatcher struct {
 func newTestWatcher(t *testing.T, root string, opts ...fileproc.Option) *testWatcher {
 	t.Helper()
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
+
 	opts = append([]fileproc.Option{
 		fileproc.WithInterval(testInterval),
 		fileproc.WithFileWorkers(1),
@@ -1197,6 +1351,7 @@ func newTestWatcher(t *testing.T, root string, opts ...fileproc.Option) *testWat
 	}
 
 	ch := w.Events(ctx)
+
 	return &testWatcher{ch: ch, cancel: cancel}
 }
 
@@ -1217,6 +1372,8 @@ func (watcher *testWatcher) stop() {
 // alone won't advance time. We must explicitly sleep to move fake time forward,
 // allowing the watcher's interval timer to fire and trigger the next scan.
 func (watcher *testWatcher) tick() {
+	_ = watcher
+
 	time.Sleep(testInterval * 2)
 	synctest.Wait()
 }
@@ -1250,12 +1407,13 @@ func ev(typ fileproc.EventType, path string, stat ...fileproc.Stat) expectedEven
 	if len(stat) > 0 {
 		s = &stat[0]
 	}
+
 	return expectedEvent{path: path, typ: typ, stat: s}
 }
 
 // assertEvents collects events and verifies each event's path and type match
-// the expected values. Returns the collected events for further inspection.
-func (watcher *testWatcher) assertEvents(t *testing.T, expected ...expectedEvent) []fileproc.Event {
+// the expected values.
+func (watcher *testWatcher) assertEvents(t *testing.T, expected ...expectedEvent) {
 	t.Helper()
 
 	events := watcher.collect(t, len(expected))
@@ -1270,37 +1428,42 @@ func (watcher *testWatcher) assertEvents(t *testing.T, expected ...expectedEvent
 		if !ok {
 			t.Fatalf("unexpected event path %q", ev.Path)
 		}
+
 		if ev.Type != exp.typ {
 			t.Fatalf("event %q: got type %v, want %v", ev.Path, ev.Type, exp.typ)
 		}
+
 		if exp.stat != nil {
 			if exp.stat.Size != 0 && ev.Stat.Size != exp.stat.Size {
 				t.Fatalf("event %q: got size %d, want %d", ev.Path, ev.Stat.Size, exp.stat.Size)
 			}
+
 			if exp.stat.Mode != 0 && ev.Stat.Mode != exp.stat.Mode {
 				t.Fatalf("event %q: got mode %v, want %v", ev.Path, ev.Stat.Mode, exp.stat.Mode)
 			}
+
 			if exp.stat.ModTime != 0 && ev.Stat.ModTime != exp.stat.ModTime {
 				t.Fatalf("event %q: got modtime %d, want %d", ev.Path, ev.Stat.ModTime, exp.stat.ModTime)
 			}
+
 			if exp.stat.Inode != 0 && ev.Stat.Inode != exp.stat.Inode {
 				t.Fatalf("event %q: got inode %d, want %d", ev.Path, ev.Stat.Inode, exp.stat.Inode)
 			}
 		}
+
 		delete(want, ev.Path)
 	}
 
 	if len(want) != 0 {
 		t.Fatalf("missing events: %v", want)
 	}
-
-	return events
 }
 
 // assertEvent is a convenience wrapper for asserting a single event.
-func (watcher *testWatcher) assertEvent(t *testing.T, expected expectedEvent) fileproc.Event {
+func (watcher *testWatcher) assertEvent(t *testing.T, expected expectedEvent) {
 	t.Helper()
-	return watcher.assertEvents(t, expected)[0]
+
+	watcher.assertEvents(t, expected)
 }
 
 // assertClosed verifies the event channel closes after the watcher stops.
@@ -1315,6 +1478,7 @@ func (watcher *testWatcher) assertClosed(t *testing.T) {
 		if !ok {
 			return
 		}
+
 		t.Fatal("expected channel to be closed, got event")
 	default:
 		t.Fatal("expected channel to be closed")
@@ -1324,12 +1488,14 @@ func (watcher *testWatcher) assertClosed(t *testing.T) {
 // drain returns all currently buffered events without blocking.
 func (watcher *testWatcher) drain() []fileproc.Event {
 	var events []fileproc.Event
+
 	for {
 		select {
 		case ev, ok := <-watcher.ch:
 			if !ok {
 				return events
 			}
+
 			events = append(events, ev)
 		default:
 			return events

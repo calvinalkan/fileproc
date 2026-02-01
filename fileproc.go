@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"sync"
 )
 
 // ErrSkip signals that the callback wants to skip this file without error.
@@ -166,7 +167,7 @@ func Process[T any](ctx context.Context, path string, fn ProcessFunc[T], opts ..
 		return nil, []error{fmt.Errorf("invalid suffix: %w", errors.New("contains NUL byte"))}
 	}
 
-	proc := processor[T]{
+	proc := &processor[T]{
 		fn:          fn,
 		fileWorkers: cfg.Workers,
 		scanWorkers: cfg.ScanWorkers,
@@ -175,6 +176,7 @@ func Process[T any](ctx context.Context, path string, fn ProcessFunc[T], opts ..
 		recursive:   cfg.Recursive,
 		errNotify:   newErrNotifier(cfg.OnError),
 	}
+
 	rootPath := newNulTermPath(path)
 
 	return proc.process(ctx, rootPath)
@@ -292,4 +294,61 @@ func (e *ProcessError) Error() string {
 
 func (e *ProcessError) Unwrap() error {
 	return e.Err
+}
+
+// ============================================================================
+// Error notification
+// ============================================================================
+
+// errNotifier tracks error counts and calls OnError callback.
+// Zero value is valid (no-op). Safe for concurrent use.
+type errNotifier struct {
+	// mu serializes error count updates and handler execution.
+	mu sync.Mutex
+	// ioErrs counts IO errors observed so far.
+	ioErrs int
+	// callbackErrs counts callback errors observed so far.
+	callbackErrs int
+	// onError is the user-provided handler (serialized).
+	onError func(err error, ioErrs, callbackErrs int) bool
+}
+
+func newErrNotifier(onError func(err error, ioErrs, procErrs int) bool) *errNotifier {
+	if onError == nil {
+		return nil
+	}
+
+	return &errNotifier{onError: onError}
+}
+
+// ioErr increments IO error count and calls callback.
+// Returns true if error should be collected, false to discard.
+func (n *errNotifier) ioErr(err error) bool {
+	if n == nil || n.onError == nil {
+		return true
+	}
+
+	n.mu.Lock()
+	n.ioErrs++
+	ioCount, procCount := n.ioErrs, n.callbackErrs
+	collect := n.onError(err, ioCount, procCount)
+	n.mu.Unlock()
+
+	return collect
+}
+
+// callbackErr increments process error count and calls callback.
+// Returns true if error should be collected, false to discard.
+func (n *errNotifier) callbackErr(err error) bool {
+	if n == nil || n.onError == nil {
+		return true
+	}
+
+	n.mu.Lock()
+	n.callbackErrs++
+	ioCount, callbackCount := n.ioErrs, n.callbackErrs
+	collect := n.onError(err, ioCount, callbackCount)
+	n.mu.Unlock()
+
+	return collect
 }

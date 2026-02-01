@@ -55,126 +55,43 @@ import (
 	"sync/atomic"
 )
 
-// processor keeps per-call config so orchestration stays allocation-free.
-type processor[T any] struct {
-	// fn is the user callback; kept on the processor to avoid per-call captures.
-	fn ProcessFunc[T]
-	// fileWorkers bounds callback concurrency to avoid oversubscribing I/O/CPU.
-	fileWorkers int
-	// scanWorkers allows discovery to run ahead without flooding the system.
+// ============================================================================
+// SCAN PIPELINE
+// ============================================================================
+
+// scanPipeline orchestrates directory discovery and chunk scheduling.
+// It owns the coordinator goroutine, scan workers, and arena pool.
+// Chunk processing is delegated to a scanConsumer.
+type scanPipeline struct {
+	// scanWorkers controls concurrent directory readers.
 	scanWorkers int
-	// chunkSize controls parallelism granularity independent of readdir size.
+	// chunkSize controls entries per work unit.
 	chunkSize int
-	// suffix filters before enqueueing to avoid wasted work.
+	// suffix filters files before chunking.
 	suffix string
-	// recursive skips subdir enqueue when false to keep discovery cheap.
+	// recursive enables subdirectory discovery.
 	recursive bool
-	// errNotify serializes error reporting for deterministic counts.
+	// errNotify handles IO errors during scanning.
 	errNotify *errNotifier
+	// queueDepth controls backpressure (set by consumer).
+	queueDepth int
 }
 
-type reportSubdirFunc func(nulTermName)
+// consumeChunkFunc processes a chunk produced by scanPipeline.
+// Must call chunk.release() exactly once when done, even on error/cancel.
+type consumeChunkFunc func(chunk fileChunk)
 
-type dirJob struct {
-	// path stays NUL-terminated to avoid per-job string allocations.
-	path nulTermPath
-}
-
-type scanEvent struct {
-	// path carries newly discovered subdirs without creating a second channel.
-	path nulTermPath
-	// done lets the coordinator track pending work accurately.
-	done bool
-}
-
-type fileChunk struct {
-	// arena owns the backing storage so entries survive past readdir.
-	arena *pathArena
-	// start/end avoid copying slices per chunk.
-	start int
-	end   int
-	// lease keeps openat-safe handles alive while chunks are processed.
-	lease *dirLease
-}
-
-// dirLease keeps a directory handle alive while file chunks are processed.
-type dirLease struct {
-	// dh stays open so openat/statat can use names without full paths.
-	dh dirHandle
-	// base is used for error messages and AbsPathBorrowed.
-	base nulTermPath
-	// refs prevents premature close while chunks are in flight.
-	refs atomic.Int32
-}
-
-func (l *dirLease) dec() {
-	if l.refs.Add(-1) == 0 {
-		_ = l.dh.closeHandle()
-	}
-}
-
-// workerBufs is per-worker to eliminate per-file allocations in hot paths.
-type workerBufs struct {
-	// fileBytesBuf reuses a single read buffer to avoid per-file allocs.
-	fileBytesBuf []byte
-
-	// pathScratch avoids per-callback path allocations when needed.
-	pathScratch []byte
-
-	// file is reused to avoid per-file heap allocations.
-	file File
-
-	// worker is reused to preserve scratch/retain arenas across files.
-	worker FileWorker
-}
-
-type dirScan struct {
-	// path stays NUL-terminated to feed syscalls without allocs.
-	path nulTermPath
-	// handle stays open for openat/statat during processing.
-	handle dirHandle
-	// dirEntryBuf is reused to avoid per-read allocations on Linux.
-	dirEntryBuf []byte
-	// reportSubdir is optional to skip recursion overhead in non-recursive mode.
-	reportSubdir reportSubdirFunc
-}
-
-// Internal constants keep tuning knobs centralized.
-const (
-	// dirReadBufSize is the size of the directory-entry read buffer.
-	// On Linux it backs getdents64/ReadDirent parsing. On other platforms the
-	// backend ignores this buffer and uses os.File.ReadDir instead; the size
-	// is only used as a sizing heuristic for arena storage.
-	//
-	// Benchmarked 32/64/128/256KB on flat and nested dirs (1k–1m files):
-	// 32KB consistently fastest (~7-13% over 128KB), likely due to L1 cache.
-	dirReadBufSize = 32 * 1024
-
-	// maxWorkers caps scan/file worker counts to avoid excessive goroutine/memory overhead.
-	maxWorkers = 256
-
-	// defaultReadBufSize is the initial buffer size for file reads and
-	// buffer growth heuristics.
-	defaultReadBufSize = 512
-
-	// defaultChunkSize is the default number of entries per work unit.
-	//
-	// Benchmarked 16–512 on flat dirs (5k–1m files): optimal chunk size
-	// scales with file count (5k→64, 100k→128, 1m→512). 128 is a good
-	// middle ground: ~1% off optimal for 100k, ~3% for 1m.
-	defaultChunkSize = 128
-
-	// defaultQueueFactor controls file job queue depth as a multiple of file workers.
-	defaultQueueFactor = 4
-)
-
-func (p processor[T]) process(ctx context.Context, root nulTermPath) ([]*T, []error) {
+// run executes the pipeline: coordinator -> scan workers -> consumer.
+// Blocks until scanning completes or ctx is canceled.
+func (p *scanPipeline) run(ctx context.Context, root nulTermPath, consumeChunk consumeChunkFunc) []error {
 	if ctx.Err() != nil {
-		return nil, nil
+		return nil
 	}
 
-	// Bound backlog so memory stays predictable while still feeding workers.
-	queueDepth := max(p.fileWorkers*defaultQueueFactor, 16)
+	queueDepth := p.queueDepth
+	if queueDepth <= 0 {
+		queueDepth = 16
+	}
 
 	// Unbuffered keeps scheduling centralized in the coordinator.
 	// It prevents scan workers from running ahead without coordinator visibility.
@@ -184,29 +101,14 @@ func (p processor[T]) process(ctx context.Context, root nulTermPath) ([]*T, []er
 	// Size is small but enough to absorb bursts from multiple scanners.
 	scanEvents := make(chan scanEvent, p.scanWorkers*64)
 
-	// Backpressure here throttles scanning instead of unbounded arena growth.
-	// This keeps memory bounded while still allowing a steady backlog.
-	fileJobs := make(chan fileChunk, queueDepth)
-
 	// Covers buffered + in-flight chunks + scanner hold; +1 keeps producer moving.
-	arenaCount := queueDepth + p.fileWorkers + p.scanWorkers + 1
+	arenaCount := queueDepth + p.scanWorkers + 1
 	// Reuse arenas to avoid per-directory allocations.
 	pool := newArenaPool(arenaCount)
 
-	// Per-worker slices avoid hot-path locks during append.
-	workerResults := make([][]*T, 0, p.fileWorkers)
-
-	workerErrs := make([][]error, 0, p.fileWorkers)
-	for range p.fileWorkers {
-		workerResults = append(workerResults, nil)
-		workerErrs = append(workerErrs, nil)
-	}
-
 	// Per-scan-worker slices keep error collection lock-free.
 	scanErrs := make([][]error, 0, p.scanWorkers)
-	for range p.scanWorkers {
-		scanErrs = append(scanErrs, nil)
-	}
+	scanErrs = scanErrs[:p.scanWorkers]
 
 	// releaseChunk centralizes cleanup so every path returns leases and arenas.
 	// This avoids refcount leaks across success, cancellation, and error paths.
@@ -222,20 +124,6 @@ func (p processor[T]) process(ctx context.Context, root nulTermPath) ([]*T, []er
 		// Only return the arena after the last chunk finishes.
 		if chunk.arena.pending.Add(-1) == 0 {
 			pool.put(chunk.arena)
-		}
-	}
-
-	// sendChunk hides enqueue + cancellation handling behind one callsite.
-	// If we can't enqueue, we immediately release ownership to prevent leaks.
-	sendChunk := func(chunk fileChunk) bool {
-		select {
-		case fileJobs <- chunk:
-			return true
-		case <-ctx.Done():
-			// If we can't enqueue, release immediately to avoid leaks.
-			releaseChunk(chunk)
-
-			return false
 		}
 	}
 
@@ -349,14 +237,14 @@ func (p processor[T]) process(ctx context.Context, root nulTermPath) ([]*T, []er
 	// SCAN WORKER POOL: DIRECTORY DISCOVERY
 	// ============================================================================
 	//
-	// Each worker scans one directory at a time, producing chunks into fileJobs.
+	// Each worker scans one directory at a time, producing chunks for the consumer.
 	// Subdirectories are reported back to the coordinator via scanEvents.
 	// Workers own their buffers to avoid contention and keep readdir hot.
 	var scanWG sync.WaitGroup
 	scanWG.Add(p.scanWorkers)
 
 	// Scan workers run one directory at a time to keep readdir + openat scoped.
-	// They publish chunks to fileJobs and subdir events to the coordinator.
+	// They push chunks to the consumer and subdir events to the coordinator.
 	for scanID := range p.scanWorkers {
 		go func(id int) {
 			defer scanWG.Done()
@@ -378,7 +266,7 @@ func (p processor[T]) process(ctx context.Context, root nulTermPath) ([]*T, []er
 				dh, err := openDir(dirJob.path)
 				if err != nil {
 					ioErr := &IOError{Path: dirJob.path.String(), Op: "open", Err: err}
-					if p.errNotify.ioErr(ioErr) {
+					if p.errNotify == nil || p.errNotify.ioErr(ioErr) {
 						localErrs = append(localErrs, ioErr)
 					}
 					// Always signal done to keep pending counts accurate.
@@ -388,8 +276,8 @@ func (p processor[T]) process(ctx context.Context, root nulTermPath) ([]*T, []er
 				}
 
 				// Hold the dir open so openat remains valid for all chunks.
-				dirLease := &dirLease{dh: dh, base: dirJob.path}
-				dirLease.refs.Store(1)
+				lease := &dirLease{dh: dh, base: dirJob.path, baseHash: hashBase(dirJob.path)}
+				lease.refs.Store(1)
 
 				// no-op unless recursive.
 				reportSubdir := reportSubdirFunc(nil)
@@ -408,19 +296,9 @@ func (p processor[T]) process(ctx context.Context, root nulTermPath) ([]*T, []er
 						break
 					}
 
-					scan := dirScan{
-						path:         dirJob.path,
-						handle:       dh,
-						dirEntryBuf:  dirBuf[:cap(dirBuf)],
-						reportSubdir: reportSubdir,
-					}
-					buf := scan.dirEntryBuf
-					// readDirBatch expects a full-length buffer, not just capacity.
-					if cap(buf) != len(buf) {
-						buf = buf[:cap(buf)]
-					}
+					buf := dirBuf[:cap(dirBuf)]
 
-					err := readDirBatch(scan.handle, scan.path, buf, p.suffix, arena, scan.reportSubdir)
+					err := readDirBatch(dh, dirJob.path, buf, p.suffix, arena, reportSubdir)
 
 					empty := len(arena.entries) == 0
 					if empty {
@@ -431,21 +309,31 @@ func (p processor[T]) process(ctx context.Context, root nulTermPath) ([]*T, []er
 						// +1 holds the arena until the scan worker finishes dispatching.
 						arena.pending.Store(chunkCount + 1)
 						// Keep the dir handle alive until all chunks finish.
-						dirLease.refs.Add(chunkCount)
+						lease.refs.Add(chunkCount)
 
 						sentAll := true
 
 						for start := 0; start < len(arena.entries); start += p.chunkSize {
 							end := min(start+p.chunkSize, len(arena.entries))
 
-							chunk := fileChunk{arena: arena, start: start, end: end, lease: dirLease}
-							if !sendChunk(chunk) {
-								sentAll = false
-								// We couldn't enqueue; release remaining chunk refs now.
-								for rest := start + p.chunkSize; rest < len(arena.entries); rest += p.chunkSize {
-									releaseChunk(fileChunk{arena: arena, start: rest, end: min(rest+p.chunkSize, len(arena.entries)), lease: dirLease})
-								}
+							chunk := fileChunk{arena: arena, start: start, end: end, lease: lease}
 
+							// Push to consumer; may block if consumer is slow (backpressure).
+							select {
+							case <-ctx.Done():
+								sentAll = false
+								// We couldn't deliver; release this and remaining chunk refs now.
+								releaseChunk(chunk)
+
+								for rest := start + p.chunkSize; rest < len(arena.entries); rest += p.chunkSize {
+									releaseChunk(fileChunk{arena: arena, start: rest, end: min(rest+p.chunkSize, len(arena.entries)), lease: lease})
+								}
+							default:
+								chunk.release = func() { releaseChunk(chunk) }
+								consumeChunk(chunk)
+							}
+
+							if !sentAll {
 								break
 							}
 						}
@@ -468,7 +356,7 @@ func (p processor[T]) process(ctx context.Context, root nulTermPath) ([]*T, []er
 						}
 
 						ioErr := &IOError{Path: dirJob.path.String(), Op: "readdir", Err: err}
-						if p.errNotify.ioErr(ioErr) {
+						if p.errNotify == nil || p.errNotify.ioErr(ioErr) {
 							localErrs = append(localErrs, ioErr)
 						}
 
@@ -482,13 +370,173 @@ func (p processor[T]) process(ctx context.Context, root nulTermPath) ([]*T, []er
 				}
 
 				// Drop the scanner's lease; chunks keep it alive if needed.
-				dirLease.dec()
+				lease.dec()
 				sendScanEvent(scanEvent{done: true})
 			}
 
 			scanErrs[id] = localErrs
 		}(scanID)
 	}
+
+	// ============================================================================
+	// SHUTDOWN
+	// ============================================================================
+	//
+	// Shutdown flow (dependency chain):
+	//   coordWG ──> close(scanQueue) ──> scanWG
+	//
+	// The coordinator is the only sender on scanQueue, so we wait for it first.
+	// Scanners exit after scanQueue closes; caller handles fileJobs cleanup.
+	coordWG.Wait()
+	scanWG.Wait()
+
+	// Merge scan errors.
+	totalErrs := 0
+	for i := range p.scanWorkers {
+		totalErrs += len(scanErrs[i])
+	}
+
+	allErrs := make([]error, 0, totalErrs)
+	for i := range p.scanWorkers {
+		allErrs = append(allErrs, scanErrs[i]...)
+	}
+
+	return allErrs
+}
+
+// Internal constants keep tuning knobs centralized.
+const (
+	// dirReadBufSize is the size of the directory-entry read buffer.
+	// On Linux it backs getdents64/ReadDirent parsing. On other platforms the
+	// backend ignores this buffer and uses os.File.ReadDir instead; the size
+	// is only used as a sizing heuristic for arena storage.
+	//
+	// Benchmarked 32/64/128/256KB on flat and nested dirs (1k–1m files):
+	// 32KB consistently fastest (~7-13% over 128KB), likely due to L1 cache.
+	dirReadBufSize = 32 * 1024
+
+	// maxWorkers caps scan/file worker counts to avoid excessive goroutine/memory overhead.
+	maxWorkers = 256
+
+	// defaultReadBufSize is the initial buffer size for file reads and
+	// buffer growth heuristics.
+	defaultReadBufSize = 512
+
+	// defaultChunkSize is the default number of entries per work unit.
+	//
+	// Benchmarked 16–512 on flat dirs (5k–1m files): optimal chunk size
+	// scales with file count (5k→64, 100k→128, 1m→512). 128 is a good
+	// middle ground: ~1% off optimal for 100k, ~3% for 1m.
+	defaultChunkSize = 128
+
+	// defaultQueueFactor controls file job queue depth as a multiple of file workers.
+	defaultQueueFactor = 4
+)
+
+// reportSubdirFunc emits a discovered subdirectory name.
+// It is a no-op when recursion is disabled to avoid per-entry branching.
+type reportSubdirFunc func(nulTermName)
+
+// dirJob represents a directory queued for scanning.
+type dirJob struct {
+	// path stays NUL-terminated to avoid per-job string allocations.
+	path nulTermPath
+}
+
+// scanEvent reports subdirectory discovery or completion to the coordinator.
+type scanEvent struct {
+	// path carries newly discovered subdirs without creating a second channel.
+	path nulTermPath
+	// done lets the coordinator track pending work accurately.
+	done bool
+}
+
+// fileChunk is a slice of entries backed by a shared arena.
+// It carries a lease so openat/statat remain valid while processing.
+type fileChunk struct {
+	// arena owns the backing storage so entries survive past readdir.
+	arena *pathArena
+	// start/end avoid copying slices per chunk.
+	start int
+	end   int
+	// lease keeps openat-safe handles alive while chunks are processed.
+	lease *dirLease
+	// release returns arena/lease refs; set by consumer when enqueueing.
+	release func()
+}
+
+// dirLease keeps a directory handle alive while file chunks are processed.
+type dirLease struct {
+	// dh stays open so openat/statat can use names without full paths.
+	dh dirHandle
+	// base is used for error messages and AbsPathBorrowed.
+	base nulTermPath
+	// baseHash is the precomputed hash for base (+sep) for watcher scans.
+	baseHash uint64
+	// refs prevents premature close while chunks are in flight.
+	refs atomic.Int32
+}
+
+// dec releases a lease reference and closes the handle when the last chunk completes.
+func (l *dirLease) dec() {
+	// Close only when last in-flight chunk releases the lease.
+	if l.refs.Add(-1) == 0 {
+		_ = l.dh.closeHandle()
+	}
+}
+
+// ============================================================================
+// PROCESSOR
+// ============================================================================
+
+// processor keeps per-call config so orchestration stays allocation-free.
+type processor[T any] struct {
+	// fn is the user callback; kept on the processor to avoid per-call captures.
+	fn ProcessFunc[T]
+	// fileWorkers bounds callback concurrency to avoid oversubscribing I/O/CPU.
+	fileWorkers int
+	// scanWorkers allows discovery to run ahead without flooding the system.
+	scanWorkers int
+	// chunkSize controls parallelism granularity independent of readdir size.
+	chunkSize int
+	// suffix filters before enqueueing to avoid wasted work.
+	suffix string
+	// recursive skips subdir enqueue when false to keep discovery cheap.
+	recursive bool
+	// errNotify serializes error reporting for deterministic counts.
+	errNotify *errNotifier
+}
+
+// fileWorkerBufs is per-worker to eliminate per-file allocations in hot paths.
+type fileWorkerBufs struct {
+	// fileBytesBuf reuses a single read buffer to avoid per-file allocs.
+	fileBytesBuf []byte
+
+	// pathScratch avoids per-callback path allocations when needed.
+	pathScratch []byte
+
+	// file is reused to avoid per-file heap allocations.
+	file File
+
+	// worker is reused to preserve scratch/retain arenas across files.
+	// This is the public api for the callback, which is why we name it FileWorker.
+	worker FileWorker
+}
+
+// process runs the full scan + process pipeline and merges worker-local results.
+// Worker-local buffers avoid contention on hot paths; merging happens once.
+func (p *processor[T]) process(ctx context.Context, root nulTermPath) ([]*T, []error) {
+	if ctx.Err() != nil {
+		return nil, nil
+	}
+
+	// Bound backlog so memory stays predictable while still feeding workers.
+	queueDepth := max(p.fileWorkers*defaultQueueFactor, 16)
+	fileJobs := make(chan fileChunk, queueDepth)
+	results := make([][]*T, 0, p.fileWorkers)
+	results = results[:p.fileWorkers]
+	errs := make([][]error, 0, p.fileWorkers)
+	errs = errs[:p.fileWorkers]
 
 	// ============================================================================
 	// FILE WORKER POOL: FILE PROCESSING
@@ -504,87 +552,86 @@ func (p processor[T]) process(ctx context.Context, root nulTermPath) ([]*T, []er
 		go func(id int) {
 			defer fileWG.Done()
 
-			bufs := &workerBufs{}
+			bufs := &fileWorkerBufs{}
 			localResults := make([]*T, 0, 64)
 			localErrs := make([]error, 0, 32)
 
 			for chunk := range fileJobs {
 				if ctx.Err() != nil {
 					// Drain to release arenas/leases after cancellation.
-					releaseChunk(chunk)
+					chunk.release()
 
 					continue
 				}
 
 				p.processChunk(ctx, chunk.lease, chunk.arena.entries[chunk.start:chunk.end], bufs, &localResults, &localErrs)
-				releaseChunk(chunk)
+				chunk.release()
 			}
 
-			workerResults[id] = localResults
-			workerErrs[id] = localErrs
+			results[id] = localResults
+			errs[id] = localErrs
 		}(workerID)
 	}
 
-	// ============================================================================
-	// SHUTDOWN AND MERGE
-	// ============================================================================
-	//
-	// Close fileJobs only after scanners exit so workers can drain safely.
-	// Then merge per-worker slices to avoid hot-path locks during processing.
-	//
-	// Shutdown flow (dependency chain):
-	//   coordWG ──> close(scanQueue) ──> scanWG ──> close(fileJobs) ──> fileWG
-	//
-	// The coordinator is the only sender on scanQueue, so we wait for it first.
-	// Scanners exit after scanQueue closes; only then can we close fileJobs so
-	// file workers drain and exit.
-	coordWG.Wait()
-	scanWG.Wait()
+	pipeline := &scanPipeline{
+		scanWorkers: p.scanWorkers,
+		chunkSize:   p.chunkSize,
+		suffix:      p.suffix,
+		recursive:   p.recursive,
+		errNotify:   p.errNotify,
+		queueDepth:  queueDepth + p.fileWorkers,
+	}
+
+	scanErrs := pipeline.run(ctx, root, func(chunk fileChunk) {
+		select {
+		case fileJobs <- chunk:
+		case <-ctx.Done():
+			chunk.release()
+		}
+	})
+
 	close(fileJobs)
 	fileWG.Wait()
 
 	// Single merge avoids per-append locking on hot paths.
 	totalResults := 0
 	for i := range p.fileWorkers {
-		totalResults += len(workerResults[i])
+		totalResults += len(results[i])
 	}
 
-	results := make([]*T, 0, totalResults)
+	merged := make([]*T, 0, totalResults)
 	for i := range p.fileWorkers {
-		results = append(results, workerResults[i]...)
+		merged = append(merged, results[i]...)
 	}
 
 	// Single merge avoids per-error locking on hot paths.
-	totalErrs := 0
+	totalErrs := len(scanErrs)
 	for i := range p.fileWorkers {
-		totalErrs += len(workerErrs[i])
-	}
-
-	for i := range p.scanWorkers {
-		totalErrs += len(scanErrs[i])
+		totalErrs += len(errs[i])
 	}
 
 	allErrs := make([]error, 0, totalErrs)
+
+	allErrs = append(allErrs, scanErrs...)
 	for i := range p.fileWorkers {
-		allErrs = append(allErrs, workerErrs[i]...)
+		allErrs = append(allErrs, errs[i]...)
 	}
 
-	for i := range p.scanWorkers {
-		allErrs = append(allErrs, scanErrs[i]...)
-	}
-
-	return results, allErrs
+	return merged, allErrs
 }
 
-func (p processor[T]) processChunk(
+// processChunk executes callbacks for a chunk of entries and applies
+// skip/error semantics consistently (ErrSkip vs internal races).
+func (p *processor[T]) processChunk(
 	ctx context.Context,
 	dirLease *dirLease,
 	entries []nulTermName,
-	bufs *workerBufs,
+	bufs *fileWorkerBufs,
 	results *[]*T,
 	errs *[]error,
 ) {
 	var (
+		// Reuse a single file handle per worker to avoid per-file allocations.
 		openFH fileHandle
 		fhOpen bool
 	)
@@ -666,61 +713,4 @@ func (p processor[T]) processChunk(
 
 		*results = append(*results, val)
 	}
-}
-
-// ============================================================================
-// Error notification
-// ============================================================================
-
-// errNotifier tracks error counts and calls OnError callback.
-// Zero value is valid (no-op). Safe for concurrent use.
-type errNotifier struct {
-	// mu serializes error count updates and handler execution.
-	mu sync.Mutex
-	// ioErrs counts IO errors observed so far.
-	ioErrs int
-	// callbackErrs counts callback errors observed so far.
-	callbackErrs int
-	// onError is the user-provided handler (serialized).
-	onError func(err error, ioErrs, callbackErrs int) bool
-}
-
-func newErrNotifier(onError func(err error, ioErrs, procErrs int) bool) *errNotifier {
-	if onError == nil {
-		return nil
-	}
-
-	return &errNotifier{onError: onError}
-}
-
-// ioErr increments IO error count and calls callback.
-// Returns true if error should be collected, false to discard.
-func (n *errNotifier) ioErr(err error) bool {
-	if n == nil || n.onError == nil {
-		return true
-	}
-
-	n.mu.Lock()
-	n.ioErrs++
-	ioCount, procCount := n.ioErrs, n.callbackErrs
-	collect := n.onError(err, ioCount, procCount)
-	n.mu.Unlock()
-
-	return collect
-}
-
-// callbackErr increments process error count and calls callback.
-// Returns true if error should be collected, false to discard.
-func (n *errNotifier) callbackErr(err error) bool {
-	if n == nil || n.onError == nil {
-		return true
-	}
-
-	n.mu.Lock()
-	n.callbackErrs++
-	ioCount, callbackCount := n.ioErrs, n.callbackErrs
-	collect := n.onError(err, ioCount, callbackCount)
-	n.mu.Unlock()
-
-	return collect
 }

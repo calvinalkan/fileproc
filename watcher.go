@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -37,6 +38,9 @@ type Event struct {
 	// Type is the kind of change (Create/Modify/Delete).
 	Type EventType
 	// Path is the absolute path for the file.
+	// It may reference internal watcher storage; retaining it can keep
+	// watcher memory alive even after the watcher stops. Use [WithOwnedPaths]
+	// to copy Event.Path per event.
 	Path string
 	// Stat is the file metadata captured at observation time.
 	// For Delete events, this is the last known metadata.
@@ -61,9 +65,9 @@ type Stats struct {
 	// Errors is the total number of IO/stat errors observed.
 	Errors uint64
 	// LastScanNs is the duration of the most recent scan in nanoseconds.
-	LastScanNs uint64
+	LastScanNs int64
 	// MaxScanNs is the longest scan duration observed in nanoseconds.
-	MaxScanNs uint64
+	MaxScanNs int64
 	// LastScanFiles is the file count observed in the most recent scan.
 	LastScanFiles uint64
 	// BehindCount counts scans that took longer than the interval.
@@ -149,18 +153,27 @@ type Stats struct {
 // The watcher maintains an in-memory index of all watched files. Memory
 // usage scales linearly with file count. Use [WithExpectedFiles] to
 // pre-allocate tables and reduce allocations during initial scan.
+// Event.Path strings are views into that internal storage; holding on to
+// them can retain watcher memory longer than expected. [WithOwnedPaths]
+// copies Event.Path and enables compaction after heavy delete churn.
 //
 // # Performance
 //
 // Set [WithInterval] based on your latency requirements and file count. If a scan takes longer
 // than the interval, the next scan starts immediately (no backlog).
 type Watcher struct {
-	root      nulTermPath
-	cfg       options
-	stats     atomicStats
-	index     watchIndex
+	// root is the NUL-terminated absolute root path for scanning.
+	root nulTermPath
+	// cfg holds normalized watcher options.
+	cfg options
+	// stats tracks cumulative counters (atomic snapshot).
+	stats atomicStats
+	// index is the persistent path index for create/modify/delete detection.
+	index watchIndex
+	// errNotify reports IO errors while scanning.
 	errNotify *errNotifier
-	gen       uint32
+	// gen is the scan generation counter used for delete sweeps.
+	gen uint32
 }
 
 // NewWatcher creates a new watcher for the given directory.
@@ -232,6 +245,7 @@ func (w *Watcher) Watch(ctx context.Context, fn func(Event)) {
 	if fn != nil {
 		w.cfg.OnEvent = fn
 	}
+
 	w.poll(ctx)
 }
 
@@ -265,11 +279,15 @@ func (w *Watcher) Events(ctx context.Context) <-chan Event {
 	}
 
 	ch := make(chan Event, buf)
+
 	var mu sync.Mutex
 
 	w.cfg.OnEvent = func(ev Event) {
+		// Serialize sends so only one goroutine can block on a full channel.
+		// This keeps backpressure bounded to a single sender.
 		mu.Lock()
 		defer mu.Unlock()
+
 		select {
 		case ch <- ev:
 		case <-ctx.Done():
@@ -284,7 +302,16 @@ func (w *Watcher) Events(ctx context.Context) <-chan Event {
 	return ch
 }
 
-// poll starts the watcher and blocks until ctx is canceled.
+// Stats returns a snapshot of watcher activity counters.
+//
+// Safe to call concurrently, including while the watcher is running.
+// All counters are cumulative since watcher creation.
+func (w *Watcher) Stats() Stats {
+	return w.stats.snapshot()
+}
+
+// poll starts the watcher loop and blocks until ctx is canceled.
+// Uses a reusable timer to avoid per-iteration allocations.
 func (w *Watcher) poll(ctx context.Context) {
 	if ctx.Err() != nil {
 		return
@@ -295,16 +322,20 @@ func (w *Watcher) poll(ctx context.Context) {
 		interval = defaultWatchInterval
 	}
 
-	for {
-		if ctx.Err() != nil {
-			break
-		}
+	minIdle := max(w.cfg.MinIdle, 0)
 
+	// Fire immediately for the first scan, then reuse the timer for periodic waits.
+	timer := time.NewTimer(0)
+	if !timer.Stop() {
+		<-timer.C
+	}
+
+	for ctx.Err() == nil {
 		w.gen++
 		gen := w.gen
 
 		start := time.Now()
-		summary, _ := w.scanOnce(ctx, gen)
+		summary := w.scanOnce(ctx, gen)
 		duration := time.Since(start)
 
 		w.updateStats(summary, duration, interval)
@@ -313,31 +344,28 @@ func (w *Watcher) poll(ctx context.Context) {
 			break
 		}
 
-		wait := interval - duration
-		if wait <= 0 {
+		// If we're behind schedule, skip waiting unless MinIdle enforces a pause.
+		wait := max(minIdle, max(interval-duration, 0))
+
+		if wait == 0 {
 			continue
 		}
 
-		timer := time.NewTimer(wait)
+		timer.Reset(wait)
+
 		select {
 		case <-ctx.Done():
 			timer.Stop()
+
 			return
 		case <-timer.C:
 		}
 	}
 }
 
-// Stats returns a snapshot of watcher activity counters.
-//
-// Safe to call concurrently, including while the watcher is running.
-// All counters are cumulative since watcher creation.
-func (w *Watcher) Stats() Stats {
-	return w.stats.snapshot()
-}
-
+// updateStats merges a scan summary into cumulative counters.
 func (w *Watcher) updateStats(summary scanSummary, duration time.Duration, interval time.Duration) {
-	ns := uint64(duration.Nanoseconds())
+	ns := duration.Nanoseconds()
 
 	w.stats.scans.Add(1)
 	w.stats.filesSeen.Add(summary.files)
@@ -354,6 +382,7 @@ func (w *Watcher) updateStats(summary scanSummary, duration time.Duration, inter
 		if ns <= cur {
 			break
 		}
+		// CAS keeps max updates lock-free under concurrent calls.
 		if w.stats.maxScanNs.CompareAndSwap(cur, ns) {
 			break
 		}
@@ -364,17 +393,26 @@ func (w *Watcher) updateStats(summary scanSummary, duration time.Duration, inter
 	}
 }
 
+// applyWatchOptions normalizes watcher-specific defaults and limits.
 func applyWatchOptions(opts []Option) options {
 	cfg := applyOptions(opts)
+	// Normalize defaults once to keep the hot path branch-light.
 	if cfg.Interval <= 0 {
 		cfg.Interval = defaultWatchInterval
 	}
+
+	if cfg.MinIdle < 0 {
+		cfg.MinIdle = 0
+	}
+
 	if cfg.EventBuffer <= 0 {
 		cfg.EventBuffer = defaultEventBuffer
 	}
+
 	if cfg.ExpectedFiles < 0 {
 		cfg.ExpectedFiles = 0
 	}
+
 	if cfg.WatchShards <= 0 {
 		cfg.WatchShards = max(min(cfg.Workers*2, 64), 1)
 	}
@@ -383,19 +421,31 @@ func applyWatchOptions(opts []Option) options {
 }
 
 type atomicStats struct {
-	scans         atomic.Uint64
-	filesSeen     atomic.Uint64
-	creates       atomic.Uint64
-	modifies      atomic.Uint64
-	deletes       atomic.Uint64
-	errors        atomic.Uint64
-	lastScanNs    atomic.Uint64
-	maxScanNs     atomic.Uint64
+	// scans is the total number of completed scans.
+	scans atomic.Uint64
+	// filesSeen is the total number of regular files observed.
+	filesSeen atomic.Uint64
+	// creates is the total number of create events emitted.
+	creates atomic.Uint64
+	// modifies is the total number of modify events emitted.
+	modifies atomic.Uint64
+	// deletes is the total number of delete events emitted.
+	deletes atomic.Uint64
+	// errors is the total number of scan errors observed.
+	errors atomic.Uint64
+	// lastScanNs is the duration of the most recent scan.
+	lastScanNs atomic.Int64
+	// maxScanNs is the longest scan duration observed.
+	maxScanNs atomic.Int64
+	// lastScanFiles is the file count of the most recent scan.
 	lastScanFiles atomic.Uint64
-	behindCount   atomic.Uint64
-	eventCount    atomic.Uint64
+	// behindCount counts scans that exceeded the interval.
+	behindCount atomic.Uint64
+	// eventCount is the total number of events emitted.
+	eventCount atomic.Uint64
 }
 
+// snapshot returns a point-in-time view of all counters.
 func (s *atomicStats) snapshot() Stats {
 	return Stats{
 		Scans:         s.scans.Load(),
@@ -410,4 +460,380 @@ func (s *atomicStats) snapshot() Stats {
 		BehindCount:   s.behindCount.Load(),
 		EventCount:    s.eventCount.Load(),
 	}
+}
+
+// ============================================================================
+// WATCH SCAN
+// ============================================================================
+
+// scanSummary aggregates per-worker results for a single scan.
+type scanSummary struct {
+	// files is the number of regular files seen.
+	files uint64
+	// creates is the number of create events emitted.
+	creates uint64
+	// modifies is the number of modify events emitted.
+	modifies uint64
+	// deletes is the number of delete events emitted.
+	deletes uint64
+	// events is the total events emitted (create/modify/delete).
+	events uint64
+	// errors is the number of IO/stat errors observed.
+	errors uint64
+}
+
+// scanOnce performs a single scan and returns a summary of activity.
+func (w *Watcher) scanOnce(ctx context.Context, gen uint32) scanSummary {
+	if ctx.Err() != nil {
+		return scanSummary{}
+	}
+
+	cfg := w.cfg
+	queueDepth := max(cfg.Workers*defaultQueueFactor, 16)
+	fileJobs := make(chan fileChunk, queueDepth)
+	workerSummaries := make([]scanSummary, 0, cfg.Workers)
+	workerSummaries = workerSummaries[:cfg.Workers]
+	errs := make([][]error, 0, cfg.Workers)
+	errs = errs[:cfg.Workers]
+
+	// Start file workers before pipeline runs.
+	var fileWG sync.WaitGroup
+	fileWG.Add(cfg.Workers)
+
+	for workerID := range cfg.Workers {
+		go func(id int) {
+			defer fileWG.Done()
+
+			localErrs := make([]error, 0, 32)
+			localSummary := scanSummary{}
+
+			for chunk := range fileJobs {
+				if ctx.Err() != nil {
+					chunk.release()
+
+					continue
+				}
+
+				w.processChunk(ctx, gen, chunk.lease, chunk.arena.entries[chunk.start:chunk.end], &localSummary, &localErrs)
+				chunk.release()
+			}
+
+			errs[id] = localErrs
+			workerSummaries[id] = localSummary
+		}(workerID)
+	}
+
+	pipeline := &scanPipeline{
+		scanWorkers: cfg.ScanWorkers,
+		chunkSize:   cfg.ChunkSize,
+		suffix:      cfg.Suffix,
+		recursive:   cfg.Recursive,
+		errNotify:   w.errNotify,
+		queueDepth:  queueDepth + cfg.Workers,
+	}
+
+	// errors are purely reported via errNotify; return is ignored intentionally
+	_ = pipeline.run(ctx, w.root, func(chunk fileChunk) {
+		select {
+		case fileJobs <- chunk:
+		case <-ctx.Done():
+			chunk.release()
+		}
+	})
+
+	close(fileJobs)
+	fileWG.Wait()
+
+	// Merge worker stats.
+	var summary scanSummary
+	for i := range cfg.Workers {
+		summary.files += workerSummaries[i].files
+		summary.creates += workerSummaries[i].creates
+		summary.modifies += workerSummaries[i].modifies
+		summary.events += workerSummaries[i].events
+		summary.errors += workerSummaries[i].errors
+	}
+
+	// Sweep deletes after workers finish.
+	deletes, deleteEvents := w.sweepDeletes(ctx, gen)
+	summary.deletes += deletes
+	summary.events += deleteEvents
+
+	return summary
+}
+
+// processChunk stats entries, updates the index, and emits events.
+func (w *Watcher) processChunk(
+	ctx context.Context,
+	gen uint32,
+	lease *dirLease,
+	entries []nulTermName,
+	localSummary *scanSummary,
+	localErrs *[]error,
+) {
+	if len(entries) == 0 {
+		return
+	}
+
+	// pendingEntry caches per-entry data so we can group by shard and lock once.
+	type pendingEntry struct {
+		entry     nulTermName
+		st        Stat
+		hash      uint64
+		shard     int
+		updateGen bool
+	}
+
+	// pendingEvent buffers events so we can emit after unlocking the shard.
+	type pendingEvent struct {
+		typ  EventType
+		path string
+		st   Stat
+	}
+
+	pending := make([]pendingEntry, 0, len(entries))
+	shardCount := len(w.index.shards)
+	shardCounts := make([]int, shardCount)
+	mask := w.index.mask
+
+	for _, entry := range entries {
+		if ctx.Err() != nil {
+			return
+		}
+
+		st, kind, err := lease.dh.statFile(entry)
+		if err != nil {
+			ioErr := &IOError{Path: lease.base.joinNameString(entry), Op: "stat", Err: err}
+			localSummary.errors++
+
+			if w.errNotify == nil || w.errNotify.ioErr(ioErr) {
+				*localErrs = append(*localErrs, ioErr)
+			}
+
+			if !errors.Is(err, syscall.ENOENT) {
+				// For transient stat failures, keep the entry alive to avoid
+				// false deletes on this scan generation.
+				hash := hashPathFromBase(lease.baseHash, entry)
+				shardIdx := int(hash & mask)
+				pending = append(pending, pendingEntry{
+					entry:     entry,
+					hash:      hash,
+					shard:     shardIdx,
+					updateGen: true,
+				})
+				shardCounts[shardIdx]++
+			}
+
+			continue
+		}
+
+		if kind != statKindReg {
+			continue
+		}
+
+		localSummary.files++
+
+		hash := hashPathFromBase(lease.baseHash, entry)
+		shardIdx := int(hash & mask)
+
+		pending = append(pending, pendingEntry{
+			entry: entry,
+			st:    st,
+			hash:  hash,
+			shard: shardIdx,
+		})
+		shardCounts[shardIdx]++
+	}
+
+	if len(pending) == 0 {
+		return
+	}
+
+	// Group entries by shard using a counting-sort layout so we lock each shard only once,
+	// per chunk, instead of once per entry.
+	order := make([]int, len(pending))
+	offsets := make([]int, shardCount)
+	sum := 0
+	for i, count := range shardCounts {
+		offsets[i] = sum
+		sum += count
+	}
+
+	next := make([]int, shardCount)
+	copy(next, offsets)
+
+	for i, pe := range pending {
+		pos := next[pe.shard]
+		order[pos] = i
+		next[pe.shard]++
+	}
+
+	events := make([]pendingEvent, 0, len(pending))
+
+	for shardIdx, count := range shardCounts {
+		if count == 0 {
+			continue
+		}
+
+		shard := &w.index.shards[shardIdx]
+		start := offsets[shardIdx]
+
+		shard.mu.Lock()
+		shard.table.ensure(count)
+
+		for i := range count {
+			pe := pending[order[start+i]]
+
+			if pe.updateGen {
+				_, idx, found := shard.table.findSlot(pe.hash, lease.base, pe.entry, &shard.store)
+				if found {
+					shard.table.entries[idx].gen = gen
+				}
+				continue
+			}
+
+			var (
+				emit      bool
+				created   bool
+				modified  bool
+				eventType EventType
+				eventPath string
+				eventStat Stat
+			)
+
+			slot, idx, found := shard.table.findSlot(pe.hash, lease.base, pe.entry, &shard.store)
+			if !found {
+				off, length := shard.store.appendPath(lease.base, pe.entry)
+				shard.table.insert(pe.hash, off, length, pe.st, gen, slot)
+
+				created = true
+				eventType = Create
+				eventPath = w.eventPath(shard, off, length)
+				eventStat = pe.st
+				shard.liveBytes += uint64(length)
+				// Suppress Create events on baseline scan unless EmitBaseline is set.
+				emit = w.cfg.OnEvent != nil && (gen > 1 || w.cfg.EmitBaseline)
+			} else {
+				rec := &shard.table.entries[idx]
+				if !statEqual(rec.st, pe.st) {
+					rec.st = pe.st
+					modified = true
+					eventType = Modify
+					eventPath = w.eventPath(shard, rec.pathOff, rec.pathLen)
+					eventStat = pe.st
+					emit = w.cfg.OnEvent != nil
+				}
+
+				rec.gen = gen
+			}
+
+			if created {
+				localSummary.creates++
+			}
+
+			if modified {
+				localSummary.modifies++
+			}
+
+			if emit {
+				events = append(events, pendingEvent{typ: eventType, path: eventPath, st: eventStat})
+			}
+		}
+
+		shard.mu.Unlock()
+
+		// Emit after unlock to keep the critical section small.
+		if w.cfg.OnEvent != nil && len(events) > 0 {
+			for _, ev := range events {
+				w.cfg.OnEvent(Event{Type: ev.typ, Path: ev.path, Stat: ev.st})
+				localSummary.events++
+			}
+			events = events[:0]
+		}
+	}
+}
+
+// sweepDeletes removes entries not seen in this scan generation and emits deletes.
+func (w *Watcher) sweepDeletes(ctx context.Context, gen uint32) (uint64, uint64) {
+	var (
+		deletes uint64
+		events  uint64
+	)
+
+	if ctx.Err() != nil {
+		return 0, 0
+	}
+
+	for i := range w.index.shards {
+		shard := &w.index.shards[i]
+		shard.mu.Lock()
+
+		for idx := range shard.table.entries {
+			if ctx.Err() != nil {
+				break
+			}
+
+			entry := &shard.table.entries[idx]
+			if !entry.alive {
+				continue
+			}
+
+			if entry.gen == gen {
+				continue
+			}
+
+			// Entry not observed in this generation => delete.
+			if entry.pathLen != 0 {
+				length := uint64(entry.pathLen)
+				if shard.liveBytes >= length {
+					shard.liveBytes -= length
+				} else {
+					shard.liveBytes = 0
+				}
+
+				shard.deadBytes += length
+			}
+
+			shard.table.remove(entry)
+
+			deletes++
+
+			if w.cfg.OnEvent != nil {
+				path := w.eventPath(shard, entry.pathOff, entry.pathLen)
+				w.cfg.OnEvent(Event{Type: Delete, Path: path, Stat: entry.st})
+
+				events++
+			}
+		}
+
+		if w.cfg.OwnedPaths && shard.shouldCompact() {
+			shard.compactLocked()
+		} else if shard.table.shouldRehash() {
+			// Rehash after deletions to restore probe locality.
+			shard.table.rehash(len(shard.table.slots))
+		}
+
+		shard.mu.Unlock()
+	}
+
+	return deletes, events
+}
+
+// statEqual reports whether file metadata changes should trigger Modify.
+func statEqual(a, b Stat) bool {
+	return a.Size == b.Size && a.ModTime == b.ModTime && a.Mode == b.Mode && a.Inode == b.Inode
+}
+
+func (w *Watcher) eventPath(shard *watchShard, off, length uint32) string {
+	if !w.cfg.OwnedPaths {
+		return shard.store.pathString(off, length)
+	}
+
+	// Owned paths allow compaction and avoid pinning pathStore buffers.
+	b := shard.store.bytes(off, length)
+	if len(b) == 0 {
+		return ""
+	}
+
+	return string(b)
 }

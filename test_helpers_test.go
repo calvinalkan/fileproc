@@ -116,7 +116,9 @@ func mustStat(t *testing.T, path string) fileproc.Stat {
 	t.Helper()
 
 	var st syscall.Stat_t
-	if err := syscall.Stat(path, &st); err != nil {
+
+	err := syscall.Stat(path, &st)
+	if err != nil {
 		t.Fatalf("stat %s: %v", path, err)
 	}
 

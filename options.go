@@ -184,6 +184,17 @@ func WithInterval(d time.Duration) Option {
 	}
 }
 
+// WithMinIdle sets a minimum idle time between scans for [Watch] and [Events].
+//
+// The watcher sleeps at least this duration after each scan completes, even if
+// the interval would allow an immediate rescan. Values <= 0 disable the idle
+// floor.
+func WithMinIdle(d time.Duration) Option {
+	return func(o *options) {
+		o.MinIdle = d
+	}
+}
+
 // WithEventBuffer sets the channel buffer size for [Events].
 //
 // Values <= 0 use the default buffer size.
@@ -220,6 +231,24 @@ func WithEmitBaseline() Option {
 	}
 }
 
+// WithOwnedPaths copies watcher event paths into owned memory.
+//
+// Only used by [Watch] and [Events].
+//
+// When enabled, Event.Path is copied per event and does not reference internal
+// watcher storage. This lets retained paths avoid pinning watcher memory and
+// allows the watcher to compact its path index after heavy delete churn to
+// reclaim memory. Compaction runs when dead path bytes dominate live bytes
+// (≈2x) and exceed a minimum size (~8MB).
+//
+// Use this only if you expect huge delete churn and need to reclaim memory.
+// Downside: one allocation + copy per emitted event.
+func WithOwnedPaths() Option {
+	return func(o *options) {
+		o.OwnedPaths = true
+	}
+}
+
 type options struct {
 	// Workers is the file worker count.
 	Workers int
@@ -237,12 +266,16 @@ type options struct {
 	OnEvent func(Event)
 	// Interval controls polling cadence for Watch/Events.
 	Interval time.Duration
+	// MinIdle sets a minimum idle time between scans.
+	MinIdle time.Duration
 	// EventBuffer sets the Events channel buffer size.
 	EventBuffer int
 	// ExpectedFiles pre-sizes watcher tables/arenas.
 	ExpectedFiles int
 	// EmitBaseline emits Create events on the initial scan.
 	EmitBaseline bool
+	// OwnedPaths copies event paths into owned memory.
+	OwnedPaths bool
 	// WatchShards is the number of shards for the watcher index.
 	WatchShards int
 }
