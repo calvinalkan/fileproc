@@ -1,6 +1,25 @@
-// Package fileproc provides ultra-fast parallel file processing with highly-efficient memory management.
-// and platform-specific IO fast paths where available (for example Linux
-// getdents/openat) while falling back to portable APIs on other platforms.
+// Package fileproc provides ultra-fast parallel file processing and watching.
+//
+// # Processing
+//
+// [Process] scans directories and invokes callbacks for each file, with
+// concurrent execution, efficient memory reuse, and platform-specific IO
+// fast paths (Linux getdents/openat) where available.
+//
+// # Watching
+//
+// [Watcher] provides high-performance polling-based file watching that works
+// identically across all platforms without inotify/kqueue/FSEvents. It detects
+// file creates, modifications, and deletions by comparing periodic directory
+// scans.
+//
+// # Features
+//
+//   - Zero per-file allocations after warmup
+//   - Scales to 1M+ files
+//   - Cross-platform with consistent behavior
+//   - Configurable concurrency and chunking
+//   - Suffix filtering and recursive traversal
 package fileproc
 
 import (
