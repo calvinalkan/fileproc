@@ -469,7 +469,7 @@ type fileChunk struct {
 type dirLease struct {
 	// dh stays open so openat/statat can use names without full paths.
 	dh dirHandle
-	// base is used for error messages and AbsPathBorrowed.
+	// base is used for error messages and AbsPath.
 	base nulTermPath
 	// baseHash is the precomputed hash for base (+sep) for watcher scans.
 	baseHash uint64

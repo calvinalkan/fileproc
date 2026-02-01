@@ -34,7 +34,7 @@ func Test_File_AbsPathBorrowed_Returns_Correct_Path_When_NonRecursive(t *testing
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, _ *fileproc.FileWorker) (*struct{}, error) {
 		mu.Lock()
 
-		seen[string(f.AbsPathBorrowed())] = true
+		seen[string(f.AbsPath())] = true
 
 		mu.Unlock()
 
@@ -75,7 +75,7 @@ func Test_File_AbsPathBorrowed_Returns_Correct_Path_When_Recursive(t *testing.T)
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, _ *fileproc.FileWorker) (*struct{}, error) {
 		mu.Lock()
 
-		seen[string(f.AbsPathBorrowed())] = true
+		seen[string(f.AbsPath())] = true
 
 		mu.Unlock()
 
@@ -115,7 +115,7 @@ func Test_File_AbsPathBorrowed_Copy_Remains_Valid_When_Process_Returns(t *testin
 	}
 
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, _ *fileproc.FileWorker) (*pathHolder, error) {
-		return &pathHolder{path: string(f.AbsPathBorrowed())}, nil
+		return &pathHolder{path: string(f.AbsPath())}, nil
 	}, opts...)
 
 	if len(errs) != 0 {
@@ -129,6 +129,88 @@ func Test_File_AbsPathBorrowed_Copy_Remains_Valid_When_Process_Returns(t *testin
 	// The path should still be valid here (arena not released)
 	if results[0].path != filepath.Join(root, "test.txt") {
 		t.Fatalf("expected path %q, got %q", filepath.Join(root, "test.txt"), results[0].path)
+	}
+}
+
+func Test_File_RelPath_Returns_Correct_Path(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name      string
+		recursive bool
+		files     map[string][]byte
+		want      []string
+	}{
+		{
+			name: "non_recursive",
+			files: map[string][]byte{
+				"alpha.txt":                        []byte("alpha"),
+				"beta.md":                          []byte("beta"),
+				filepath.Join("sub", "nested.txt"): []byte("nested"),
+			},
+			want: []string{
+				"alpha.txt",
+				"beta.md",
+			},
+		},
+		{
+			name:      "recursive",
+			recursive: true,
+			files: map[string][]byte{
+				"top.txt":                                 []byte("top"),
+				filepath.Join("sub", "nested.txt"):        []byte("nested"),
+				filepath.Join("sub", "deep", "file.txt"):  []byte("deep"),
+				filepath.Join("other", "branch", "x.txt"): []byte("x"),
+			},
+			want: []string{
+				"top.txt",
+				filepath.Join("sub", "nested.txt"),
+				filepath.Join("sub", "deep", "file.txt"),
+				filepath.Join("other", "branch", "x.txt"),
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			root := t.TempDir()
+			writeFiles(t, root, tc.files)
+
+			opts := []fileproc.Option{fileproc.WithFileWorkers(1)}
+			if tc.recursive {
+				opts = append(opts, fileproc.WithRecursive())
+			}
+
+			var (
+				mu   sync.Mutex
+				seen = make(map[string]bool)
+			)
+
+			results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, _ *fileproc.FileWorker) (*struct{}, error) {
+				mu.Lock()
+				seen[string(f.RelPath())] = true
+				mu.Unlock()
+
+				return &struct{}{}, nil
+			}, opts...)
+
+			if len(errs) != 0 {
+				t.Fatalf("unexpected errors: %v", errs)
+			}
+
+			if len(results) != len(tc.want) {
+				t.Fatalf("expected %d results, got %d", len(tc.want), len(results))
+			}
+
+			for _, w := range tc.want {
+				if !seen[w] {
+					t.Fatalf("missing expected path %q: %v", w, seen)
+				}
+			}
+		})
 	}
 }
 
@@ -240,7 +322,7 @@ func Test_File_Bytes_Reads_Full_Content_When_Called(t *testing.T) {
 	var gotData []byte
 
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, w *fileproc.FileWorker) (*struct{}, error) {
-		data, err := f.Bytes()
+		data, err := f.ReadAll()
 		if err != nil {
 			return nil, fmt.Errorf("test: %w", err)
 		}
@@ -277,7 +359,7 @@ func Test_File_Bytes_Remains_Valid_When_RetainBytes_Called(t *testing.T) {
 	}
 
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, w *fileproc.FileWorker) (*dataHolder, error) {
-		data, err := f.Bytes()
+		data, err := f.ReadAll()
 		if err != nil {
 			return nil, fmt.Errorf("test: %w", err)
 		}
@@ -313,7 +395,7 @@ func Test_File_Bytes_Returns_NonNil_Empty_Slice_When_File_Empty(t *testing.T) {
 	)
 
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, _ *fileproc.FileWorker) (*struct{}, error) {
-		data, err := f.Bytes()
+		data, err := f.ReadAll()
 		if err != nil {
 			return nil, fmt.Errorf("test: %w", err)
 		}
@@ -364,7 +446,7 @@ func Test_File_Bytes_Returns_Empty_Slice_When_File_Size_Is_Zero(t *testing.T) {
 			t.Errorf("expected size 0, got %d", st.Size)
 		}
 
-		data, err := f.Bytes()
+		data, err := f.ReadAll()
 		if err != nil {
 			return nil, fmt.Errorf("test: %w", err)
 		}
@@ -427,7 +509,7 @@ func Test_File_Bytes_Returns_Actual_Content_When_File_Shrunk_Since_Stat(t *testi
 			return nil, fmt.Errorf("write: %w", writeErr)
 		}
 
-		data, err := f.Bytes()
+		data, err := f.ReadAll()
 		if err != nil {
 			return nil, fmt.Errorf("test: %w", err)
 		}
@@ -493,7 +575,7 @@ func Test_File_Bytes_Returns_Full_Content_When_File_Grew_Since_Stat(t *testing.T
 			return nil, fmt.Errorf("write: %w", writeErr)
 		}
 
-		data, err := f.Bytes()
+		data, err := f.ReadAll()
 		if err != nil {
 			return nil, fmt.Errorf("test: %w", err)
 		}
@@ -533,8 +615,8 @@ func Test_File_Bytes_Returns_Error_When_Called_Second_Time(t *testing.T) {
 	var firstErr, secondErr error
 
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, _ *fileproc.FileWorker) (*struct{}, error) {
-		_, firstErr = f.Bytes()
-		_, secondErr = f.Bytes()
+		_, firstErr = f.ReadAll()
+		_, secondErr = f.ReadAll()
 
 		return &struct{}{}, nil
 	}, opts...)
@@ -583,7 +665,7 @@ func Test_File_Bytes_Opens_File_Lazily_When_Called(t *testing.T) {
 		st, statErr := f.Stat()
 		statOK = statErr == nil && st.Size > 0
 		// Bytes() should fail because file is unreadable
-		_, bytesErr = f.Bytes()
+		_, bytesErr = f.ReadAll()
 
 		return &struct{}{}, nil
 	}, opts...)
@@ -625,7 +707,7 @@ func Test_File_Bytes_Works_Correctly_When_File_Large(t *testing.T) {
 	var gotData []byte
 
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, w *fileproc.FileWorker) (*struct{}, error) {
-		data, err := f.Bytes()
+		data, err := f.ReadAll()
 		if err != nil {
 			return nil, fmt.Errorf("test: %w", err)
 		}
@@ -669,7 +751,7 @@ func Test_File_Bytes_Returns_Error_When_File_Is_Deleted(t *testing.T) {
 			return nil, fmt.Errorf("remove: %w", removeErr)
 		}
 
-		_, err := f.Bytes()
+		_, err := f.ReadAll()
 		if err != nil {
 			return nil, fmt.Errorf("test: %w", err)
 		}
@@ -727,7 +809,7 @@ func Test_File_Bytes_Returns_Content_When_File_Grows_From_Empty(t *testing.T) {
 			return nil, fmt.Errorf("write: %w", writeErr)
 		}
 
-		data, err := f.Bytes()
+		data, err := f.ReadAll()
 		if err != nil {
 			return nil, fmt.Errorf("test: %w", err)
 		}
@@ -775,7 +857,7 @@ func Test_File_Bytes_Propagates_Error_When_File_Unreadable(t *testing.T) {
 	opts := []fileproc.Option{fileproc.WithFileWorkers(1)}
 
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, _ *fileproc.FileWorker) (*struct{}, error) {
-		_, err := f.Bytes()
+		_, err := f.ReadAll()
 		if err != nil {
 			return nil, fmt.Errorf("test: %w", err)
 		}
@@ -1044,7 +1126,7 @@ func Test_File_Fd_Works_When_Called_After_Bytes(t *testing.T) {
 	var fd uintptr
 
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, _ *fileproc.FileWorker) (*struct{}, error) {
-		_, _ = f.Bytes()
+		_, _ = f.ReadAll()
 		fd = f.Fd()
 
 		return &struct{}{}, nil
@@ -1240,7 +1322,7 @@ func Test_Worker_RetainBytes_Returns_Stable_Slice_When_Called(t *testing.T) {
 	}
 
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, w *fileproc.FileWorker) (*holder, error) {
-		data, err := f.Bytes()
+		data, err := f.ReadAll()
 		if err != nil {
 			return nil, fmt.Errorf("bytes: %w", err)
 		}
@@ -1272,7 +1354,7 @@ func Test_Worker_RetainBytes_Returns_Empty_Slice_When_Input_Empty(t *testing.T) 
 	var retained []byte
 
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, w *fileproc.FileWorker) (*struct{}, error) {
-		data, err := f.Bytes()
+		data, err := f.ReadAll()
 		if err != nil {
 			return nil, fmt.Errorf("bytes: %w", err)
 		}
@@ -1313,7 +1395,7 @@ func Test_Worker_RetainBytes_Preserves_Multiple_Slices_When_Called_Repeatedly(t 
 	}
 
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, w *fileproc.FileWorker) (*holder, error) {
-		data, err := f.Bytes()
+		data, err := f.ReadAll()
 		if err != nil {
 			return nil, fmt.Errorf("bytes: %w", err)
 		}
@@ -1355,7 +1437,7 @@ func Test_Worker_RetainBytes_Independent_From_Original_When_Modified(t *testing.
 	}
 
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, w *fileproc.FileWorker) (*holder, error) {
-		data, err := f.Bytes()
+		data, err := f.ReadAll()
 		if err != nil {
 			return nil, fmt.Errorf("bytes: %w", err)
 		}
@@ -1403,12 +1485,12 @@ func Test_Arena_Multiple_Files_Dont_Interfere_When_Using_Single_Worker(t *testin
 	}
 
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, w *fileproc.FileWorker) (*fileData, error) {
-		data, err := f.Bytes()
+		data, err := f.ReadAll()
 		if err != nil {
 			return nil, fmt.Errorf("test: %w", err)
 		}
 
-		return &fileData{path: string(f.AbsPathBorrowed()), data: w.RetainBytes(data)}, nil
+		return &fileData{path: string(f.AbsPath()), data: w.RetainBytes(data)}, nil
 	}, opts...)
 
 	if len(errs) != 0 {
@@ -1453,7 +1535,7 @@ func Test_Arena_Subslices_Remain_Valid_When_Process_Returns(t *testing.T) {
 	}
 
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, w *fileproc.FileWorker) (*parts, error) {
-		data, err := f.Bytes()
+		data, err := f.ReadAll()
 		if err != nil {
 			return nil, fmt.Errorf("test: %w", err)
 		}
@@ -1509,7 +1591,7 @@ func Test_File_Read_And_Bytes_Return_Error_When_Called_In_Different_Order(t *tes
 		{
 			name: "BytesThenRead",
 			first: func(f *fileproc.File) error {
-				_, err := f.Bytes()
+				_, err := f.ReadAll()
 				if err != nil {
 					return fmt.Errorf("bytes: %w", err)
 				}
@@ -1542,7 +1624,7 @@ func Test_File_Read_And_Bytes_Return_Error_When_Called_In_Different_Order(t *tes
 				return nil
 			},
 			second: func(f *fileproc.File) error {
-				_, err := f.Bytes()
+				_, err := f.ReadAll()
 				if err != nil {
 					return fmt.Errorf("bytes: %w", err)
 				}

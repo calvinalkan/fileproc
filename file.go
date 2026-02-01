@@ -24,10 +24,10 @@ type Stat struct {
 // File provides access to a file being processed by [Process].
 //
 // All methods are lazy: the underlying file is opened on first content access
-// (Bytes, Read, or Fd). The handle is owned by fileproc and closed after the
+// (ReadAll, Read, or Fd). The handle is owned by fileproc and closed after the
 // callback returns. File must not be retained beyond the callback.
 //
-// Bytes() and Read() are mutually exclusive per file. Calling one after
+// ReadAll() and Read() are mutually exclusive per file. Calling one after
 // the other returns an error.
 type File struct {
 	// dh is the open directory handle used for openat/statat.
@@ -36,12 +36,20 @@ type File struct {
 	name nulTermName
 	// base is the NUL-terminated directory path for building absolute paths.
 	base nulTermPath
+	// rootLen is the length of the root path (no trailing NUL).
+	rootLen int
 	// path caches the built absolute path (no trailing NUL).
 	path []byte
 	// pathScratch is a reusable buffer for building absolute paths.
 	pathScratch *[]byte
 	// pathBuilt tracks whether path is populated for this file.
 	pathBuilt bool
+	// relPath caches the built relative path (no trailing NUL).
+	relPath []byte
+	// relPathScratch is a reusable buffer for building relative paths.
+	relPathScratch *[]byte
+	// relPathBuilt tracks whether relPath is populated for this file.
+	relPathBuilt bool
 	// st caches the file stat result.
 	st Stat
 	// statDone tracks whether stat has been attempted.
@@ -60,11 +68,11 @@ type File struct {
 	statErr error
 }
 
-// AbsPathBorrowed returns the absolute file path (without the trailing NUL).
+// AbsPath returns the absolute file path (without the trailing NUL).
 //
 // The returned slice is ephemeral and only valid during the callback.
 // Copy if you need to retain it.
-func (f *File) AbsPathBorrowed() []byte {
+func (f *File) AbsPath() []byte {
 	if f.pathBuilt {
 		return f.path
 	}
@@ -101,6 +109,61 @@ func (f *File) AbsPathBorrowed() []byte {
 	return buf
 }
 
+// RelPath returns the file path relative to the root passed to [Process].
+//
+// The returned slice is ephemeral and only valid during the callback.
+// Copy if you need to retain it.
+func (f *File) RelPath() []byte {
+	if f.relPathBuilt {
+		return f.relPath
+	}
+
+	baseLen := f.base.lenWithoutNul()
+	nameLen := f.name.lenWithoutNul()
+
+	if baseLen == f.rootLen {
+		f.relPath = f.name[:nameLen]
+		f.relPathBuilt = true
+
+		return f.relPath
+	}
+
+	start := f.rootLen
+	if baseLen > f.rootLen && f.base[f.rootLen] == os.PathSeparator {
+		start++
+	}
+	if start > baseLen {
+		start = baseLen
+	}
+
+	baseRelLen := baseLen - start
+	sep := 0
+	if baseRelLen > 0 {
+		sep = 1
+	}
+
+	needed := baseRelLen + sep + nameLen
+
+	buf := *f.relPathScratch
+	if cap(buf) < needed {
+		buf = make([]byte, 0, needed)
+	}
+
+	buf = buf[:0]
+	if baseRelLen > 0 {
+		buf = append(buf, f.base[start:baseLen]...)
+		buf = append(buf, os.PathSeparator)
+	}
+
+	buf = append(buf, f.name[:nameLen]...)
+
+	*f.relPathScratch = buf
+	f.relPath = buf
+	f.relPathBuilt = true
+
+	return buf
+}
+
 // Stat returns file metadata.
 //
 // Lazy: the stat syscall is made on first call and cached. Subsequent calls
@@ -129,8 +192,8 @@ func (f *File) Stat() (Stat, error) {
 	return f.st, f.statErr
 }
 
-// BytesOption configures the behavior of [File.Bytes].
-type BytesOption struct {
+// ReadAllOption configures the behavior of [File.ReadAll].
+type ReadAllOption struct {
 	// sizeHint is the expected file size to pre-size buffers.
 	sizeHint int
 }
@@ -153,14 +216,14 @@ type BytesOption struct {
 //	opt := fileproc.WithSizeHint(4096)
 //
 //	fileproc.Process(ctx, dir, func(f *fileproc.File, _ *fileproc.FileWorker) (*T, error) {
-//	    data, err := f.Bytes(opt)
+//	    data, err := f.ReadAll(opt)
 //	    // ...
 //	}, opts)
-func WithSizeHint(size int) BytesOption {
-	return BytesOption{sizeHint: size}
+func WithSizeHint(size int) ReadAllOption {
+	return ReadAllOption{sizeHint: size}
 }
 
-// Bytes reads and returns the full file content.
+// ReadAll reads and returns the full file content.
 //
 // The returned slice points into a reusable buffer and is only valid during
 // the callback. To retain data beyond the callback, copy it or use
@@ -168,18 +231,18 @@ func WithSizeHint(size int) BytesOption {
 //
 // Empty files return a non-nil empty slice ([]byte{}, nil).
 //
-// Single-use: Bytes can only be called once per File and is mutually exclusive
+// Single-use: ReadAll can only be called once per File and is mutually exclusive
 // with [File.Read].
 //
 // Returns error if called after [File.Read], or on I/O failure. If the file
-// changes type (becomes a directory or symlink) between scan and read, Bytes
+// changes type (becomes a directory or symlink) between scan and read, ReadAll
 // returns a skip error that Process ignores when returned by the callback.
 //
 // Memory: content is stored in a reusable buffer; it is not retained.
 // For large files or memory-constrained use cases, consider [File.Read]
 // with streaming processing instead.
 //
-// Buffer sizing: Bytes does not call stat internally. The buffer size is
+// Buffer sizing: ReadAll does not call stat internally. The buffer size is
 // determined by (in priority order):
 //  1. The actual size from [File.Stat], if it was called previously
 //  2. The hint from [WithSizeHint], if provided
@@ -190,13 +253,13 @@ func WithSizeHint(size int) BytesOption {
 //
 // Example (inside Process callback):
 //
-//	data, err := f.Bytes()
+//	data, err := f.ReadAll()
 //	if err != nil {
 //	    return nil, err
 //	}
 //	keep := w.RetainBytes(data)
 //	return &Result{Len: len(keep)}, nil
-func (f *File) Bytes(opts ...BytesOption) ([]byte, error) {
+func (f *File) ReadAll(opts ...ReadAllOption) ([]byte, error) {
 	if f.mode == fileModeReader {
 		return nil, errBytesAfterRead
 	}
@@ -299,7 +362,7 @@ func (f *File) Bytes(opts ...BytesOption) ([]byte, error) {
 // caller provides and manages the buffer.
 //
 // Read may be called multiple times until it returns io.EOF. It is mutually
-// exclusive with [File.Bytes] and returns an error if Bytes was used first.
+// exclusive with [File.ReadAll] and returns an error if ReadAll was used first.
 //
 // If the file changes type (becomes a directory or symlink) between scan and
 // read, Read returns a skip error that Process ignores when returned by the
