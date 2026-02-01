@@ -270,6 +270,11 @@ linters:
       - path: ^cmd/
         linters:
           - gosec
+      # Benchmark harness uses deliberate GC calls and deep control flow.
+      - path: ^cmd/watcherbench/
+        text: "(call-to-gc|max-control-nesting|empty-block)"
+        linters:
+          - revive
 
       # Low-level raw syscalls require unsafe.Pointer; gosec flags this as G103.
       # Keep this scoped to syscall implementation files.
@@ -279,7 +284,16 @@ linters:
 
       # G115 int->int32: chunkCount bounded by arena size (256KB / ~30 bytes
       # per entry = ~8500 max)
-      - path: processor\.go
+      - path: process\.go
+        text: "G115:"
+        linters:
+          - gosec
+      # watcher_paths uses bounded casts + unsafe.String for zero-alloc hot path.
+      - path: watcher_paths\.go
+        text: "G103:"
+        linters:
+          - gosec
+      - path: watcher_paths\.go
         text: "G115:"
         linters:
           - gosec
@@ -313,6 +327,19 @@ linters:
         text: "G306:" # file permissions > 0600
         linters:
           - gosec
+      # Allow math/rand in tests for deterministic seeded randomness
+      - path: _test\.go
+        text: "math/rand"
+        linters:
+          - depguard
+      # Internal-package tests need access to unexported watcher internals.
+      - path: watcher_compaction_test\.go
+        linters:
+          - testpackage
+      - path: watcher_paths_test\.go
+        linters:
+          - testpackage
+          - depguard
 
 formatters:
   enable:

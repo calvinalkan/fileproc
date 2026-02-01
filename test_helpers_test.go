@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"syscall"
 	"testing"
 
 	"github.com/calvinalkan/fileproc"
@@ -108,6 +109,24 @@ func writeNestedFiles(
 
 			writeFile(t, root, rel, data)
 		}
+	}
+}
+
+func mustStat(t *testing.T, path string) fileproc.Stat {
+	t.Helper()
+
+	var st syscall.Stat_t
+
+	err := syscall.Stat(path, &st)
+	if err != nil {
+		t.Fatalf("stat %s: %v", path, err)
+	}
+
+	return fileproc.Stat{
+		Size:    st.Size,
+		ModTime: st.Mtim.Nano(),
+		Mode:    st.Mode,
+		Inode:   st.Ino,
 	}
 }
 

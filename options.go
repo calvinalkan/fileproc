@@ -1,8 +1,11 @@
 package fileproc
 
-import "runtime"
+import (
+	"runtime"
+	"time"
+)
 
-// Option configures [Process].
+// Option configures [Process], [Watch], and [Events].
 // Options are applied in order.
 type Option func(*options)
 
@@ -162,6 +165,90 @@ func WithOnError(fn func(err error, ioErrs, procErrs int) bool) Option {
 	}
 }
 
+// WithOnEvent registers a handler for watcher events.
+//
+// Only used by [Watch] and [Events].
+// If nil, events are dropped.
+func WithOnEvent(fn func(Event)) Option {
+	return func(o *options) {
+		o.OnEvent = fn
+	}
+}
+
+// WithInterval sets the polling interval for [Watch] and [Events].
+//
+// Values <= 0 use the default interval.
+func WithInterval(d time.Duration) Option {
+	return func(o *options) {
+		o.Interval = d
+	}
+}
+
+// WithMinIdle sets a minimum idle time between scans for [Watch] and [Events].
+//
+// The watcher sleeps at least this duration after each scan completes, even if
+// the interval would allow an immediate rescan. Values <= 0 disable the idle
+// floor.
+func WithMinIdle(d time.Duration) Option {
+	return func(o *options) {
+		o.MinIdle = d
+	}
+}
+
+// WithEventBuffer sets the channel buffer size for [Events].
+//
+// Values <= 0 use the default buffer size.
+func WithEventBuffer(n int) Option {
+	return func(o *options) {
+		o.EventBuffer = n
+	}
+}
+
+// WithExpectedFiles pre-sizes watcher tables/arenas for the expected file count.
+//
+// Only used by [Watch] and [Events].
+func WithExpectedFiles(n int) Option {
+	return func(o *options) {
+		o.ExpectedFiles = n
+	}
+}
+
+// WithEmitBaseline enables Create events for files found during the initial scan.
+//
+// By default, the first scan silently populates the file index without emitting
+// events. Only subsequent scans emit Create/Modify/Delete events for changes.
+// This matches the behavior of event-based watchers (inotify, fsnotify) which
+// only report changes after watching begins.
+//
+// When enabled, the initial scan emits a Create event for every existing file.
+// This is useful when you need to process all files on startup, but be aware
+// that watching a directory with 1M files will emit 1M Create events.
+//
+// Only used by [Watch] and [Events].
+func WithEmitBaseline() Option {
+	return func(o *options) {
+		o.EmitBaseline = true
+	}
+}
+
+// WithOwnedPaths copies watcher event paths into owned memory.
+//
+// Only used by [Watch] and [Events].
+//
+// When enabled, Event.Path is copied per event and does not reference internal
+// watcher storage. This lets retained paths avoid pinning watcher memory and
+// allows the watcher to compact its path index after heavy delete churn to
+// reclaim memory. Compaction runs when dead path bytes dominate live bytes
+// (≈2x) and exceed a minimum size (~8MB).
+//
+// Use this only if you expect huge delete churn and need to reclaim memory.
+// Downside: one allocation + copy per emitted event.
+func WithOwnedPaths() Option {
+	return func(o *options) {
+		o.OwnedPaths = true
+	}
+}
+
 type options struct {
 	// Workers is the file worker count.
 	Workers int
@@ -175,6 +262,22 @@ type options struct {
 	Recursive bool
 	// OnError handles IO and callback errors.
 	OnError func(err error, ioErrs, procErrs int) (collect bool)
+	// OnEvent receives watcher events.
+	OnEvent func(Event)
+	// Interval controls polling cadence for Watch/Events.
+	Interval time.Duration
+	// MinIdle sets a minimum idle time between scans.
+	MinIdle time.Duration
+	// EventBuffer sets the Events channel buffer size.
+	EventBuffer int
+	// ExpectedFiles pre-sizes watcher tables/arenas.
+	ExpectedFiles int
+	// EmitBaseline emits Create events on the initial scan.
+	EmitBaseline bool
+	// OwnedPaths copies event paths into owned memory.
+	OwnedPaths bool
+	// WatchShards is the number of shards for the watcher index.
+	WatchShards int
 }
 
 // applyOptions merges option values and applies defaults.

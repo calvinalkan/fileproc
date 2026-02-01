@@ -11,9 +11,11 @@
 cmd/fileprocbench/fileprocbench
 cmd/ticketgen/ticketgen
 cmd/benchreport/benchreport
+cmd/watcherbench/watcherbench
 /fileprocbench
 /ticketgen
 /benchreport
+/watcherbench
 
 # symlinked from pi directory
 .codex/skills
