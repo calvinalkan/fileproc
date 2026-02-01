@@ -454,7 +454,7 @@ func makeProcessFn(process string) fileproc.ProcessFunc[struct{}] {
 
 	case processBytes:
 		return func(f *fileproc.File, _ *fileproc.FileWorker) (*struct{}, error) {
-			_, err := f.Bytes()
+			_, err := f.ReadAll()
 			if err != nil {
 				return nil, fmt.Errorf("bytes: %w", err)
 			}

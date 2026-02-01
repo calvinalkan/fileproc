@@ -34,7 +34,7 @@ func Test_Concurrency_Multiple_Workers_Have_Independent_Arenas_When_Parallel(t *
 	}
 
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, w *fileproc.FileWorker) (*holder, error) {
-		data, err := f.Bytes()
+		data, err := f.ReadAll()
 		if err != nil {
 			return nil, fmt.Errorf("test: %w", err)
 		}
@@ -77,7 +77,7 @@ func Test_Concurrency_Multiple_Workers_Have_Independent_WorkerBuf_When_Parallel(
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, scratch *fileproc.FileWorker) (*scratchResult, error) {
 		// Write file path into scratch buffer
 		buf := scratch.Buf(256)
-		buf = append(buf, f.AbsPathBorrowed()...)
+		buf = append(buf, f.AbsPath()...)
 
 		// Copy to result (scratch only valid during callback)
 		return &scratchResult{data: append([]byte(nil), buf...)}, nil

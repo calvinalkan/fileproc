@@ -493,6 +493,8 @@ func (l *dirLease) dec() {
 type processor[T any] struct {
 	// fn is the user callback; kept on the processor to avoid per-call captures.
 	fn ProcessFunc[T]
+	// rootLen is the root path length without trailing NUL.
+	rootLen int
 	// fileWorkers bounds callback concurrency to avoid oversubscribing I/O/CPU.
 	fileWorkers int
 	// scanWorkers allows discovery to run ahead without flooding the system.
@@ -663,6 +665,7 @@ func (p *processor[T]) processChunk(
 			dh:          dirLease.dh,
 			name:        entry,
 			base:        dirLease.base,
+			rootLen:     p.rootLen,
 			fh:          &openFH,
 			fhOpen:      &fhOpen,
 			dataBuf:     &bufs.fileBytesBuf,

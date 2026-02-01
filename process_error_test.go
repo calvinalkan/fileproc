@@ -217,7 +217,7 @@ func Test_Process_Continues_When_OnError_Drops_Errors(t *testing.T) {
 	)
 
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, _ *fileproc.FileWorker) (*string, error) {
-		path := string(f.AbsPathBorrowed())
+		path := string(f.AbsPath())
 		if path == filepath.Join(root, "bad.txt") {
 			return nil, errors.New("fail")
 		}
@@ -367,7 +367,7 @@ func Test_Process_Counts_Errors_Correctly_When_Mixed_IO_And_Process_Errors_Concu
 	}
 
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, _ *fileproc.FileWorker) (*string, error) {
-		path := string(f.AbsPathBorrowed())
+		path := string(f.AbsPath())
 		if path == filepath.Join(root, testBadFile) {
 			return nil, sentinel
 		}
@@ -524,7 +524,7 @@ func Test_Process_Drops_IOErrors_When_OnError_Returns_False(t *testing.T) {
 	}
 
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, _ *fileproc.FileWorker) (*string, error) {
-		path := string(f.AbsPathBorrowed())
+		path := string(f.AbsPath())
 
 		return &path, nil
 	}, opts...)
@@ -563,7 +563,7 @@ func Test_Process_Skips_File_When_Callback_Returns_ErrSkip(t *testing.T) {
 	writeFile(t, root, "skip.txt", []byte("skip"))
 
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, _ *fileproc.FileWorker) (*string, error) {
-		path := string(f.AbsPathBorrowed())
+		path := string(f.AbsPath())
 		if strings.HasSuffix(path, "skip.txt") {
 			return nil, fileproc.ErrSkip
 		}

@@ -44,7 +44,7 @@ var ErrSkip = errors.New("skip")
 // Callbacks may run concurrently; results are unordered.
 //
 // Each callback receives:
-//   - *File: lazy access to path, metadata, and content (AbsPathBorrowed, Stat,
+//   - *File: lazy access to path, metadata, and content (AbsPath, Stat,
 //     Bytes, Read, Fd).
 //   - *FileWorker: reusable low-level memory helpers (Buf, RetainBytes).
 //
@@ -169,6 +169,7 @@ func Process[T any](ctx context.Context, path string, fn ProcessFunc[T], opts ..
 
 	proc := &processor[T]{
 		fn:          fn,
+		rootLen:     len(path),
 		fileWorkers: cfg.Workers,
 		scanWorkers: cfg.ScanWorkers,
 		chunkSize:   cfg.ChunkSize,
@@ -186,7 +187,7 @@ func Process[T any](ctx context.Context, path string, fn ProcessFunc[T], opts ..
 //
 // ProcessFunc may be called concurrently and must be safe for concurrent use.
 //
-// f provides access to [File] metadata and content (AbsPathBorrowed, Stat, Bytes,
+// f provides access to [File] metadata and content (AbsPath, Stat, Bytes,
 // Read, Fd). w provides reusable temporary buffers (Buf, RetainBytes).
 //
 // Both f and w are only valid during the callback.

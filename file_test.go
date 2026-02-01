@@ -15,7 +15,7 @@ import (
 	"github.com/calvinalkan/fileproc"
 )
 
-func Test_File_AbsPathBorrowed_Returns_Correct_Path_When_NonRecursive(t *testing.T) {
+func Test_File_AbsPath_Returns_Correct_Path_When_NonRecursive(t *testing.T) {
 	t.Parallel()
 
 	root := t.TempDir()
@@ -54,7 +54,7 @@ func Test_File_AbsPathBorrowed_Returns_Correct_Path_When_NonRecursive(t *testing
 	}
 }
 
-func Test_File_AbsPathBorrowed_Returns_Correct_Path_When_Recursive(t *testing.T) {
+func Test_File_AbsPath_Returns_Correct_Path_When_Recursive(t *testing.T) {
 	t.Parallel()
 
 	root := t.TempDir()
@@ -102,7 +102,7 @@ func Test_File_AbsPathBorrowed_Returns_Correct_Path_When_Recursive(t *testing.T)
 	}
 }
 
-func Test_File_AbsPathBorrowed_Copy_Remains_Valid_When_Process_Returns(t *testing.T) {
+func Test_File_AbsPath_Copy_Remains_Valid_When_Process_Returns(t *testing.T) {
 	t.Parallel()
 
 	root := t.TempDir()
@@ -172,7 +172,6 @@ func Test_File_RelPath_Returns_Correct_Path(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
@@ -191,7 +190,9 @@ func Test_File_RelPath_Returns_Correct_Path(t *testing.T) {
 
 			results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, _ *fileproc.FileWorker) (*struct{}, error) {
 				mu.Lock()
+
 				seen[string(f.RelPath())] = true
+
 				mu.Unlock()
 
 				return &struct{}{}, nil
@@ -202,12 +203,12 @@ func Test_File_RelPath_Returns_Correct_Path(t *testing.T) {
 			}
 
 			if len(results) != len(tc.want) {
-				t.Fatalf("expected %d results, got %d", len(tc.want), len(results))
+				t.Fatalf("expected %d results, got %d; seen paths: %v", len(tc.want), len(results), seen)
 			}
 
 			for _, w := range tc.want {
 				if !seen[w] {
-					t.Fatalf("missing expected path %q: %v", w, seen)
+					t.Fatalf("missing expected path %q in seen paths: %v", w, seen)
 				}
 			}
 		})

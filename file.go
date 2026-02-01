@@ -44,12 +44,6 @@ type File struct {
 	pathScratch *[]byte
 	// pathBuilt tracks whether path is populated for this file.
 	pathBuilt bool
-	// relPath caches the built relative path (no trailing NUL).
-	relPath []byte
-	// relPathScratch is a reusable buffer for building relative paths.
-	relPathScratch *[]byte
-	// relPathBuilt tracks whether relPath is populated for this file.
-	relPathBuilt bool
 	// st caches the file stat result.
 	st Stat
 	// statDone tracks whether stat has been attempted.
@@ -69,6 +63,9 @@ type File struct {
 }
 
 // AbsPath returns the absolute file path (without the trailing NUL).
+//
+// Prefer this over string concatenation: it reuses a scratch buffer to
+// avoid per-file allocations and handles path separators correctly.
 //
 // The returned slice is ephemeral and only valid during the callback.
 // Copy if you need to retain it.
@@ -111,57 +108,23 @@ func (f *File) AbsPath() []byte {
 
 // RelPath returns the file path relative to the root passed to [Process].
 //
+// Prefer this over string concatenation: it reuses the AbsPath buffer to
+// avoid per-file allocations and handles path separators correctly.
+//
 // The returned slice is ephemeral and only valid during the callback.
 // Copy if you need to retain it.
 func (f *File) RelPath() []byte {
-	if f.relPathBuilt {
-		return f.relPath
-	}
-
-	baseLen := f.base.lenWithoutNul()
-	nameLen := f.name.lenWithoutNul()
-
-	if baseLen == f.rootLen {
-		f.relPath = f.name[:nameLen]
-		f.relPathBuilt = true
-
-		return f.relPath
+	abs := f.AbsPath()
+	if f.rootLen >= len(abs) {
+		return abs
 	}
 
 	start := f.rootLen
-	if baseLen > f.rootLen && f.base[f.rootLen] == os.PathSeparator {
+	if abs[start] == os.PathSeparator {
 		start++
 	}
-	if start > baseLen {
-		start = baseLen
-	}
 
-	baseRelLen := baseLen - start
-	sep := 0
-	if baseRelLen > 0 {
-		sep = 1
-	}
-
-	needed := baseRelLen + sep + nameLen
-
-	buf := *f.relPathScratch
-	if cap(buf) < needed {
-		buf = make([]byte, 0, needed)
-	}
-
-	buf = buf[:0]
-	if baseRelLen > 0 {
-		buf = append(buf, f.base[start:baseLen]...)
-		buf = append(buf, os.PathSeparator)
-	}
-
-	buf = append(buf, f.name[:nameLen]...)
-
-	*f.relPathScratch = buf
-	f.relPath = buf
-	f.relPathBuilt = true
-
-	return buf
+	return abs[start:]
 }
 
 // Stat returns file metadata.
@@ -428,9 +391,9 @@ func (f *File) Fd() uintptr {
 }
 
 var (
-	errBytesAfterRead     = errors.New("Bytes: cannot call after Read")
-	errBytesAlreadyCalled = errors.New("Bytes: already called")
-	errReadAfterBytes     = errors.New("Read: cannot call after Bytes")
+	errBytesAfterRead     = errors.New("bytes: cannot call after read")
+	errBytesAlreadyCalled = errors.New("bytes: already called")
+	errReadAfterBytes     = errors.New("read: cannot call after bytes")
 
 	// errSkipFile is an internal sentinel indicating the file should be
 	// silently skipped (e.g., became a directory due to race condition).
