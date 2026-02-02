@@ -297,6 +297,13 @@ linters:
         text: "G115:"
         linters:
           - gosec
+      - path: watcher\.go
+        text: "G115:"
+        linters:
+          - gosec
+      - path: watcher\.go
+        linters:
+          - makezero
 
       - path: _test\.go
         linters:

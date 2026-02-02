@@ -443,12 +443,6 @@ func newWatchIndex(shardCount int, expectedFiles int) watchIndex {
 	return idx
 }
 
-// shard returns the shard responsible for the given hash.
-// Sharding reduces lock contention in concurrent scans.
-func (i *watchIndex) shard(hash uint64) *watchShard {
-	return &i.shards[hash&i.mask]
-}
-
 // shouldCompact reports whether dead bytes dominate enough to rebuild.
 // Only used when OwnedPaths is enabled.
 func (s *watchShard) shouldCompact() bool {

@@ -614,7 +614,7 @@ func (w *Watcher) processChunk(
 				// For transient stat failures, keep the entry alive to avoid
 				// false deletes on this scan generation.
 				hash := hashPathFromBase(lease.baseHash, entry)
-				shardIdx := int(hash & mask)
+				shardIdx := int(hash) & int(mask)
 				pending = append(pending, pendingEntry{
 					entry:     entry,
 					hash:      hash,
@@ -634,7 +634,7 @@ func (w *Watcher) processChunk(
 		localSummary.files++
 
 		hash := hashPathFromBase(lease.baseHash, entry)
-		shardIdx := int(hash & mask)
+		shardIdx := int(hash) & int(mask)
 
 		pending = append(pending, pendingEntry{
 			entry: entry,
@@ -653,6 +653,7 @@ func (w *Watcher) processChunk(
 	// per chunk, instead of once per entry.
 	order := make([]int, len(pending))
 	offsets := make([]int, shardCount)
+
 	sum := 0
 	for i, count := range shardCounts {
 		offsets[i] = sum
@@ -689,6 +690,7 @@ func (w *Watcher) processChunk(
 				if found {
 					shard.table.entries[idx].gen = gen
 				}
+
 				continue
 			}
 
@@ -746,8 +748,10 @@ func (w *Watcher) processChunk(
 		if w.cfg.OnEvent != nil && len(events) > 0 {
 			for _, ev := range events {
 				w.cfg.OnEvent(Event{Type: ev.typ, Path: ev.path, Stat: ev.st})
+
 				localSummary.events++
 			}
+
 			events = events[:0]
 		}
 	}
