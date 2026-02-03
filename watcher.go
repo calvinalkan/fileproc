@@ -1,5 +1,93 @@
 package fileproc
 
+// Watcher Design Notes
+//
+// This file implements a polling-based file watcher. Kernel event APIs (inotify,
+// kqueue, FSEvents, ReadDirectoryChangesW) are a valid alternative. The choice is a
+// tradeoff between portability/consistency and latency/overhead.
+//
+// # Polling strengths
+//
+//   - Works on any filesystem that supports stat/readdir (including many network,
+//     container, and virtualized filesystems).
+//
+//   - No per-directory watch limits or kernel buffers to tune (inotify defaults to
+//     ~65k watches, configurable via sysctl).
+//
+//   - Same fast scan pipeline as [Process]; optimized readdir/stat code paths.
+//
+//   - Pure Go, no platform-specific bindings or cgo.
+//
+// # Kernel watcher strengths
+//
+//   - Near-real-time events (microsecond latency).
+//
+//   - Low steady-state CPU (no full scans).
+//
+//   - Lower user-space memory (kernel maintains watch state).
+//
+//   - Event-per-change semantics (not just final state).
+//
+// # Kernel watcher gotchas
+//
+//   - Event semantics vary by OS/editor: atomic saves often show up as Rename+Create
+//     instead of Write, and some workflows emit duplicate events.
+//
+//   - Watching a file directly is brittle: renames/removes often drop the watch.
+//     Watching the parent directory and filtering is more reliable.
+//
+//   - Some platforms lack "close-write" signals, so reading on Write can yield
+//     partially-written data unless you add delays/coalescing.
+//
+//   - Renames across directories may be missed unless all parent directories are
+//     watched.
+//
+// # Event semantics
+//
+//   - Kernel watchers emit every change (create/modify/delete). Under sustained
+//     load, events may be coalesced or dropped by the kernel.
+//
+//   - Polling observes snapshots. If a file changes multiple times between scans,
+//     you will see one Modify event for the final state. Intermediate states are
+//     not captured, but events are not dropped.
+//
+// # Polling gotchas
+//
+//   - Transient files (create+delete between scans) may never be observed.
+//
+//   - Renames are observed as Delete+Create (no rename tracking).
+//
+//   - Filesystems with coarse mtime resolution can collapse rapid modifications
+//     into a single Modify event.
+//
+// # Performance characteristics
+//
+//   - Latency ≈ interval + scan_time. Scan time scales with file count: ~10ms for
+//     100k files, ~130ms for 1M files on a 24-core machine.
+//
+//   - CPU: proportional to file count and interval; dominated by stat/readdir.
+//
+//   - Memory: linear in files (≈150 bytes/file for path+index data).
+//
+// # When to prefer polling
+//
+//   - Very large directory trees (watch limits are a concern).
+//   - Filesystems where kernel events are unreliable (NFS/FUSE/containers).
+//   - Need consistent behavior across OSes and environments.
+//
+// # When to prefer kernel watchers
+//
+//   - Very low latency is required.
+//   - Watching a small set of directories on local disk.
+//   - CPU/memory budgets are tight.
+//
+// # Hybrid approach (not implemented)
+//
+// A potential optimization is to use kernel events for directory changes and scan
+// only affected directories. This combines instant notifications with reliable file
+// scanning, but adds complexity (two systems, races, overflow handling) and does
+// not address filesystems where kernel events are unreliable.
+
 import (
 	"context"
 	"errors"
@@ -768,6 +856,13 @@ func (w *Watcher) sweepDeletes(ctx context.Context, gen uint32) (uint64, uint64)
 		return 0, 0
 	}
 
+	shardCount := max(len(w.index.shards), 1)
+	// Scale total dead-bytes budget across shards to keep trigger stable.
+	minDeadBytes := uint64(compactionMinDeadBytesTotal)
+	if shardCount > 1 {
+		minDeadBytes /= uint64(shardCount)
+	}
+
 	for i := range w.index.shards {
 		shard := &w.index.shards[i]
 		shard.mu.Lock()
@@ -810,11 +905,14 @@ func (w *Watcher) sweepDeletes(ctx context.Context, gen uint32) (uint64, uint64)
 			}
 		}
 
-		if w.cfg.OwnedPaths && shard.shouldCompact() {
-			shard.compactLocked()
-		} else if shard.table.shouldRehash() {
-			// Rehash after deletions to restore probe locality.
-			shard.table.rehash(len(shard.table.slots))
+		shouldRehash := shard.table.shouldRehash()
+
+		shouldCompact := w.cfg.OwnedPaths && shard.shouldCompactPaths(minDeadBytes)
+		if shouldRehash || shouldCompact {
+			// Rehash: fix probe locality (tombstones/load).
+			// Compact paths too: tombstones can stay low under delete+create churn
+			// while dead path bytes grow, so rehash alone won't reclaim store space.
+			shard.rehashAndCompactPaths(w.cfg.OwnedPaths)
 		}
 
 		shard.mu.Unlock()

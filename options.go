@@ -239,7 +239,7 @@ func WithEmitBaseline() Option {
 // watcher storage. This lets retained paths avoid pinning watcher memory and
 // allows the watcher to compact its path index after heavy delete churn to
 // reclaim memory. Compaction runs when dead path bytes dominate live bytes
-// (≈2x) and exceed a minimum size (~8MB).
+// (≈2x) and exceed a minimum size (~4MB total, scaled by shard count).
 //
 // Use this only if you expect huge delete churn and need to reclaim memory.
 // Downside: one allocation + copy per emitted event.

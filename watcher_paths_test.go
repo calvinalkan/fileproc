@@ -68,12 +68,6 @@ func Test_PathTable_Finds_Live_Entries_When_Randomized_Churn(t *testing.T) {
 	table.init(1)
 	table.rehash(8)
 
-	type liveEntry struct {
-		entryIdx int
-		listIdx  int
-	}
-
-	live := make(map[string]liveEntry)
 	names := make([]string, 0, 64)
 	rng := rand.New(rand.NewSource(1))
 	nextID := 0
@@ -81,9 +75,8 @@ func Test_PathTable_Finds_Live_Entries_When_Randomized_Churn(t *testing.T) {
 	insert := func() {
 		name := fmt.Sprintf("f-%d", nextID)
 		nextID++
-		idx := insertPathEntry(&table, &store, base, name)
+		_ = insertPathEntry(&table, &store, base, name)
 		names = append(names, name)
-		live[name] = liveEntry{entryIdx: idx, listIdx: len(names) - 1}
 	}
 
 	remove := func() {
@@ -93,19 +86,21 @@ func Test_PathTable_Finds_Live_Entries_When_Randomized_Churn(t *testing.T) {
 
 		i := rng.Intn(len(names))
 		name := names[i]
-		info := live[name]
-		table.remove(&table.entries[info.entryIdx])
-		delete(live, name)
+
+		// Lookup entry by name (indices change after rehash compaction).
+		n := nulTermName(append([]byte(name), 0))
+		hash := hashPath(base, n)
+
+		_, idx, found := table.findSlot(hash, base, n, &store)
+		if !found {
+			return
+		}
+
+		table.remove(&table.entries[idx])
 
 		last := names[len(names)-1]
 		names[i] = last
 		names = names[:len(names)-1]
-
-		if name != last {
-			info = live[last]
-			info.listIdx = i
-			live[last] = info
-		}
 	}
 
 	const (
@@ -173,4 +168,70 @@ func mapKeys(in map[string]int) []string {
 	}
 
 	return keys
+}
+
+func Test_PathTable_Rehash_Compacts_Entries_When_Tombstones_Exist(t *testing.T) {
+	t.Parallel()
+
+	base := newNulTermPath("/dummy")
+
+	var (
+		store pathStore
+		table pathTable
+	)
+
+	table.init(100)
+
+	// Insert 100 entries.
+	live := make(map[string]int)
+
+	for i := range 100 {
+		name := fmt.Sprintf("file-%03d", i)
+		idx := insertPathEntry(&table, &store, base, name)
+		live[name] = idx
+	}
+
+	if len(table.entries) != 100 {
+		t.Fatalf("expected 100 entries, got %d", len(table.entries))
+	}
+
+	// Remove 90 entries (keep 10).
+	for i := range 90 {
+		name := fmt.Sprintf("file-%03d", i)
+		idx := live[name]
+		table.remove(&table.entries[idx])
+		delete(live, name)
+	}
+
+	if table.count != 10 {
+		t.Fatalf("expected count=10, got %d", table.count)
+	}
+
+	if table.tombstones != 90 {
+		t.Fatalf("expected tombstones=90, got %d", table.tombstones)
+	}
+
+	// Entries slice still has 100 items (90 dead).
+	if len(table.entries) != 100 {
+		t.Fatalf("expected entries slice len=100 before rehash, got %d", len(table.entries))
+	}
+
+	// Rehash should compact entries to only live ones.
+	table.rehash(len(table.slots))
+
+	// After rehash, entries slice should only contain live entries.
+	if len(table.entries) != 10 {
+		t.Fatalf("expected entries slice len=10 after rehash, got %d", len(table.entries))
+	}
+
+	if table.count != 10 {
+		t.Fatalf("expected count=10 after rehash, got %d", table.count)
+	}
+
+	if table.tombstones != 0 {
+		t.Fatalf("expected tombstones=0 after rehash, got %d", table.tombstones)
+	}
+
+	// Verify all live entries are still findable.
+	assertLiveEntries(t, &table, &store, base, mapKeys(live))
 }

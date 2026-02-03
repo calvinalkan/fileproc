@@ -41,6 +41,7 @@ import (
 //   - 8-bit hash tags avoid touching entries on most probe mismatches.
 //
 // Design goals:
+//   - optimize for scan throughput and delete sweeps; point lookups are secondary
 //   - steady-state scans allocate zero per-file (only new files append bytes)
 //   - event emission reuses stored path bytes (no rebuild)
 //   - predictable memory: append-only store + bounded probe factor
@@ -66,12 +67,11 @@ const (
 	loadFactorNum = 7
 	loadFactorDen = 10
 
-	// compactionMinBytes is the minimum dead-byte budget before compaction.
-	// Prevents thrashing on small, transient churn.
-	compactionMinBytes = 8 << 20
-	// compactionDeadRatio triggers when dead bytes dominate live bytes.
-	// Ratio keeps compaction a last-resort for heavy churn.
-	compactionDeadRatio = 2
+	// compactionMinDeadBytesTotal is the minimum dead byte threshold to compact paths,
+	// scaled across shards.
+	compactionMinDeadBytesTotal = 4 << 20
+	// compactionDeadToLiveRatio triggers compaction when dead bytes dominate.
+	compactionDeadToLiveRatio = 2
 )
 
 // maxInt avoids int overflow on 32-bit when pre-sizing buffers.
@@ -257,7 +257,7 @@ func (t *pathTable) ensure(extra int) {
 }
 
 // rehash rebuilds slots into a fresh table of the given size.
-// This removes tombstones and tightens probe chains for faster lookups.
+// This removes tombstones, compacts entries, and tightens probe chains.
 func (t *pathTable) rehash(size int) {
 	slots := make([]uint32, 0, size)
 	slots = slots[:size]
@@ -265,11 +265,16 @@ func (t *pathTable) rehash(size int) {
 	tags = tags[:size]
 	mask := uint64(size - 1)
 
+	// Compact entries: copy only live entries to new slice.
+	newEntries := make([]pathEntry, 0, t.count)
 	for i := range t.entries {
 		entry := &t.entries[i]
 		if !entry.alive {
 			continue
 		}
+
+		newIdx := len(newEntries)
+		newEntries = append(newEntries, *entry)
 
 		tag := hashTag(entry.hash)
 
@@ -278,11 +283,12 @@ func (t *pathTable) rehash(size int) {
 			pos = (pos + 1) & mask
 		}
 
-		slots[pos] = uint32(i) + slotIndexOffset
+		slots[pos] = uint32(newIdx) + slotIndexOffset
 		tags[pos] = tag
-		entry.slot = uint32(pos)
+		newEntries[newIdx].slot = uint32(pos)
 	}
 
+	t.entries = newEntries
 	t.slots = slots
 	t.tags = tags
 	t.tombstones = 0
@@ -407,6 +413,15 @@ type watchShard struct {
 	deadBytes uint64
 }
 
+// shouldCompactPaths reports whether path store compaction is warranted.
+func (s *watchShard) shouldCompactPaths(minDeadBytes uint64) bool {
+	if s.deadBytes < minDeadBytes {
+		return false
+	}
+
+	return s.deadBytes >= s.liveBytes*compactionDeadToLiveRatio
+}
+
 // watchIndex is a sharded hash index keyed by path hash.
 type watchIndex struct {
 	// shards hold independent table/store pairs.
@@ -443,24 +458,18 @@ func newWatchIndex(shardCount int, expectedFiles int) watchIndex {
 	return idx
 }
 
-// shouldCompact reports whether dead bytes dominate enough to rebuild.
-// Only used when OwnedPaths is enabled.
-func (s *watchShard) shouldCompact() bool {
-	if s.deadBytes < compactionMinBytes {
-		return false
-	}
-
-	if s.liveBytes == 0 {
-		return true
-	}
-
-	return s.deadBytes/compactionDeadRatio >= s.liveBytes
-}
-
-// compactLocked rewrites the shard to only live entries/paths.
+// rehashAndCompactPaths rehashes the table (compacting entries) and optionally
+// compacts the path store if ownedPaths is true.
 // Caller must hold shard.mu.
-// Safe only when OwnedPaths is enabled (no external references).
-func (s *watchShard) compactLocked() {
+func (s *watchShard) rehashAndCompactPaths(ownedPaths bool) {
+	if !ownedPaths {
+		// Just rehash entries, don't touch path store.
+		s.table.rehash(len(s.table.slots))
+
+		return
+	}
+
+	// OwnedPaths enabled: compact both entries and paths.
 	if s.table.count == 0 {
 		s.table = pathTable{}
 		s.table.init(1)
@@ -471,7 +480,6 @@ func (s *watchShard) compactLocked() {
 		return
 	}
 
-	// Rebuild entries/slots and path store from live entries only.
 	newTable := pathTable{}
 	newTable.init(s.table.count)
 
