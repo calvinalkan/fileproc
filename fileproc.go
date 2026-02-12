@@ -257,8 +257,11 @@ type Lease struct {
 
 // Release returns this lease buffer to the worker reuse pool.
 //
-// Release is safe to call from any goroutine and is idempotent. After the
-// first successful release, Buf is invalid and must not be accessed.
+// Release is safe to call from any goroutine and is idempotent:
+// repeated calls on the same lease return the same result.
+//
+// Calling Release after [Process] returns is allowed and behaves as a no-op.
+// After the first successful release, Buf is invalid and must not be accessed.
 func (l Lease) Release() error {
 	if l.token == nil {
 		return errInvalidLease
@@ -323,6 +326,9 @@ func (w *FileWorker) RetainBytes(b []byte) []byte {
 //
 // The returned buffer is valid until [Lease.Release] or [Process] return,
 // whichever comes first. Release is safe from non-callback goroutines.
+//
+// Leases are a middle ground between [FileWorker.Buf] (callback-local scratch)
+// and [FileWorker.RetainBytes] (kept for full Process lifetime).
 //
 // size <= 0 returns a lease with an empty buffer.
 func (w *FileWorker) RetainLease(size int) Lease {
