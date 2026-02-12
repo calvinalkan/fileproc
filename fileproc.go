@@ -251,8 +251,8 @@ type Lease struct {
 	// Buf has len equal to requested size and is writable.
 	Buf []byte
 
-	// token is shared across Lease copies so Release stays idempotent.
-	token *leaseToken
+	// leases points to the owning worker lease manager.
+	leases *workerLeases
 }
 
 // Release returns this lease buffer to the worker reuse pool.
@@ -263,11 +263,11 @@ type Lease struct {
 // Calling Release after [Process] returns is allowed and behaves as a no-op.
 // After the first successful release, Buf is invalid and must not be accessed.
 func (l Lease) Release() error {
-	if l.token == nil {
+	if l.leases == nil {
 		return errInvalidLease
 	}
 
-	return l.token.release()
+	return l.leases.release(l.ID)
 }
 
 // ID returns this callback worker's identity.
@@ -337,28 +337,6 @@ func (w *FileWorker) RetainLease(size int) Lease {
 
 var errInvalidLease = errors.New("lease: invalid")
 
-type leaseToken struct {
-	once sync.Once
-
-	leases *workerLeases
-	id     LeaseID
-	err    error
-}
-
-func (t *leaseToken) release() error {
-	t.once.Do(func() {
-		if t.leases == nil {
-			t.err = errInvalidLease
-
-			return
-		}
-
-		t.err = t.leases.release(t.id)
-	})
-
-	return t.err
-}
-
 // workerLeases keeps worker-owned lease buffers reusable and thread-safe.
 type workerLeases struct {
 	mu sync.Mutex
@@ -393,9 +371,9 @@ func (l *workerLeases) retain(size int) Lease {
 	l.active[leaseID] = buffer
 
 	return Lease{
-		ID:    leaseID,
-		Buf:   buffer,
-		token: &leaseToken{leases: l, id: leaseID},
+		ID:     leaseID,
+		Buf:    buffer,
+		leases: l,
 	}
 }
 
