@@ -177,7 +177,7 @@ func Test_FileWorker_RetainLease_Returns_Empty_Buffer_When_Size_Is_NonPositive(t
 	}
 }
 
-func Test_FileWorker_RetainLease_Assigns_DistinctIDs_When_Multiple_Leases_Are_Active(t *testing.T) {
+func Test_FileWorker_RetainLease_Uses_Distinct_Buffers_When_Multiple_Leases_Are_Active(t *testing.T) {
 	t.Parallel()
 
 	root := t.TempDir()
@@ -186,14 +186,6 @@ func Test_FileWorker_RetainLease_Assigns_DistinctIDs_When_Multiple_Leases_Are_Ac
 	_, errs := fileproc.Process(t.Context(), root, func(_ *fileproc.File, w *fileproc.FileWorker) (*struct{}, error) {
 		first := w.RetainLease(32)
 		second := w.RetainLease(32)
-
-		if first.ID == 0 || second.ID == 0 {
-			t.Fatalf("expected non-zero lease IDs, got first=%d second=%d", first.ID, second.ID)
-		}
-
-		if first.ID == second.ID {
-			t.Fatalf("expected distinct lease IDs, got %d", first.ID)
-		}
 
 		// Both leases are still active, so memory must not alias.
 		if sliceDataPtr(first.Buf) == sliceDataPtr(second.Buf) {
@@ -437,14 +429,6 @@ func Test_Lease_Release_Returns_Error_When_Lease_Is_ZeroValue(t *testing.T) {
 	}
 }
 
-func sliceDataPtr(b []byte) uintptr {
-	if len(b) == 0 {
-		return 0
-	}
-
-	return uintptr(unsafe.Pointer(unsafe.SliceData(b)))
-}
-
 func Benchmark_FileWorker_RetainLease_Release_When_Buffer_Is_Reused(b *testing.B) {
 	b.ReportAllocs()
 
@@ -561,4 +545,12 @@ func prepareLeaseBenchmarkRoot(b *testing.B) string {
 	}
 
 	return root
+}
+
+func sliceDataPtr(b []byte) uintptr {
+	if len(b) == 0 {
+		return 0
+	}
+
+	return uintptr(unsafe.Pointer(unsafe.SliceData(b)))
 }
