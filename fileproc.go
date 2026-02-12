@@ -46,7 +46,8 @@ var ErrSkip = errors.New("skip")
 // Each callback receives:
 //   - *File: lazy access to path, metadata, and content (AbsPath, Stat,
 //     Bytes, Read, Fd).
-//   - *FileWorker: reusable low-level memory helpers (ID, Buf, RetainBytes).
+//   - *FileWorker: reusable low-level memory helpers (ID, Buf, RetainBytes,
+//     RetainLease).
 //
 // File and FileWorker data are only valid during the callback; do not retain
 // *File or any borrowed buffers/slices beyond the callback.
@@ -188,7 +189,8 @@ func Process[T any](ctx context.Context, path string, fn ProcessFunc[T], opts ..
 // ProcessFunc may be called concurrently and must be safe for concurrent use.
 //
 // f provides access to [File] metadata and content (AbsPath, Stat, Bytes,
-// Read, Fd). w provides reusable temporary buffers (ID, Buf, RetainBytes).
+// Read, Fd). w provides reusable temporary buffers (ID, Buf, RetainBytes,
+// RetainLease).
 //
 // Both f and w are only valid during the callback.
 //
@@ -220,6 +222,9 @@ type ProcessFunc[T any] func(f *File, w *FileWorker) (*T, error)
 // Use Buf for scratch space that can be reused across callbacks, and
 // RetainBytes to copy data into a per-worker arena when you need it to live
 // beyond the current callback.
+//
+// Use [FileWorker.RetainLease] when data must outlive the callback but should
+// be explicitly released before [Process] returns.
 type FileWorker struct {
 	// id is stable for this worker within one Process invocation.
 	id int
@@ -227,6 +232,39 @@ type FileWorker struct {
 	buf []byte
 	// retain is the append-only arena for retained data.
 	retain []byte
+	// leases tracks explicitly releasable buffers.
+	leases workerLeases
+}
+
+// LeaseID identifies a lease returned by [FileWorker.RetainLease].
+//
+// IDs are unique only within one worker in one [Process] invocation.
+type LeaseID uint64
+
+// Lease is a writable buffer retained from a worker-local lease pool.
+//
+// Buf remains valid until [Lease.Release] is called or until [Process] returns.
+// The zero value is invalid and Release returns an error.
+type Lease struct {
+	// ID is stable for the lease lifetime and useful for debugging.
+	ID LeaseID
+	// Buf has len equal to requested size and is writable.
+	Buf []byte
+
+	// token is shared across Lease copies so Release stays idempotent.
+	token *leaseToken
+}
+
+// Release returns this lease buffer to the worker reuse pool.
+//
+// Release is safe to call from any goroutine and is idempotent. After the
+// first successful release, Buf is invalid and must not be accessed.
+func (l Lease) Release() error {
+	if l.token == nil {
+		return errInvalidLease
+	}
+
+	return l.token.release()
 }
 
 // ID returns this callback worker's identity.
@@ -279,6 +317,133 @@ func (w *FileWorker) RetainBytes(b []byte) []byte {
 	w.retain = append(w.retain, b...)
 
 	return w.retain[start:]
+}
+
+// RetainLease returns a writable lease buffer with len=size.
+//
+// The returned buffer is valid until [Lease.Release] or [Process] return,
+// whichever comes first. Release is safe from non-callback goroutines.
+//
+// size <= 0 returns a lease with an empty buffer.
+func (w *FileWorker) RetainLease(size int) Lease {
+	return w.leases.retain(size)
+}
+
+var errInvalidLease = errors.New("lease: invalid")
+
+type leaseToken struct {
+	once sync.Once
+
+	leases *workerLeases
+	id     LeaseID
+	err    error
+}
+
+func (t *leaseToken) release() error {
+	t.once.Do(func() {
+		if t.leases == nil {
+			t.err = errInvalidLease
+
+			return
+		}
+
+		t.err = t.leases.release(t.id)
+	})
+
+	return t.err
+}
+
+// workerLeases keeps worker-owned lease buffers reusable and thread-safe.
+type workerLeases struct {
+	mu sync.Mutex
+
+	nextID LeaseID
+	active map[LeaseID][]byte
+	free   [][]byte
+	closed bool
+}
+
+func (l *workerLeases) retain(size int) Lease {
+	if size < 0 {
+		size = 0
+	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if l.closed {
+		// Worker lifetime ended; return an invalid lease rather than panicking.
+		return Lease{Buf: []byte{}}
+	}
+
+	if l.active == nil {
+		l.active = make(map[LeaseID][]byte, 8)
+	}
+
+	leaseID := l.nextID + 1
+	l.nextID = leaseID
+
+	buffer := l.takeBuffer(size)
+	l.active[leaseID] = buffer
+
+	return Lease{
+		ID:    leaseID,
+		Buf:   buffer,
+		token: &leaseToken{leases: l, id: leaseID},
+	}
+}
+
+func (l *workerLeases) takeBuffer(size int) []byte {
+	for i := len(l.free) - 1; i >= 0; i-- {
+		if cap(l.free[i]) < size {
+			continue
+		}
+
+		reused := l.free[i]
+		last := len(l.free) - 1
+		l.free[i] = l.free[last]
+		l.free[last] = nil
+		l.free = l.free[:last]
+
+		return reused[:size]
+	}
+
+	if size == 0 {
+		return []byte{}
+	}
+
+	return make([]byte, size)
+}
+
+func (l *workerLeases) release(id LeaseID) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if l.closed {
+		// Process already ended and leases were auto-cleaned.
+		return nil
+	}
+
+	buffer, ok := l.active[id]
+	if !ok {
+		// Unknown here means already released/cleaned; keep Release idempotent.
+		return nil
+	}
+
+	delete(l.active, id)
+	l.free = append(l.free, buffer[:0])
+
+	return nil
+}
+
+func (l *workerLeases) shutdown() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	l.closed = true
+	clear(l.active)
+	l.active = nil
+	l.free = nil
 }
 
 // IOError is returned when a file system operation fails.

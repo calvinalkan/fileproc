@@ -571,6 +571,9 @@ func (p *processor[T]) process(ctx context.Context, root nulTermPath) ([]*T, []e
 				chunk.release()
 			}
 
+			// Drop all outstanding lease bookkeeping when this Process run ends.
+			bufs.worker.leases.shutdown()
+
 			results[id] = localResults
 			errs[id] = localErrs
 		}(workerID)
