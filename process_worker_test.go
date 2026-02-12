@@ -3,6 +3,8 @@ package fileproc_test
 import (
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -441,4 +443,122 @@ func sliceDataPtr(b []byte) uintptr {
 	}
 
 	return uintptr(unsafe.Pointer(unsafe.SliceData(b)))
+}
+
+func Benchmark_FileWorker_RetainLease_Release_When_Buffer_Is_Reused(b *testing.B) {
+	b.ReportAllocs()
+
+	runLeaseBenchmark(b, func(worker *fileproc.FileWorker) {
+		const size = 4 * 1024
+
+		b.ResetTimer()
+
+		for i := range b.N {
+			lease := worker.RetainLease(size)
+			lease.Buf[0] = byte(i)
+
+			err := lease.Release()
+			if err != nil {
+				b.Fatalf("release: %v", err)
+			}
+		}
+
+		b.StopTimer()
+	})
+}
+
+func Benchmark_FileWorker_RetainLease_Release_When_Buffer_Grows(b *testing.B) {
+	b.ReportAllocs()
+
+	runLeaseBenchmark(b, func(worker *fileproc.FileWorker) {
+		b.ResetTimer()
+
+		for i := range b.N {
+			size := 64
+			if i%2 == 1 {
+				size = 64 * 1024
+			}
+
+			lease := worker.RetainLease(size)
+			lease.Buf[0] = byte(i)
+
+			err := lease.Release()
+			if err != nil {
+				b.Fatalf("release: %v", err)
+			}
+		}
+
+		b.StopTimer()
+	})
+}
+
+func Benchmark_FileWorker_Lease_Release_Remains_Idempotent_When_Called_Twice(b *testing.B) {
+	b.ReportAllocs()
+
+	runLeaseBenchmark(b, func(worker *fileproc.FileWorker) {
+		const size = 1024
+
+		b.ResetTimer()
+
+		for i := range b.N {
+			lease := worker.RetainLease(size)
+			lease.Buf[0] = byte(i)
+
+			err := lease.Release()
+			if err != nil {
+				b.Fatalf("first release: %v", err)
+			}
+
+			err = lease.Release()
+			if err != nil {
+				b.Fatalf("second release: %v", err)
+			}
+		}
+
+		b.StopTimer()
+	})
+}
+
+func runLeaseBenchmark(b *testing.B, benchFn func(*fileproc.FileWorker)) {
+	b.Helper()
+
+	root := prepareLeaseBenchmarkRoot(b)
+	callbacks := 0
+
+	_, errs := fileproc.Process(
+		b.Context(),
+		root,
+		func(_ *fileproc.File, worker *fileproc.FileWorker) (*struct{}, error) {
+			callbacks++
+			if callbacks > 1 {
+				return nil, errors.New("unexpected extra callback in benchmark")
+			}
+
+			benchFn(worker)
+
+			return &struct{}{}, nil
+		},
+		fileproc.WithFileWorkers(1),
+	)
+	if len(errs) != 0 {
+		b.Fatalf("expected no errors, got %v", errs)
+	}
+
+	if callbacks != 1 {
+		b.Fatalf("expected exactly one callback, got %d", callbacks)
+	}
+}
+
+func prepareLeaseBenchmarkRoot(b *testing.B) string {
+	b.Helper()
+
+	root := b.TempDir()
+	path := filepath.Join(root, "bench.txt")
+
+	err := os.WriteFile(path, []byte("x"), 0o600)
+	if err != nil {
+		b.Fatalf("write %s: %v", path, err)
+	}
+
+	return root
 }
