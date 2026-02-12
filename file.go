@@ -25,11 +25,12 @@ type Stat struct {
 // File provides access to a file being processed by [Process].
 //
 // All methods are lazy: the underlying file is opened on first content access
-// (ReadAll, Read, or Fd). The handle is owned by fileproc and closed after the
-// callback returns. File must not be retained beyond the callback.
+// (ReadAll, ReadAllIntoAt, Read, or Fd). The handle is owned by fileproc and
+// closed after the callback returns. File must not be retained beyond the
+// callback.
 //
-// ReadAll() and Read() are mutually exclusive per file. Calling one after
-// the other returns an error.
+// ReadAll(), ReadAllIntoAt(), and Read() are mutually exclusive per file.
+// Calling one after another returns an error.
 type File struct {
 	// dh is the open directory handle used for openat/statat.
 	dh dirHandle
@@ -196,7 +197,7 @@ func WithSizeHint(size int) ReadAllOption {
 // Empty files return a non-nil empty slice ([]byte{}, nil).
 //
 // Single-use: ReadAll can only be called once per File and is mutually exclusive
-// with [File.Read].
+// with [File.Read] and [File.ReadAllIntoAt].
 //
 // Returns error if called after [File.Read], or on I/O failure. If the file
 // changes type (becomes a directory or symlink) between scan and read, ReadAll
@@ -283,6 +284,52 @@ func (f *File) ReadAll(opts ...ReadAllOption) ([]byte, error) {
 	return out[:n], nil
 }
 
+// ReadAllIntoAt reads the full file content into dst starting at destOffset.
+//
+// It writes into dst[destOffset:] and returns the number of bytes written.
+//
+// If the file does not fit in the remaining destination space, it writes as much
+// as possible and returns io.ErrShortBuffer. If it fits exactly, it returns nil.
+//
+// Empty files return (0, nil).
+//
+// Single-use: ReadAllIntoAt can only be called once per File and is mutually
+// exclusive with [File.ReadAll] and [File.Read].
+//
+// Returns an error when destOffset is outside [0, len(dst)].
+// If the file changes type (becomes a directory or symlink) between scan and
+// read, ReadAllIntoAt returns a skip error that Process ignores when returned
+// by the callback.
+func (f *File) ReadAllIntoAt(dst []byte, destOffset int) (int, error) {
+	if f.mode == fileModeReader {
+		return 0, errBytesAfterRead
+	}
+
+	if f.mode == fileModeBytes {
+		return 0, errBytesAlreadyCalled
+	}
+
+	// Validate destination before mutating file state.
+	if destOffset < 0 || destOffset > len(dst) {
+		return 0, errInvalidDestOffset
+	}
+
+	// Open file if needed.
+	openErr := f.open()
+	if openErr != nil {
+		return 0, openErr
+	}
+
+	f.mode = fileModeBytes
+
+	n, _, err := f.readAllInto(dst, destOffset, false)
+	if err != nil {
+		return n, err
+	}
+
+	return n, nil
+}
+
 // Read implements io.Reader for streaming access.
 //
 // Use when you need only a prefix or want to process in chunks without
@@ -290,7 +337,8 @@ func (f *File) ReadAll(opts ...ReadAllOption) ([]byte, error) {
 // caller provides and manages the buffer.
 //
 // Read may be called multiple times until it returns io.EOF. It is mutually
-// exclusive with [File.ReadAll] and returns an error if ReadAll was used first.
+// exclusive with [File.ReadAll] and [File.ReadAllIntoAt], and returns an error
+// if one of those methods was used first.
 //
 // If the file changes type (becomes a directory or symlink) between scan and
 // read, Read returns a skip error that Process ignores when returned by the
