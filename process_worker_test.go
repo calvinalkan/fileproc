@@ -1,6 +1,7 @@
 package fileproc_test
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -426,6 +427,230 @@ func Test_Lease_Release_Returns_Error_When_Lease_Is_ZeroValue(t *testing.T) {
 	err := lease.Release()
 	if err == nil {
 		t.Fatal("expected zero-value lease release to fail")
+	}
+}
+
+func Test_FileWorker_Leases_Are_Isolated_When_Multiple_Workers_Retain_Concurrently(t *testing.T) {
+	t.Parallel()
+
+	const (
+		workers   = 4
+		leaseSize = 128
+	)
+
+	root := t.TempDir()
+	writeFlatFiles(t, root, testNumFilesBig, func(i int) string {
+		return fmt.Sprintf("f-%04d.txt", i)
+	}, nil)
+
+	var (
+		mu               sync.Mutex
+		firstPtrByWorker = make(map[string]uintptr, workers)
+		markerByWorker   = make(map[string]byte, workers)
+		completedWorkers = make(map[string]struct{}, workers)
+	)
+
+	allRetained := make(chan struct{})
+
+	waitCtx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+
+	_, errs := fileproc.Process(
+		t.Context(),
+		root,
+		func(_ *fileproc.File, w *fileproc.FileWorker) (*struct{}, error) {
+			workerPtr := fmt.Sprintf("%p", w)
+
+			mu.Lock()
+
+			if _, done := completedWorkers[workerPtr]; done {
+				mu.Unlock()
+
+				return &struct{}{}, nil
+			}
+
+			lease := w.RetainLease(leaseSize)
+
+			marker := byte(len(firstPtrByWorker) + 1)
+			for i := range lease.Buf {
+				lease.Buf[i] = marker
+			}
+
+			firstPtr := sliceDataPtr(lease.Buf)
+			firstPtrByWorker[workerPtr] = firstPtr
+			markerByWorker[workerPtr] = marker
+
+			if len(firstPtrByWorker) == workers {
+				close(allRetained)
+			}
+
+			mu.Unlock()
+
+			select {
+			case <-allRetained:
+			case <-waitCtx.Done():
+				return nil, errors.New("timed out waiting for concurrent lease retention")
+			}
+
+			mu.Lock()
+
+			for otherWorker, otherPtr := range firstPtrByWorker {
+				if otherWorker != workerPtr && otherPtr == firstPtr {
+					mu.Unlock()
+
+					return nil, fmt.Errorf("workers share active lease buffer: %s and %s", workerPtr, otherWorker)
+				}
+			}
+
+			expectedMarker := markerByWorker[workerPtr]
+
+			mu.Unlock()
+
+			for i := range leaseSize {
+				if lease.Buf[i] != expectedMarker {
+					return nil, fmt.Errorf("lease data corrupted at %d: got=%d want=%d", i, lease.Buf[i], expectedMarker)
+				}
+			}
+
+			err := lease.Release()
+			if err != nil {
+				return nil, fmt.Errorf("release first lease: %w", err)
+			}
+
+			mu.Lock()
+
+			completedWorkers[workerPtr] = struct{}{}
+
+			mu.Unlock()
+
+			return &struct{}{}, nil
+		},
+		fileproc.WithFileWorkers(workers),
+		fileproc.WithChunkSize(1),
+	)
+
+	if len(errs) != 0 {
+		t.Fatalf("expected no errors, got %v", errs)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if len(firstPtrByWorker) != workers {
+		t.Fatalf("expected %d workers to retain leases, got %d", workers, len(firstPtrByWorker))
+	}
+
+	if len(completedWorkers) != workers {
+		t.Fatalf("expected %d workers to complete lease validation, got %d", workers, len(completedWorkers))
+	}
+}
+
+func Test_FileWorker_Lease_Reuses_Worker_Buffer_When_Workers_Release_Concurrently(t *testing.T) {
+	t.Parallel()
+
+	const (
+		workers   = 4
+		leaseSize = 320
+	)
+
+	root := t.TempDir()
+	writeFlatFiles(t, root, testNumFilesBig, func(i int) string {
+		return fmt.Sprintf("f-%04d.txt", i)
+	}, nil)
+
+	var (
+		mu               sync.Mutex
+		firstPtrByWorker = make(map[string]uintptr, workers)
+		completedWorkers = make(map[string]struct{}, workers)
+	)
+
+	allRetained := make(chan struct{})
+
+	waitCtx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+
+	_, errs := fileproc.Process(
+		t.Context(),
+		root,
+		func(_ *fileproc.File, w *fileproc.FileWorker) (*struct{}, error) {
+			workerPtr := fmt.Sprintf("%p", w)
+
+			mu.Lock()
+
+			if _, done := completedWorkers[workerPtr]; done {
+				mu.Unlock()
+
+				return &struct{}{}, nil
+			}
+
+			mu.Unlock()
+
+			first := w.RetainLease(leaseSize)
+			firstPtr := sliceDataPtr(first.Buf)
+
+			mu.Lock()
+
+			firstPtrByWorker[workerPtr] = firstPtr
+			if len(firstPtrByWorker) == workers {
+				close(allRetained)
+			}
+
+			mu.Unlock()
+
+			select {
+			case <-allRetained:
+			case <-waitCtx.Done():
+				return nil, errors.New("timed out waiting for concurrent lease retention")
+			}
+
+			releaseDone := make(chan error, 1)
+
+			go func(l fileproc.Lease) {
+				releaseDone <- l.Release()
+			}(first)
+
+			err := <-releaseDone
+			if err != nil {
+				return nil, fmt.Errorf("release first lease from goroutine: %w", err)
+			}
+
+			second := w.RetainLease(leaseSize)
+
+			secondPtr := sliceDataPtr(second.Buf)
+			if secondPtr != firstPtr {
+				return nil, fmt.Errorf("worker did not reuse its lease buffer: first=%#x second=%#x", firstPtr, secondPtr)
+			}
+
+			err = second.Release()
+			if err != nil {
+				return nil, fmt.Errorf("release second lease: %w", err)
+			}
+
+			mu.Lock()
+
+			completedWorkers[workerPtr] = struct{}{}
+
+			mu.Unlock()
+
+			return &struct{}{}, nil
+		},
+		fileproc.WithFileWorkers(workers),
+		fileproc.WithChunkSize(1),
+	)
+
+	if len(errs) != 0 {
+		t.Fatalf("expected no errors, got %v", errs)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if len(firstPtrByWorker) != workers {
+		t.Fatalf("expected %d workers to retain leases, got %d", workers, len(firstPtrByWorker))
+	}
+
+	if len(completedWorkers) != workers {
+		t.Fatalf("expected %d workers to complete reuse validation, got %d", workers, len(completedWorkers))
 	}
 }
 

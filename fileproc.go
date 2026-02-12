@@ -219,8 +219,8 @@ type ProcessFunc[T any] func(f *File, w *FileWorker) (*T, error)
 // IDs are unique within a single [Process] invocation and stable for that
 // worker until the invocation returns.
 //
-// Use Buf for scratch space that can be reused across callbacks, and
-// RetainBytes to copy data into a per-worker arena when you need it to live
+// Use [FileWorker.Buf] for scratch space that can be reused across callbacks, and
+// [FileWorker.RetainBytes] to copy data into a per-worker arena when you need it to live
 // beyond the current callback.
 //
 // Use [FileWorker.RetainLease] when data must outlive the callback but should
