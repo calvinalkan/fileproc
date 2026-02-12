@@ -2,6 +2,7 @@ package fileproc
 
 import (
 	"errors"
+	"io"
 	"os"
 	"syscall"
 )
@@ -266,56 +267,20 @@ func (f *File) ReadAll(opts ...ReadAllOption) ([]byte, error) {
 	}
 
 	*f.dataBuf = (*f.dataBuf)[:readSize]
-	buf := *f.dataBuf
 
-	// Single read syscall using backend.
-	n, isDir, err := f.fh.readInto(buf)
-	if isDir {
-		return nil, errSkipFile
-	}
-
+	n, out, err := f.readAllInto(*f.dataBuf, 0, true)
 	if err != nil {
 		return nil, err
 	}
 
-	// Buffer was filled - file may be larger, continue reading.
-	if n == readSize {
-		var readErr error
-
-		for {
-			if n == len(buf) {
-				growBy := max(len(buf), 4096)
-				*f.dataBuf = append(*f.dataBuf, make([]byte, growBy)...)
-				buf = *f.dataBuf
-			}
-
-			m, isDir, err := f.fh.readInto(buf[n:])
-			if isDir {
-				return nil, errSkipFile
-			}
-
-			if err != nil {
-				readErr = err
-			}
-
-			n += m
-
-			if m == 0 || readErr != nil {
-				break
-			}
-		}
-
-		if readErr != nil {
-			return nil, readErr
-		}
-	}
+	*f.dataBuf = out
 
 	// Empty file.
 	if n == 0 {
 		return []byte{}, nil
 	}
 
-	return buf[:n], nil
+	return out[:n], nil
 }
 
 // Read implements io.Reader for streaming access.
@@ -390,10 +355,100 @@ func (f *File) Fd() uintptr {
 	return f.fh.fdValue()
 }
 
+// readAllInto reads file content into dst starting at destOff.
+//
+// When allowGrow is true, dst may be grown to fit full content.
+// When allowGrow is false, io.ErrShortBuffer is returned if content exceeds
+// remaining destination capacity.
+func (f *File) readAllInto(dst []byte, destOffset int, allowGrow bool) (int, []byte, error) {
+	// destOffset==len(dst) is valid (zero remaining capacity).
+	if destOffset < 0 || destOffset > len(dst) {
+		return 0, dst, errInvalidDestOffset
+	}
+
+	buffer := dst
+
+	// Fast path: one read handles empty/small files without entering the grow loop.
+	initialRead, isDir, err := f.fh.readInto(buffer[destOffset:])
+	if isDir {
+		return 0, buffer, errSkipFile
+	}
+
+	if err != nil {
+		return 0, buffer, err
+	}
+
+	writeCursor := destOffset + initialRead
+
+	// A full initial read means there may be more bytes; continue until EOF/error.
+	if initialRead == len(buffer)-destOffset {
+		var readFailure error
+
+		for {
+			if writeCursor == len(buffer) {
+				if !allowGrow {
+					// Distinguish exact fit vs truncation without growing destination:
+					// if one more byte exists, caller buffer was too small.
+					var probe [1]byte
+
+					probeRead, isDir, err := f.fh.readInto(probe[:])
+					if isDir {
+						return writeCursor - destOffset, buffer, errSkipFile
+					}
+
+					if err != nil {
+						return writeCursor - destOffset, buffer, err
+					}
+
+					if probeRead > 0 {
+						return writeCursor - destOffset, buffer, io.ErrShortBuffer
+					}
+
+					break
+				}
+
+				// Geometric growth keeps realloc count low on large files.
+				growBy := max(len(buffer), 4096)
+				if growBy == 0 {
+					growBy = defaultReadBufSize
+				}
+
+				buffer = append(buffer, make([]byte, growBy)...)
+			}
+
+			chunkRead, isDir, err := f.fh.readInto(buffer[writeCursor:])
+			if isDir {
+				return writeCursor - destOffset, buffer, errSkipFile
+			}
+
+			// Keep bytes read so far, then surface the read error after loop.
+			if err != nil {
+				readFailure = err
+			}
+
+			// Advance by actual bytes read, even on short reads.
+			writeCursor += chunkRead
+
+			// Stop on EOF/short-read (chunkRead==0) or any read failure.
+			if chunkRead == 0 || readFailure != nil {
+				break
+			}
+		}
+
+		// Return buffered bytes alongside the terminal read failure.
+		if readFailure != nil {
+			return writeCursor - destOffset, buffer, readFailure
+		}
+	}
+
+	return writeCursor - destOffset, buffer, nil
+}
+
 var (
 	errBytesAfterRead     = errors.New("bytes: cannot call after read")
 	errBytesAlreadyCalled = errors.New("bytes: already called")
 	errReadAfterBytes     = errors.New("read: cannot call after bytes")
+	errInvalidDestOffset  = errors.New("read all into: invalid destination offset")
 
 	// errSkipFile is an internal sentinel indicating the file should be
 	// silently skipped (e.g., became a directory due to race condition).
