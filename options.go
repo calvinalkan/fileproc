@@ -290,12 +290,8 @@ func applyOptions(opts []Option) options {
 		}
 	}
 
-	if cfg.Recursive {
-		if cfg.Workers <= 0 {
-			cfg.Workers = defaultRecursiveWorkers()
-		}
-	} else if cfg.Workers <= 0 {
-		cfg.Workers = defaultWorkers()
+	if cfg.Workers <= 0 {
+		cfg.Workers = DefaultWorkers(cfg.Recursive)
 	}
 
 	if cfg.Workers > maxWorkers {
@@ -317,26 +313,19 @@ func applyOptions(opts []Option) options {
 	return cfg
 }
 
-// defaultWorkers returns the default file worker count for non-recursive mode.
+// DefaultWorkers returns the current default worker-count resolution used by
+// [Process] when [WithFileWorkers] is not set.
 //
-// Formula: (GOMAXPROCS × 2) / 3, minimum 4.
-//
-// Rationale: benchmarks on 24-core showed w=16 optimal for I/O-bound work.
-// Higher counts (32–256) cause kernel VFS lock contention, increasing
-// per-syscall latency without improving throughput.
-func defaultWorkers() int {
-	return max((runtime.GOMAXPROCS(0)*2)/3, 4)
-}
+// When recursive is false, this matches non-recursive [Process] defaults.
+// When recursive is true, this matches [WithRecursive] defaults.
+func DefaultWorkers(recursive bool) int {
+	if recursive {
+		// Recursive default: NumCPU/2, clamped to [4, 16].
+		return min(max(runtime.NumCPU()/2, 4), 16)
+	}
 
-// defaultRecursiveWorkers returns the default worker count for tree traversal.
-//
-// Benchmarks on a 24-core machine showed 12 workers optimal for tree mode,
-// with regression at 16+ workers due to futex contention from goroutine
-// coordination (job queue + found channel for subdirectories).
-//
-// Formula: NumCPU/2, clamped to [4, 16].
-func defaultRecursiveWorkers() int {
-	return min(max(runtime.NumCPU()/2, 4), 16)
+	// Non-recursive default: (GOMAXPROCS × 2) / 3, minimum 4.
+	return max((runtime.GOMAXPROCS(0)*2)/3, 4)
 }
 
 // defaultScanWorkers returns the default scan worker count.

@@ -46,7 +46,7 @@ var ErrSkip = errors.New("skip")
 // Each callback receives:
 //   - *File: lazy access to path, metadata, and content (AbsPath, Stat,
 //     Bytes, Read, Fd).
-//   - *FileWorker: reusable low-level memory helpers (Buf, RetainBytes).
+//   - *FileWorker: reusable low-level memory helpers (ID, Buf, RetainBytes).
 //
 // File and FileWorker data are only valid during the callback; do not retain
 // *File or any borrowed buffers/slices beyond the callback.
@@ -188,7 +188,7 @@ func Process[T any](ctx context.Context, path string, fn ProcessFunc[T], opts ..
 // ProcessFunc may be called concurrently and must be safe for concurrent use.
 //
 // f provides access to [File] metadata and content (AbsPath, Stat, Bytes,
-// Read, Fd). w provides reusable temporary buffers (Buf, RetainBytes).
+// Read, Fd). w provides reusable temporary buffers (ID, Buf, RetainBytes).
 //
 // Both f and w are only valid during the callback.
 //
@@ -213,14 +213,32 @@ type ProcessFunc[T any] func(f *File, w *FileWorker) (*T, error)
 // FileWorker provides low-level memory helpers to avoid per-callback
 // allocations and reduce GC pressure.
 //
+// Use [FileWorker.ID] to index caller-owned per-worker state without locks.
+// IDs are unique within a single [Process] invocation and stable for that
+// worker until the invocation returns.
+//
 // Use Buf for scratch space that can be reused across callbacks, and
 // RetainBytes to copy data into a per-worker arena when you need it to live
 // beyond the current callback.
 type FileWorker struct {
+	// id is stable for this worker within one Process invocation.
+	id int
 	// buf is the reusable scratch buffer for the current callback.
 	buf []byte
 	// retain is the append-only arena for retained data.
 	retain []byte
+}
+
+// ID returns this callback worker's identity.
+//
+// The ID is unique only within a single [Process] invocation and remains
+// stable for this worker until [Process] returns. IDs are zero-based within
+// that invocation (0..workers-1). IDs may be reused across separate [Process]
+// calls.
+//
+// Use it to index caller-owned per-worker state without synchronization.
+func (w *FileWorker) ID() int {
+	return w.id
 }
 
 // Buf returns a reusable buffer with at least the requested capacity.

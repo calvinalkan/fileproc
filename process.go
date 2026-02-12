@@ -555,6 +555,7 @@ func (p *processor[T]) process(ctx context.Context, root nulTermPath) ([]*T, []e
 			defer fileWG.Done()
 
 			bufs := &fileWorkerBufs{}
+			bufs.worker.id = id
 			localResults := make([]*T, 0, 64)
 			localErrs := make([]error, 0, 32)
 
