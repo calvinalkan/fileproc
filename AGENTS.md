@@ -4,13 +4,14 @@
 
 ## Architecture
 
-- `fileproc.go` - Public API (`Process`, options), docs.
-- `processor.go` - Core pipeline: coordinator, scan workers, file workers.
-- `file.go` - `File` methods (AbsPath/RelPath/Stat/Read/ReadAll/Fd).
-- `io*.go` - Platform-specific IO (linux/unix/other) and syscall wrappers.
-- `path_helpers.go` - NUL-terminated path types, arenas, helpers.
-- `options.go` - Option parsing and defaults.
-- `*_test.go` - Tests; focus on `Process` behavior and `File` API.
+- `fileproc.go` - Public API (`Process`, `ProcessFunc`, top-level docs).
+- `process.go` - Core processing pipeline: coordinator, scanner, worker dispatch.
+- `file.go` - `File` API (`AbsPath`/`RelPath`/`Stat`/`ReadAll`/`ReadAllOwned`/`Read`/`Fd`).
+- `file_worker.go` - `FileWorker` memory helpers (`AllocateScratch`, `AllocateOwned`, IDs).
+- `io*.go` - Platform-specific IO handles/syscall wrappers (`linux`/`unix`/`other`).
+- `path_helpers.go` - Path arenas, NUL-terminated path helpers.
+- `options.go` - Option parsing/defaults for process and worker behavior.
+- `watcher*.go` - File watcher and path-tracking/compaction logic.
 
 ## Commands
 
