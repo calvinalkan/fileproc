@@ -46,11 +46,13 @@ var ErrSkip = errors.New("skip")
 // Each callback receives:
 //   - *File: lazy access to path, metadata, and content (AbsPath, Stat,
 //     Bytes, Read, Fd).
-//   - *FileWorker: reusable low-level memory helpers (ID, Buf, RetainBytes,
-//     RetainLease).
+//   - *FileWorker: reusable low-level memory helpers (ID, AllocateScratch,
+//     AllocateOwned).
 //
-// File and FileWorker data are only valid during the callback; do not retain
-// *File or any borrowed buffers/slices beyond the callback.
+// *File and *FileWorker are callback-scoped and must not be retained.
+// Borrowed slices (from [File] methods and [FileWorker.AllocateScratch]) are
+// valid only during the callback. Exception: memory from
+// [FileWorker.AllocateOwned] may be retained until [Owned.Free].
 //
 // # Errors:
 //   - Directory open/readdir errors are reported as [IOError].
@@ -143,9 +145,12 @@ var ErrSkip = errors.New("skip")
 //	        prefix = prefix[:16]
 //	    }
 //
+//	    owned := w.AllocateOwned(len(prefix))
+//	    copy(owned.Buf, prefix)
+//
 //	    return &Result{
 //	        Size:   st.Size,
-//	        Prefix: w.RetainBytes(prefix),
+//	        Prefix: owned.Buf,
 //	    }, nil
 //	}, fileproc.WithRecursive(), fileproc.WithSuffix(".log"))
 func Process[T any](ctx context.Context, path string, fn ProcessFunc[T], opts ...Option) ([]*T, []error) {
@@ -189,10 +194,11 @@ func Process[T any](ctx context.Context, path string, fn ProcessFunc[T], opts ..
 // ProcessFunc may be called concurrently and must be safe for concurrent use.
 //
 // f provides access to [File] metadata and content (AbsPath, Stat, Bytes,
-// Read, Fd). w provides reusable temporary buffers (ID, Buf, RetainBytes,
-// RetainLease).
+// Read, Fd). w provides reusable temporary buffers (ID, AllocateScratch, AllocateOwned).
 //
-// Both f and w are only valid during the callback.
+// Both f and w are only valid during the callback. Borrowed slices from f and
+// from [FileWorker.AllocateScratch] are callback-scoped; memory allocated via
+// [FileWorker.AllocateOwned] may be retained until [Owned.Free].
 //
 // Callbacks are not invoked for directories, symlinks, or other non-regular
 // files.
@@ -211,224 +217,6 @@ func Process[T any](ctx context.Context, path string, fn ProcessFunc[T], opts ..
 // Panics are not recovered by this package. Callbacks must not panic; if you
 // need to guard against panics, recover inside the callback.
 type ProcessFunc[T any] func(f *File, w *FileWorker) (*T, error)
-
-// FileWorker provides low-level memory helpers to avoid per-callback
-// allocations and reduce GC pressure.
-//
-// Use [FileWorker.ID] to index caller-owned per-worker state without locks.
-// IDs are unique within a single [Process] invocation and stable for that
-// worker until the invocation returns.
-//
-// Use [FileWorker.Buf] for scratch space that can be reused across callbacks, and
-// [FileWorker.RetainBytes] to copy data into a per-worker arena when you need it to live
-// beyond the current callback.
-//
-// Use [FileWorker.RetainLease] when data must outlive the callback but should
-// be explicitly released before [Process] returns.
-type FileWorker struct {
-	// id is stable for this worker within one Process invocation.
-	id int
-	// buf is the reusable scratch buffer for the current callback.
-	buf []byte
-	// retain is the append-only arena for retained data.
-	retain []byte
-	// leases tracks explicitly releasable buffers.
-	leases workerLeases
-}
-
-// LeaseID identifies a lease returned by [FileWorker.RetainLease].
-//
-// IDs are unique only within one worker in one [Process] invocation.
-type LeaseID uint64
-
-// Lease is a writable buffer retained from a worker-local lease pool.
-//
-// Buf remains valid until [Lease.Release] is called or until [Process] returns.
-// The zero value is invalid and Release returns an error.
-type Lease struct {
-	// ID is stable for the lease lifetime and useful for debugging.
-	ID LeaseID
-	// Buf has len equal to requested size and is writable.
-	Buf []byte
-
-	// leases points to the owning worker lease manager.
-	leases *workerLeases
-}
-
-// Release returns this lease buffer to the worker reuse pool.
-//
-// Release is safe to call from any goroutine and is idempotent:
-// repeated calls on the same lease return the same result.
-//
-// Calling Release after [Process] returns is allowed and behaves as a no-op.
-// After the first successful release, Buf is invalid and must not be accessed.
-func (l Lease) Release() error {
-	if l.leases == nil {
-		return errInvalidLease
-	}
-
-	return l.leases.release(l.ID)
-}
-
-// ID returns this callback worker's identity.
-//
-// The ID is unique only within a single [Process] invocation and remains
-// stable for this worker until [Process] returns. IDs are zero-based within
-// that invocation (0..workers-1). IDs may be reused across separate [Process]
-// calls.
-//
-// Use it to index caller-owned per-worker state without synchronization.
-func (w *FileWorker) ID() int {
-	return w.id
-}
-
-// Buf returns a reusable buffer with at least the requested capacity.
-//
-// Returns a slice with len=0 and cap>=size, ready for append:
-//
-//	buf := w.Buf(4096)
-//	buf = append(buf, data...)  // no alloc if fits in capacity
-//
-// For use as a fixed-size read target, expand to full capacity:
-//
-//	buf := w.Buf(4096)
-//	buf = buf[:cap(buf)]
-//	n, _ := io.ReadFull(r, buf)
-//
-// The capacity grows to accommodate the largest request seen across all
-// files processed by this worker, then stabilizes.
-//
-// The returned slice is only valid during the current callback.
-func (w *FileWorker) Buf(size int) []byte {
-	if cap(w.buf) < size {
-		w.buf = make([]byte, 0, size)
-	}
-
-	return w.buf[:0]
-}
-
-// RetainBytes copies b into a per-worker arena and returns a stable subslice.
-//
-// The returned slice remains valid until [Process] returns; if the caller keeps
-// the slice, it remains valid until GC (standard Go slice lifetime).
-func (w *FileWorker) RetainBytes(b []byte) []byte {
-	if len(b) == 0 {
-		return []byte{}
-	}
-
-	start := len(w.retain)
-	w.retain = append(w.retain, b...)
-
-	return w.retain[start:]
-}
-
-// RetainLease returns a writable lease buffer with len=size.
-//
-// The returned buffer is valid until [Lease.Release] or [Process] return,
-// whichever comes first. Release is safe from non-callback goroutines.
-//
-// Leases are a middle ground between [FileWorker.Buf] (callback-local scratch)
-// and [FileWorker.RetainBytes] (kept for full Process lifetime).
-//
-// size <= 0 returns a lease with an empty buffer.
-func (w *FileWorker) RetainLease(size int) Lease {
-	return w.leases.retain(size)
-}
-
-var errInvalidLease = errors.New("lease: invalid")
-
-// workerLeases keeps worker-owned lease buffers reusable and thread-safe.
-type workerLeases struct {
-	mu sync.Mutex
-
-	nextID LeaseID
-	active map[LeaseID][]byte
-	free   [][]byte
-	closed bool
-}
-
-func (l *workerLeases) retain(size int) Lease {
-	if size < 0 {
-		size = 0
-	}
-
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	if l.closed {
-		// Worker lifetime ended; return an invalid lease rather than panicking.
-		return Lease{Buf: []byte{}}
-	}
-
-	if l.active == nil {
-		l.active = make(map[LeaseID][]byte, 8)
-	}
-
-	leaseID := l.nextID + 1
-	l.nextID = leaseID
-
-	buffer := l.takeBuffer(size)
-	l.active[leaseID] = buffer
-
-	return Lease{
-		ID:     leaseID,
-		Buf:    buffer,
-		leases: l,
-	}
-}
-
-func (l *workerLeases) takeBuffer(size int) []byte {
-	for i := len(l.free) - 1; i >= 0; i-- {
-		if cap(l.free[i]) < size {
-			continue
-		}
-
-		reused := l.free[i]
-		last := len(l.free) - 1
-		l.free[i] = l.free[last]
-		l.free[last] = nil
-		l.free = l.free[:last]
-
-		return reused[:size]
-	}
-
-	if size == 0 {
-		return []byte{}
-	}
-
-	return make([]byte, size)
-}
-
-func (l *workerLeases) release(id LeaseID) error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	if l.closed {
-		// Process already ended and leases were auto-cleaned.
-		return nil
-	}
-
-	buffer, ok := l.active[id]
-	if !ok {
-		// Unknown here means already released/cleaned; keep Release idempotent.
-		return nil
-	}
-
-	delete(l.active, id)
-	l.free = append(l.free, buffer[:0])
-
-	return nil
-}
-
-func (l *workerLeases) shutdown() {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	l.closed = true
-	clear(l.active)
-	l.active = nil
-	l.free = nil
-}
 
 // IOError is returned when a file system operation fails.
 type IOError struct {

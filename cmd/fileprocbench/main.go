@@ -441,7 +441,7 @@ func makeProcessFn(process string) fileproc.ProcessFunc[struct{}] {
 
 	case processRead:
 		return func(f *fileproc.File, w *fileproc.FileWorker) (*struct{}, error) {
-			buf := w.Buf(defaultReadSize)
+			buf := w.AllocateScratch(defaultReadSize)
 			buf = buf[:cap(buf)]
 
 			_, err := f.Read(buf)

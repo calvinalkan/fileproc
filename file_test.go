@@ -10,7 +10,6 @@ import (
 	"runtime"
 	"sync"
 	"testing"
-	"unsafe"
 
 	"github.com/calvinalkan/fileproc"
 )
@@ -328,7 +327,7 @@ func Test_File_Bytes_Reads_Full_Content_When_Called(t *testing.T) {
 			return nil, fmt.Errorf("test: %w", err)
 		}
 
-		gotData = w.RetainBytes(data)
+		gotData = retainOwnedCopy(w, data)
 
 		return &struct{}{}, nil
 	}, opts...)
@@ -346,7 +345,7 @@ func Test_File_Bytes_Reads_Full_Content_When_Called(t *testing.T) {
 	}
 }
 
-func Test_File_Bytes_Remains_Valid_When_RetainBytes_Called(t *testing.T) {
+func Test_File_Bytes_Remains_Valid_When_AllocateOwnedCopy_Called(t *testing.T) {
 	t.Parallel()
 
 	root := t.TempDir()
@@ -365,7 +364,7 @@ func Test_File_Bytes_Remains_Valid_When_RetainBytes_Called(t *testing.T) {
 			return nil, fmt.Errorf("test: %w", err)
 		}
 
-		return &dataHolder{data: w.RetainBytes(data)}, nil
+		return &dataHolder{data: retainOwnedCopy(w, data)}, nil
 	}, opts...)
 
 	if len(errs) != 0 {
@@ -515,7 +514,7 @@ func Test_File_Bytes_Returns_Actual_Content_When_File_Shrunk_Since_Stat(t *testi
 			return nil, fmt.Errorf("test: %w", err)
 		}
 
-		gotData = w.RetainBytes(data)
+		gotData = retainOwnedCopy(w, data)
 
 		return &struct{}{}, nil
 	}, opts...)
@@ -581,7 +580,7 @@ func Test_File_Bytes_Returns_Full_Content_When_File_Grew_Since_Stat(t *testing.T
 			return nil, fmt.Errorf("test: %w", err)
 		}
 
-		gotData = w.RetainBytes(data)
+		gotData = retainOwnedCopy(w, data)
 
 		return &struct{}{}, nil
 	}, opts...)
@@ -713,7 +712,7 @@ func Test_File_Bytes_Works_Correctly_When_File_Large(t *testing.T) {
 			return nil, fmt.Errorf("test: %w", err)
 		}
 
-		gotData = w.RetainBytes(data)
+		gotData = retainOwnedCopy(w, data)
 
 		return &struct{}{}, nil
 	}, opts...)
@@ -815,7 +814,7 @@ func Test_File_Bytes_Returns_Content_When_File_Grows_From_Empty(t *testing.T) {
 			return nil, fmt.Errorf("test: %w", err)
 		}
 
-		gotData = w.RetainBytes(data)
+		gotData = retainOwnedCopy(w, data)
 
 		return &struct{}{}, nil
 	}, opts...)
@@ -1178,399 +1177,6 @@ func Test_File_Fd_Works_When_Called_After_Read(t *testing.T) {
 	}
 }
 
-// ============================================================================
-// Worker.Buf tests
-// ============================================================================
-
-func Test_Worker_Buf_Returns_Zero_Len_With_Cap_When_Called(t *testing.T) {
-	t.Parallel()
-
-	root := t.TempDir()
-	writeFile(t, root, "test.txt", []byte("content"))
-
-	opts := []fileproc.Option{fileproc.WithFileWorkers(1)}
-
-	var bufLen, bufCap int
-
-	results, errs := fileproc.Process(t.Context(), root, func(_ *fileproc.File, scratch *fileproc.FileWorker) (*struct{}, error) {
-		buf := scratch.Buf(4096)
-		bufLen = len(buf)
-		bufCap = cap(buf)
-
-		return &struct{}{}, nil
-	}, opts...)
-
-	if len(errs) != 0 {
-		t.Fatalf("unexpected errors: %v", errs)
-	}
-
-	if len(results) != 1 {
-		t.Fatalf("expected 1 result, got %d", len(results))
-	}
-
-	if bufLen != 0 {
-		t.Fatalf("expected len=0, got %d", bufLen)
-	}
-
-	if bufCap < 4096 {
-		t.Fatalf("expected cap>=4096, got %d", bufCap)
-	}
-}
-
-func Test_Worker_Buf_Grows_Capacity_When_Larger_Request(t *testing.T) {
-	t.Parallel()
-
-	root := t.TempDir()
-	writeFile(t, root, "a.txt", []byte("a"))
-	writeFile(t, root, "b.txt", []byte("b"))
-
-	opts := []fileproc.Option{
-		fileproc.WithFileWorkers(1),
-	}
-
-	var caps []int
-
-	results, errs := fileproc.Process(t.Context(), root, func(_ *fileproc.File, scratch *fileproc.FileWorker) (*struct{}, error) {
-		// First file requests 1024, second requests 8192
-		size := 1024
-		if len(caps) > 0 {
-			size = 8192
-		}
-
-		buf := scratch.Buf(size)
-		caps = append(caps, cap(buf))
-
-		return &struct{}{}, nil
-	}, opts...)
-
-	if len(errs) != 0 {
-		t.Fatalf("unexpected errors: %v", errs)
-	}
-
-	if len(results) != 2 {
-		t.Fatalf("expected 2 results, got %d", len(results))
-	}
-
-	if len(caps) != 2 {
-		t.Fatalf("expected 2 capacity readings, got %d", len(caps))
-	}
-
-	if caps[0] < 1024 {
-		t.Fatalf("first cap should be >= 1024, got %d", caps[0])
-	}
-
-	if caps[1] < 8192 {
-		t.Fatalf("second cap should be >= 8192, got %d", caps[1])
-	}
-}
-
-func Test_Worker_Buf_Reuses_Buffer_When_Same_Worker(t *testing.T) {
-	t.Parallel()
-
-	root := t.TempDir()
-	writeFile(t, root, "a.txt", []byte("a"))
-	writeFile(t, root, "b.txt", []byte("b"))
-
-	opts := []fileproc.Option{
-		fileproc.WithFileWorkers(1),
-	}
-
-	var ptrs []uintptr
-
-	results, errs := fileproc.Process(t.Context(), root, func(_ *fileproc.File, scratch *fileproc.FileWorker) (*struct{}, error) {
-		buf := scratch.Buf(1024)
-		// Expand to get actual backing array pointer
-		buf = buf[:cap(buf)]
-		if len(buf) > 0 {
-			ptrs = append(ptrs, uintptr(unsafe.Pointer(&buf[0])))
-		}
-
-		return &struct{}{}, nil
-	}, opts...)
-
-	if len(errs) != 0 {
-		t.Fatalf("unexpected errors: %v", errs)
-	}
-
-	if len(results) != 2 {
-		t.Fatalf("expected 2 results, got %d", len(results))
-	}
-
-	if len(ptrs) != 2 {
-		t.Fatalf("expected 2 pointers, got %d", len(ptrs))
-	}
-
-	// Same backing array should be reused
-	if ptrs[0] != ptrs[1] {
-		t.Fatal("worker buffer should be reused across files in same worker")
-	}
-}
-
-// ============================================================================
-// Worker.RetainBytes tests
-// ============================================================================
-
-func Test_Worker_RetainBytes_Returns_Stable_Slice_When_Called(t *testing.T) {
-	t.Parallel()
-
-	root := t.TempDir()
-	writeFile(t, root, "test.txt", []byte("content"))
-
-	opts := []fileproc.Option{fileproc.WithFileWorkers(1)}
-
-	type holder struct {
-		retained []byte
-	}
-
-	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, w *fileproc.FileWorker) (*holder, error) {
-		data, err := f.ReadAll()
-		if err != nil {
-			return nil, fmt.Errorf("bytes: %w", err)
-		}
-
-		return &holder{retained: w.RetainBytes(data)}, nil
-	}, opts...)
-
-	if len(errs) != 0 {
-		t.Fatalf("unexpected errors: %v", errs)
-	}
-
-	if len(results) != 1 {
-		t.Fatalf("expected 1 result, got %d", len(results))
-	}
-
-	if string(results[0].retained) != "content" {
-		t.Fatalf("expected 'content', got %q", results[0].retained)
-	}
-}
-
-func Test_Worker_RetainBytes_Returns_Empty_Slice_When_Input_Empty(t *testing.T) {
-	t.Parallel()
-
-	root := t.TempDir()
-	writeFile(t, root, "empty.txt", nil)
-
-	opts := []fileproc.Option{fileproc.WithFileWorkers(1)}
-
-	var retained []byte
-
-	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, w *fileproc.FileWorker) (*struct{}, error) {
-		data, err := f.ReadAll()
-		if err != nil {
-			return nil, fmt.Errorf("bytes: %w", err)
-		}
-
-		retained = w.RetainBytes(data)
-
-		return &struct{}{}, nil
-	}, opts...)
-
-	if len(errs) != 0 {
-		t.Fatalf("unexpected errors: %v", errs)
-	}
-
-	if len(results) != 1 {
-		t.Fatalf("expected 1 result, got %d", len(results))
-	}
-
-	if retained == nil {
-		t.Fatal("expected non-nil slice for empty input")
-	}
-
-	if len(retained) != 0 {
-		t.Fatalf("expected empty slice, got len=%d", len(retained))
-	}
-}
-
-func Test_Worker_RetainBytes_Preserves_Multiple_Slices_When_Called_Repeatedly(t *testing.T) {
-	t.Parallel()
-
-	root := t.TempDir()
-	writeFile(t, root, "test.txt", []byte("hello world"))
-
-	opts := []fileproc.Option{fileproc.WithFileWorkers(1)}
-
-	type holder struct {
-		first  []byte
-		second []byte
-	}
-
-	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, w *fileproc.FileWorker) (*holder, error) {
-		data, err := f.ReadAll()
-		if err != nil {
-			return nil, fmt.Errorf("bytes: %w", err)
-		}
-
-		// Retain two different subslices
-		first := w.RetainBytes(data[:5])  // "hello"
-		second := w.RetainBytes(data[6:]) // "world"
-
-		return &holder{first: first, second: second}, nil
-	}, opts...)
-
-	if len(errs) != 0 {
-		t.Fatalf("unexpected errors: %v", errs)
-	}
-
-	if len(results) != 1 {
-		t.Fatalf("expected 1 result, got %d", len(results))
-	}
-
-	if string(results[0].first) != "hello" {
-		t.Fatalf("first: expected 'hello', got %q", results[0].first)
-	}
-
-	if string(results[0].second) != "world" {
-		t.Fatalf("second: expected 'world', got %q", results[0].second)
-	}
-}
-
-func Test_Worker_RetainBytes_Independent_From_Original_When_Modified(t *testing.T) {
-	t.Parallel()
-
-	root := t.TempDir()
-	writeFile(t, root, "test.txt", []byte("original"))
-
-	opts := []fileproc.Option{fileproc.WithFileWorkers(1)}
-
-	type holder struct {
-		retained []byte
-	}
-
-	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, w *fileproc.FileWorker) (*holder, error) {
-		data, err := f.ReadAll()
-		if err != nil {
-			return nil, fmt.Errorf("bytes: %w", err)
-		}
-
-		retained := w.RetainBytes(data)
-
-		// Modify original - should not affect retained copy
-		data[0] = 'X'
-
-		return &holder{retained: retained}, nil
-	}, opts...)
-
-	if len(errs) != 0 {
-		t.Fatalf("unexpected errors: %v", errs)
-	}
-
-	if len(results) != 1 {
-		t.Fatalf("expected 1 result, got %d", len(results))
-	}
-
-	if string(results[0].retained) != "original" {
-		t.Fatalf("expected 'original', got %q (was modified)", results[0].retained)
-	}
-}
-
-// ============================================================================
-// Arena lifetime tests
-// ============================================================================
-
-func Test_Arena_Multiple_Files_Dont_Interfere_When_Using_Single_Worker(t *testing.T) {
-	t.Parallel()
-
-	root := t.TempDir()
-	writeFile(t, root, "a.txt", []byte("alpha"))
-	writeFile(t, root, "b.txt", []byte("bravo"))
-	writeFile(t, root, "c.txt", []byte("charlie"))
-
-	opts := []fileproc.Option{
-		fileproc.WithFileWorkers(1),
-	}
-
-	type fileData struct {
-		path string
-		data []byte
-	}
-
-	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, w *fileproc.FileWorker) (*fileData, error) {
-		data, err := f.ReadAll()
-		if err != nil {
-			return nil, fmt.Errorf("test: %w", err)
-		}
-
-		return &fileData{path: string(f.AbsPath()), data: w.RetainBytes(data)}, nil
-	}, opts...)
-
-	if len(errs) != 0 {
-		t.Fatalf("unexpected errors: %v", errs)
-	}
-
-	if len(results) != 3 {
-		t.Fatalf("expected 3 results, got %d", len(results))
-	}
-
-	expected := map[string]string{
-		filepath.Join(root, "a.txt"): "alpha",
-		filepath.Join(root, "b.txt"): "bravo",
-		filepath.Join(root, "c.txt"): "charlie",
-	}
-
-	for _, r := range results {
-		want, ok := expected[r.path]
-		if !ok {
-			t.Fatalf("unexpected path: %s", r.path)
-		}
-
-		if string(r.data) != want {
-			t.Fatalf("data mismatch for %s: got %q, want %q", r.path, r.data, want)
-		}
-	}
-}
-
-func Test_Arena_Subslices_Remain_Valid_When_Process_Returns(t *testing.T) {
-	t.Parallel()
-
-	root := t.TempDir()
-	content := []byte("prefix:middle:suffix")
-	writeFile(t, root, "test.txt", content)
-
-	opts := []fileproc.Option{fileproc.WithFileWorkers(1)}
-
-	type parts struct {
-		prefix []byte
-		middle []byte
-		suffix []byte
-	}
-
-	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, w *fileproc.FileWorker) (*parts, error) {
-		data, err := f.ReadAll()
-		if err != nil {
-			return nil, fmt.Errorf("test: %w", err)
-		}
-		// Create subslices
-		return &parts{
-			prefix: w.RetainBytes(data[0:6]),   // "prefix"
-			middle: w.RetainBytes(data[7:13]),  // "middle"
-			suffix: w.RetainBytes(data[14:20]), // "suffix"
-		}, nil
-	}, opts...)
-
-	if len(errs) != 0 {
-		t.Fatalf("unexpected errors: %v", errs)
-	}
-
-	if len(results) != 1 {
-		t.Fatalf("expected 1 result, got %d", len(results))
-	}
-
-	// Subslices should still be valid
-	if string(results[0].prefix) != "prefix" {
-		t.Fatalf("prefix: got %q", results[0].prefix)
-	}
-
-	if string(results[0].middle) != "middle" {
-		t.Fatalf("middle: got %q", results[0].middle)
-	}
-
-	if string(results[0].suffix) != "suffix" {
-		t.Fatalf("suffix: got %q", results[0].suffix)
-	}
-}
-
-// ============================================================================
 // Mutual exclusion tests
 // ============================================================================
 

@@ -32,36 +32,56 @@ type Stat struct {
 // ReadAll(), ReadAllIntoAt(), and Read() are mutually exclusive per file.
 // Calling one after another returns an error.
 type File struct {
+	// File identity and path context (constant for this callback).
 	// dh is the open directory handle used for openat/statat.
 	dh dirHandle
+
 	// name is the NUL-terminated basename for openat/statat.
 	name nulTermName
-	// base is the NUL-terminated directory path for building absolute paths.
-	base nulTermPath
-	// rootLen is the length of the root path (no trailing NUL).
-	rootLen int
-	// path caches the built absolute path (no trailing NUL).
-	path []byte
-	// pathScratch is a reusable buffer for building absolute paths.
-	pathScratch *[]byte
-	// pathBuilt tracks whether path is populated for this file.
-	pathBuilt bool
-	// st caches the file stat result.
-	st Stat
+
+	// dirPath is the NUL-terminated absolute directory path containing name.
+	// Example: if file is "/src/photos/a.jpg", dirPath is "/src/photos".
+	dirPath nulTermPath
+
+	// processRootPathLen is len(path passed to [Process]), without trailing NUL.
+	// [File.RelPath] strips this prefix from AbsPath in O(1) via slicing.
+	// Example:
+	//   Process path: "/src"
+	//   processRootPathLen: 4
+	//   AbsPath: "/src/photos/a.jpg"
+	//   RelPath: "photos/a.jpg"
+	processRootPathLen int
+
+	// Cached absolute path (built lazily on first AbsPath call).
+	// absPath caches the built absolute absPath (no trailing NUL).
+	absPath []byte
+
+	// Cached stat result (populated lazily on first Stat call).
+	// stat caches the file stat result.
+	stat Stat
+
 	// statDone tracks whether stat has been attempted.
 	statDone bool
-	// fh points at the currently open file handle.
-	fh *fileHandle
-	// fhOpen indicates whether fh is open.
-	fhOpen *bool
-	// dataBuf is the temporary read buffer reused across files.
-	dataBuf *[]byte
-	// mode tracks the Bytes/Read usage state.
-	mode fileMode
-	// openErr caches open errors for lazy open.
-	openErr error
+
 	// statErr caches stat errors for lazy stat.
 	statErr error
+
+	// Lazy-open/read state for ReadAll/Read/Fd paths.
+	// fh points at the currently open file handle.
+	fh *fileHandle
+
+	// fhOpened indicates whether fh is open.
+	fhOpened *bool
+
+	// mode tracks the Bytes/Read usage state.
+	mode fileMode
+
+	// openErr caches open errors for lazy open.
+	openErr error
+
+	// Worker-local scratch/reuse state shared across File methods.
+	// worker provides internal scratch slots for path/read operations.
+	worker *FileWorker
 }
 
 // AbsPath returns the absolute file path (without the trailing NUL).
@@ -72,28 +92,25 @@ type File struct {
 // The returned slice is ephemeral and only valid during the callback.
 // Copy if you need to retain it.
 func (f *File) AbsPath() []byte {
-	if f.pathBuilt {
-		return f.path
+	if len(f.absPath) > 0 {
+		return f.absPath
 	}
 
-	baseLen := f.base.lenWithoutNul()
+	baseLen := f.dirPath.lenWithoutNul()
 	nameLen := f.name.lenWithoutNul()
 
 	sep := 0
-	if baseLen > 0 && f.base[baseLen-1] != os.PathSeparator {
+	if baseLen > 0 && f.dirPath[baseLen-1] != os.PathSeparator {
 		sep = 1
 	}
 
 	needed := baseLen + sep + nameLen
 
-	buf := *f.pathScratch
-	if cap(buf) < needed {
-		buf = make([]byte, 0, needed)
-	}
+	buf := f.worker.allocateScratchAt(scratchSlotAbsPath, needed)
 
 	buf = buf[:0]
 	if baseLen > 0 {
-		buf = append(buf, f.base[:baseLen]...)
+		buf = append(buf, f.dirPath[:baseLen]...)
 		if sep == 1 {
 			buf = append(buf, os.PathSeparator)
 		}
@@ -101,9 +118,7 @@ func (f *File) AbsPath() []byte {
 
 	buf = append(buf, f.name[:nameLen]...)
 
-	*f.pathScratch = buf
-	f.path = buf
-	f.pathBuilt = true
+	f.absPath = buf
 
 	return buf
 }
@@ -117,11 +132,11 @@ func (f *File) AbsPath() []byte {
 // Copy if you need to retain it.
 func (f *File) RelPath() []byte {
 	abs := f.AbsPath()
-	if f.rootLen >= len(abs) {
+	if f.processRootPathLen >= len(abs) {
 		return abs
 	}
 
-	start := f.rootLen
+	start := f.processRootPathLen
 	if abs[start] == os.PathSeparator {
 		start++
 	}
@@ -154,7 +169,7 @@ func (f *File) Stat() (Stat, error) {
 		f.lazyStat()
 	}
 
-	return f.st, f.statErr
+	return f.stat, f.statErr
 }
 
 // ReadAllOption configures the behavior of [File.ReadAll].
@@ -170,7 +185,7 @@ type ReadAllOption struct {
 //
 // The hint is a suggestion, not a limit. Files larger than the hint are
 // read completely; smaller files don't waste the extra space (only the
-// actual content is stored in the arena).
+// actual content is returned).
 //
 // The hint is ignored if [File.Stat] was called previously, since the
 // actual size is already known.
@@ -191,8 +206,8 @@ func WithSizeHint(size int) ReadAllOption {
 // ReadAll reads and returns the full file content.
 //
 // The returned slice points into a reusable buffer and is only valid during
-// the callback. To retain data beyond the callback, copy it or use
-// [FileWorker.RetainBytes].
+// the callback. To retain data beyond the callback, copy it or allocate owned
+// memory via [FileWorker.AllocateOwned].
 //
 // Empty files return a non-nil empty slice ([]byte{}, nil).
 //
@@ -222,8 +237,9 @@ func WithSizeHint(size int) ReadAllOption {
 //	if err != nil {
 //	    return nil, err
 //	}
-//	keep := w.RetainBytes(data)
-//	return &Result{Len: len(keep)}, nil
+//	owned := w.AllocateOwned(len(data))
+//	copy(owned.Buf, data)
+//	return &Result{Len: len(owned.Buf)}, nil
 func (f *File) ReadAll(opts ...ReadAllOption) ([]byte, error) {
 	if f.mode == fileModeReader {
 		return nil, errBytesAfterRead
@@ -248,11 +264,11 @@ func (f *File) ReadAll(opts ...ReadAllOption) ([]byte, error) {
 	var size int
 
 	if f.statDone && f.statErr == nil {
-		if f.st.Size > 0 {
-			if f.st.Size > int64(maxSize) {
+		if f.stat.Size > 0 {
+			if f.stat.Size > int64(maxSize) {
 				size = maxSize
 			} else {
-				size = int(f.st.Size)
+				size = int(f.stat.Size)
 			}
 		}
 	} else if len(opts) > 0 && opts[0].sizeHint > 0 {
@@ -262,19 +278,17 @@ func (f *File) ReadAll(opts ...ReadAllOption) ([]byte, error) {
 	// +1 to detect growth / read past expected size.
 	readSize := max(size+1, defaultReadBufSize)
 
-	// Ensure dataBuf capacity.
-	if cap(*f.dataBuf) < readSize {
-		*f.dataBuf = make([]byte, 0, readSize)
-	}
+	// Internal read scratch uses a reserved worker slot.
+	// allocateScratchAt returns len=0, so reslice to expose readSize bytes.
+	readBuf := f.worker.allocateScratchAt(scratchSlotFileBytes, readSize)[:readSize]
 
-	*f.dataBuf = (*f.dataBuf)[:readSize]
-
-	n, out, err := f.readAllInto(*f.dataBuf, 0, true)
+	n, out, err := f.readAllInto(readBuf, 0, true)
 	if err != nil {
 		return nil, err
 	}
 
-	*f.dataBuf = out
+	// readAllInto may grow via append; persist the grown slice in the slot.
+	f.worker.perCallbackScratchSlots[scratchSlotFileBytes] = out
 
 	// Empty file.
 	if n == 0 {
@@ -348,7 +362,7 @@ func (f *File) ReadAllIntoAt(dst []byte, destOffset int) (int, error) {
 //
 // Example (inside Process callback):
 //
-//	buf := w.Buf(32 * 1024)
+//	buf := w.AllocateScratch(32 * 1024)
 //	buf = buf[:cap(buf)]
 //	for {
 //	    n, err := f.Read(buf)
@@ -553,13 +567,13 @@ func (f *File) lazyStat() {
 		return
 	}
 
-	f.st = st
+	f.stat = st
 }
 
 // open lazily opens the file and caches the result.
 // Symlink/dir races are normalized to errSkipFile so callers can skip silently.
 func (f *File) open() error {
-	if f.fhOpen != nil && *f.fhOpen {
+	if f.fhOpened != nil && *f.fhOpened {
 		return nil // already open
 	}
 
@@ -582,7 +596,7 @@ func (f *File) open() error {
 	}
 
 	*f.fh = fh
-	*f.fhOpen = true
+	*f.fhOpened = true
 
 	return nil
 }

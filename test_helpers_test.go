@@ -209,3 +209,10 @@ func assertIOError(t *testing.T, err error, wantPath, wantOp string) {
 		t.Fatalf("unexpected error op: %s", ioErr.Op)
 	}
 }
+
+func retainOwnedCopy(w *fileproc.FileWorker, src []byte) []byte {
+	owned := w.AllocateOwned(len(src))
+	copy(owned.Buf, src)
+
+	return owned.Buf
+}

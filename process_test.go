@@ -201,7 +201,7 @@ func Test_Process_Closes_File_Handle_When_Bytes_Returns_Error(t *testing.T) {
 			return nil, fmt.Errorf("test: %w", err)
 		}
 
-		successData = w.RetainBytes(data)
+		successData = retainOwnedCopy(w, data)
 
 		return &struct{}{}, nil
 	}, opts...)

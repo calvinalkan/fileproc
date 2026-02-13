@@ -509,22 +509,6 @@ type processor[T any] struct {
 	errNotify *errNotifier
 }
 
-// fileWorkerBufs is per-worker to eliminate per-file allocations in hot paths.
-type fileWorkerBufs struct {
-	// fileBytesBuf reuses a single read buffer to avoid per-file allocs.
-	fileBytesBuf []byte
-
-	// pathScratch avoids per-callback path allocations when needed.
-	pathScratch []byte
-
-	// file is reused to avoid per-file heap allocations.
-	file File
-
-	// worker is reused to preserve scratch/retain arenas across files.
-	// This is the public api for the callback, which is why we name it FileWorker.
-	worker FileWorker
-}
-
 // process runs the full scan + process pipeline and merges worker-local results.
 // Worker-local buffers avoid contention on hot paths; merging happens once.
 func (p *processor[T]) process(ctx context.Context, root nulTermPath) ([]*T, []error) {
@@ -554,8 +538,7 @@ func (p *processor[T]) process(ctx context.Context, root nulTermPath) ([]*T, []e
 		go func(id int) {
 			defer fileWG.Done()
 
-			bufs := &fileWorkerBufs{}
-			bufs.worker.id = id
+			worker := &FileWorker{id: id}
 			localResults := make([]*T, 0, 64)
 			localErrs := make([]error, 0, 32)
 
@@ -567,12 +550,12 @@ func (p *processor[T]) process(ctx context.Context, root nulTermPath) ([]*T, []e
 					continue
 				}
 
-				p.processChunk(ctx, chunk.lease, chunk.arena.entries[chunk.start:chunk.end], bufs, &localResults, &localErrs)
+				p.processChunk(ctx, chunk.lease, chunk.arena.entries[chunk.start:chunk.end], worker, &localResults, &localErrs)
 				chunk.release()
 			}
 
-			// Drop all outstanding lease bookkeeping when this Process run ends.
-			bufs.worker.leases.shutdown()
+			// Close the owned buffer pool and release its internal references.
+			worker.ownedBufferPool.shutdown()
 
 			results[id] = localResults
 			errs[id] = localErrs
@@ -632,29 +615,29 @@ func (p *processor[T]) processChunk(
 	ctx context.Context,
 	dirLease *dirLease,
 	entries []nulTermName,
-	bufs *fileWorkerBufs,
+	worker *FileWorker,
 	results *[]*T,
 	errs *[]error,
 ) {
 	var (
 		// Reuse a single file handle per worker to avoid per-file allocations.
-		openFH fileHandle
-		fhOpen bool
+		fh       fileHandle
+		fhOpened bool
 	)
 
 	defer func() {
-		if fhOpen {
-			_ = openFH.closeHandle()
+		if fhOpened {
+			_ = fh.closeHandle()
 		}
 	}()
 
 	closeIfOpen := func() {
-		if !fhOpen {
+		if !fhOpened {
 			return
 		}
 
-		_ = openFH.closeHandle()
-		fhOpen = false
+		_ = fh.closeHandle()
+		fhOpened = false
 	}
 
 	for _, entry := range entries {
@@ -662,22 +645,21 @@ func (p *processor[T]) processChunk(
 			return
 		}
 
-		// Reuse scratch to avoid per-file allocations.
-		bufs.worker.buf = bufs.worker.buf[:0]
+		// Reset public scratch cursor for this callback. Slots 0/1 are reserved
+		// for File internals (path/read); public AllocateScratch starts at slot 2.
+		worker.nextScratchSlotIdx = scratchSlotFirstPublic
 
-		bufs.file = File{
-			dh:          dirLease.dh,
-			name:        entry,
-			base:        dirLease.base,
-			rootLen:     p.rootLen,
-			fh:          &openFH,
-			fhOpen:      &fhOpen,
-			dataBuf:     &bufs.fileBytesBuf,
-			pathScratch: &bufs.pathScratch,
-			pathBuilt:   false,
+		worker.currentFile = File{
+			dh:                 dirLease.dh,
+			name:               entry,
+			dirPath:            dirLease.base,
+			processRootPathLen: p.rootLen,
+			fh:                 &fh,
+			fhOpened:           &fhOpened,
+			worker:             worker,
 		}
 
-		val, fnErr := p.fn(&bufs.file, &bufs.worker)
+		val, fnErr := p.fn(&worker.currentFile, worker)
 		if fnErr != nil {
 			if errors.Is(fnErr, errSkipFile) {
 				// Skip races (file became dir/symlink) without surfacing error.

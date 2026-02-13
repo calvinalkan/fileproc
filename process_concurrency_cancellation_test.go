@@ -39,7 +39,7 @@ func Test_Concurrency_Multiple_Workers_Have_Independent_Arenas_When_Parallel(t *
 			return nil, fmt.Errorf("test: %w", err)
 		}
 
-		return &holder{data: w.RetainBytes(data)}, nil
+		return &holder{data: retainOwnedCopy(w, data)}, nil
 	}, opts...)
 
 	if len(errs) != 0 {
@@ -76,7 +76,7 @@ func Test_Concurrency_Multiple_Workers_Have_Independent_WorkerBuf_When_Parallel(
 
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, scratch *fileproc.FileWorker) (*scratchResult, error) {
 		// Write file path into scratch buffer
-		buf := scratch.Buf(256)
+		buf := scratch.AllocateScratch(256)
 		buf = append(buf, f.AbsPath()...)
 
 		// Copy to result (scratch only valid during callback)
@@ -231,7 +231,7 @@ func Test_Process_Does_Not_Share_DataBuffers_When_Using_Concurrent_Workers(t *te
 
 		go func() {
 			_, errs = fileproc.Process(t.Context(), root, func(_ *fileproc.File, w *fileproc.FileWorker) (*struct{}, error) {
-				buf := w.Buf(1)
+				buf := w.AllocateScratch(1)
 
 				buf = buf[:cap(buf)]
 				if len(buf) == 0 {
@@ -303,7 +303,7 @@ func Test_Process_Does_Not_Share_DataBuffers_When_Using_Concurrent_Workers(t *te
 
 		go func() {
 			results, errs = fileproc.Process(t.Context(), root, func(_ *fileproc.File, w *fileproc.FileWorker) (*struct{}, error) {
-				buf := w.Buf(1)
+				buf := w.AllocateScratch(1)
 
 				buf = buf[:cap(buf)]
 				if len(buf) == 0 {
