@@ -977,6 +977,126 @@ func Test_Worker_AllocateScratch_Does_Not_Clobber_ReadAll_Or_AbsPath_When_Scratc
 	}
 }
 
+func Test_Worker_AllocateScratch_Are_Isolated_When_Multiple_Workers_Allocate_Concurrently(t *testing.T) {
+	t.Parallel()
+
+	const (
+		workers     = 4
+		scratchSize = 4 << 6
+	)
+
+	root := t.TempDir()
+	writeFlatFiles(t, root, testNumFilesBig, func(i int) string {
+		return fmt.Sprintf("f-%04d.txt", i)
+	}, nil)
+
+	var (
+		mu               sync.Mutex
+		firstPtrByWorker = make(map[string]uintptr, workers)
+		markerByWorker   = make(map[string]byte, workers)
+		completedWorkers = make(map[string]struct{}, workers)
+	)
+
+	allRetained := make(chan struct{})
+
+	waitCtx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+
+	_, errs := fileproc.Process(
+		t.Context(),
+		root,
+		func(_ *fileproc.File, w *fileproc.FileWorker) (*struct{}, error) {
+			workerPtr := fmt.Sprintf("%p", w)
+
+			mu.Lock()
+
+			if _, done := completedWorkers[workerPtr]; done {
+				mu.Unlock()
+
+				return &struct{}{}, nil
+			}
+
+			marker, ok := markerByWorker[workerPtr]
+			if !ok {
+				marker = byte(len(firstPtrByWorker) + 1)
+				markerByWorker[workerPtr] = marker
+			}
+
+			mu.Unlock()
+
+			scratch := w.AllocateScratch(scratchSize)
+			scratch = scratch[:scratchSize]
+
+			for i := range scratchSize {
+				scratch[i] = marker
+			}
+
+			firstPtr := sliceDataPtr(scratch)
+
+			mu.Lock()
+
+			firstPtrByWorker[workerPtr] = firstPtr
+
+			if len(firstPtrByWorker) == workers {
+				close(allRetained)
+			}
+
+			mu.Unlock()
+
+			select {
+			case <-allRetained:
+			case <-waitCtx.Done():
+				return nil, errors.New("timed out waiting for concurrent scratch retention")
+			}
+
+			mu.Lock()
+
+			for otherWorker, otherPtr := range firstPtrByWorker {
+				if otherWorker != workerPtr && otherPtr == firstPtr {
+					mu.Unlock()
+
+					return nil, fmt.Errorf("workers share active scratch buffer: %s and %s", workerPtr, otherWorker)
+				}
+			}
+
+			expectedMarker := markerByWorker[workerPtr]
+
+			mu.Unlock()
+
+			for i := range scratchSize {
+				if scratch[i] != expectedMarker {
+					return nil, fmt.Errorf("scratch data corrupted at %d: got=%d want=%d", i, scratch[i], expectedMarker)
+				}
+			}
+
+			mu.Lock()
+
+			completedWorkers[workerPtr] = struct{}{}
+
+			mu.Unlock()
+
+			return &struct{}{}, nil
+		},
+		fileproc.WithFileWorkers(workers),
+		fileproc.WithChunkSize(1),
+	)
+
+	if len(errs) != 0 {
+		t.Fatalf("expected no errors, got %v", errs)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if len(firstPtrByWorker) != workers {
+		t.Fatalf("expected %d workers to retain scratch buffers, got %d", workers, len(firstPtrByWorker))
+	}
+
+	if len(completedWorkers) != workers {
+		t.Fatalf("expected %d workers to complete scratch validation, got %d", workers, len(completedWorkers))
+	}
+}
+
 // ============================================================================
 // Owned copy tests
 // ============================================================================
@@ -996,7 +1116,7 @@ func Test_Worker_AllocateOwnedCopy_Returns_Stable_Slice_When_Called(t *testing.T
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, w *fileproc.FileWorker) (*holder, error) {
 		data, err := f.ReadAll()
 		if err != nil {
-			return nil, fmt.Errorf("bytes: %w", err)
+			return nil, fmt.Errorf("read all: %w", err)
 		}
 
 		return &holder{retained: retainOwnedCopy(w, data)}, nil
@@ -1028,7 +1148,7 @@ func Test_Worker_AllocateOwnedCopy_Returns_Empty_Slice_When_Input_Empty(t *testi
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, w *fileproc.FileWorker) (*struct{}, error) {
 		data, err := f.ReadAll()
 		if err != nil {
-			return nil, fmt.Errorf("bytes: %w", err)
+			return nil, fmt.Errorf("read all: %w", err)
 		}
 
 		retained = retainOwnedCopy(w, data)
@@ -1069,7 +1189,7 @@ func Test_Worker_AllocateOwnedCopy_Preserves_Multiple_Slices_When_Called_Repeate
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, w *fileproc.FileWorker) (*holder, error) {
 		data, err := f.ReadAll()
 		if err != nil {
-			return nil, fmt.Errorf("bytes: %w", err)
+			return nil, fmt.Errorf("read all: %w", err)
 		}
 
 		// Retain two different subslices
@@ -1111,7 +1231,7 @@ func Test_Worker_AllocateOwnedCopy_Is_Independent_From_Original_When_Modified(t 
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, w *fileproc.FileWorker) (*holder, error) {
 		data, err := f.ReadAll()
 		if err != nil {
-			return nil, fmt.Errorf("bytes: %w", err)
+			return nil, fmt.Errorf("read all: %w", err)
 		}
 
 		retained := retainOwnedCopy(w, data)

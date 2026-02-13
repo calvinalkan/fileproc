@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sync"
+	"syscall"
 	"testing"
 
 	"github.com/calvinalkan/fileproc"
@@ -307,10 +308,10 @@ func Test_File_Stat_Is_Available_When_File_Unreadable(t *testing.T) {
 }
 
 // ============================================================================
-// File.Bytes() tests
+// File.ReadAll() tests
 // ============================================================================
 
-func Test_File_Bytes_Reads_Full_Content_When_Called(t *testing.T) {
+func Test_File_ReadAll_Reads_Full_Content_When_Called(t *testing.T) {
 	t.Parallel()
 
 	root := t.TempDir()
@@ -345,7 +346,7 @@ func Test_File_Bytes_Reads_Full_Content_When_Called(t *testing.T) {
 	}
 }
 
-func Test_File_Bytes_Remains_Valid_When_AllocateOwnedCopy_Called(t *testing.T) {
+func Test_File_ReadAll_Remains_Valid_When_AllocateOwnedCopy_Called(t *testing.T) {
 	t.Parallel()
 
 	root := t.TempDir()
@@ -381,7 +382,7 @@ func Test_File_Bytes_Remains_Valid_When_AllocateOwnedCopy_Called(t *testing.T) {
 	}
 }
 
-func Test_File_Bytes_Returns_NonNil_Empty_Slice_When_File_Empty(t *testing.T) {
+func Test_File_ReadAll_Returns_NonNil_Empty_Slice_When_File_Empty(t *testing.T) {
 	t.Parallel()
 
 	root := t.TempDir()
@@ -423,7 +424,7 @@ func Test_File_Bytes_Returns_NonNil_Empty_Slice_When_File_Empty(t *testing.T) {
 	}
 }
 
-func Test_File_Bytes_Returns_Empty_Slice_When_File_Size_Is_Zero(t *testing.T) {
+func Test_File_ReadAll_Returns_Empty_Slice_When_File_Size_Is_Zero(t *testing.T) {
 	t.Parallel()
 
 	root := t.TempDir()
@@ -474,7 +475,7 @@ func Test_File_Bytes_Returns_Empty_Slice_When_File_Size_Is_Zero(t *testing.T) {
 	}
 }
 
-func Test_File_Bytes_Returns_Actual_Content_When_File_Shrunk_Since_Stat(t *testing.T) {
+func Test_File_ReadAll_Returns_Actual_Content_When_File_Shrunk_Since_Stat(t *testing.T) {
 	t.Parallel()
 
 	root := t.TempDir()
@@ -503,7 +504,7 @@ func Test_File_Bytes_Returns_Actual_Content_When_File_Shrunk_Since_Stat(t *testi
 
 		statSize = st.Size
 
-		// Shrink the file after stat but before Bytes()
+		// Shrink the file after stat but before ReadAll()
 		writeErr := os.WriteFile(filePath, []byte("short"), 0o644)
 		if writeErr != nil {
 			return nil, fmt.Errorf("write: %w", writeErr)
@@ -532,13 +533,62 @@ func Test_File_Bytes_Returns_Actual_Content_When_File_Shrunk_Since_Stat(t *testi
 		t.Fatalf("stat size: got %d, want %d", statSize, len(initialContent))
 	}
 
-	// Bytes() returns actual (shorter) content
+	// ReadAll() returns actual (shorter) content
 	if string(gotData) != "short" {
 		t.Fatalf("data: got %q, want 'short'", gotData)
 	}
 }
 
-func Test_File_Bytes_Returns_Full_Content_When_File_Grew_Since_Stat(t *testing.T) {
+func Test_File_ReadAll_Does_Not_Reject_From_Stale_Stat_Size_When_File_Shrinks(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	filePath := filepath.Join(root, "shrinking-max-bytes.txt")
+	initialContent := []byte("0123456789")
+	shrunkContent := []byte("1234")
+
+	err := os.WriteFile(filePath, initialContent, 0o644)
+	if err != nil {
+		t.Fatalf("write initial: %v", err)
+	}
+
+	var gotData []byte
+
+	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, w *fileproc.FileWorker) (*struct{}, error) {
+		_, err = f.Stat()
+		if err != nil {
+			return nil, fmt.Errorf("stat: %w", err)
+		}
+
+		err = os.WriteFile(filePath, shrunkContent, 0o644)
+		if err != nil {
+			return nil, fmt.Errorf("write shrunk: %w", err)
+		}
+
+		data, err := f.ReadAll(fileproc.WithMaxBytes(len(shrunkContent)))
+		if err != nil {
+			return nil, fmt.Errorf("read all: %w", err)
+		}
+
+		gotData = retainOwnedCopy(w, data)
+
+		return &struct{}{}, nil
+	}, fileproc.WithFileWorkers(1))
+
+	if len(errs) != 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+
+	if !bytes.Equal(gotData, shrunkContent) {
+		t.Fatalf("data: got %q, want %q", gotData, shrunkContent)
+	}
+}
+
+func Test_File_ReadAll_Returns_Full_Content_When_File_Grew_Since_Stat(t *testing.T) {
 	t.Parallel()
 
 	root := t.TempDir()
@@ -569,7 +619,7 @@ func Test_File_Bytes_Returns_Full_Content_When_File_Grew_Since_Stat(t *testing.T
 
 		statSize = st.Size
 
-		// Grow the file after stat but before Bytes()
+		// Grow the file after stat but before ReadAll()
 		writeErr := os.WriteFile(filePath, grownContent, 0o644)
 		if writeErr != nil {
 			return nil, fmt.Errorf("write: %w", writeErr)
@@ -598,47 +648,13 @@ func Test_File_Bytes_Returns_Full_Content_When_File_Grew_Since_Stat(t *testing.T
 		t.Fatalf("stat size: got %d, want %d", statSize, len(initialContent))
 	}
 
-	// Bytes() returns actual (larger) content
+	// ReadAll() returns actual (larger) content
 	if !bytes.Equal(gotData, grownContent) {
 		t.Fatalf("data: got %q, want %q", gotData, grownContent)
 	}
 }
 
-func Test_File_Bytes_Returns_Error_When_Called_Second_Time(t *testing.T) {
-	t.Parallel()
-
-	root := t.TempDir()
-	writeFile(t, root, "test.txt", []byte("content"))
-
-	opts := []fileproc.Option{fileproc.WithFileWorkers(1)}
-
-	var firstErr, secondErr error
-
-	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, _ *fileproc.FileWorker) (*struct{}, error) {
-		_, firstErr = f.ReadAll()
-		_, secondErr = f.ReadAll()
-
-		return &struct{}{}, nil
-	}, opts...)
-
-	if len(errs) != 0 {
-		t.Fatalf("unexpected errors: %v", errs)
-	}
-
-	if len(results) != 1 {
-		t.Fatalf("expected 1 result, got %d", len(results))
-	}
-
-	if firstErr != nil {
-		t.Fatalf("first Bytes() should succeed: %v", firstErr)
-	}
-
-	if secondErr == nil {
-		t.Fatal("second Bytes() should return error")
-	}
-}
-
-func Test_File_Bytes_Opens_File_Lazily_When_Called(t *testing.T) {
+func Test_File_ReadAll_Opens_File_Lazily_When_Called(t *testing.T) {
 	t.Parallel()
 
 	if runtime.GOOS == windowsOS {
@@ -664,7 +680,7 @@ func Test_File_Bytes_Opens_File_Lazily_When_Called(t *testing.T) {
 		// Stat should work without opening file
 		st, statErr := f.Stat()
 		statOK = statErr == nil && st.Size > 0
-		// Bytes() should fail because file is unreadable
+		// ReadAll() should fail because file is unreadable
 		_, bytesErr = f.ReadAll()
 
 		return &struct{}{}, nil
@@ -683,11 +699,11 @@ func Test_File_Bytes_Opens_File_Lazily_When_Called(t *testing.T) {
 	}
 
 	if bytesErr == nil {
-		t.Fatal("Bytes() should fail for unreadable file")
+		t.Fatal("ReadAll() should fail for unreadable file")
 	}
 }
 
-func Test_File_Bytes_Works_Correctly_When_File_Large(t *testing.T) {
+func Test_File_ReadAll_Works_Correctly_When_File_Large(t *testing.T) {
 	t.Parallel()
 
 	root := t.TempDir()
@@ -730,7 +746,7 @@ func Test_File_Bytes_Works_Correctly_When_File_Large(t *testing.T) {
 	}
 }
 
-func Test_File_Bytes_Returns_Error_When_File_Is_Deleted(t *testing.T) {
+func Test_File_ReadAll_Returns_Error_When_File_Is_Deleted(t *testing.T) {
 	t.Parallel()
 
 	root := t.TempDir()
@@ -745,7 +761,7 @@ func Test_File_Bytes_Returns_Error_When_File_Is_Deleted(t *testing.T) {
 	opts := []fileproc.Option{fileproc.WithFileWorkers(1)}
 
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, _ *fileproc.FileWorker) (*struct{}, error) {
-		// Delete file after stat but before Bytes()
+		// Delete file after stat but before ReadAll()
 		removeErr := os.Remove(filePath)
 		if removeErr != nil {
 			return nil, fmt.Errorf("remove: %w", removeErr)
@@ -774,7 +790,7 @@ func Test_File_Bytes_Returns_Error_When_File_Is_Deleted(t *testing.T) {
 	}
 }
 
-func Test_File_Bytes_Returns_Content_When_File_Grows_From_Empty(t *testing.T) {
+func Test_File_ReadAll_Returns_Content_When_File_Grows_From_Empty(t *testing.T) {
 	t.Parallel()
 
 	root := t.TempDir()
@@ -837,10 +853,10 @@ func Test_File_Bytes_Returns_Content_When_File_Grows_From_Empty(t *testing.T) {
 }
 
 // ============================================================================
-// Bytes error propagation
+// ReadAll error propagation
 // ============================================================================
 
-func Test_File_Bytes_Propagates_Error_When_File_Unreadable(t *testing.T) {
+func Test_File_ReadAll_Propagates_Error_When_File_Unreadable(t *testing.T) {
 	t.Parallel()
 
 	if runtime.GOOS == windowsOS {
@@ -1085,7 +1101,7 @@ func Test_File_Fd_Returns_Valid_Fd_When_Called(t *testing.T) {
 	}
 }
 
-func Test_File_Fd_Opens_File_When_Not_Already_Open(t *testing.T) {
+func Test_File_Fd_Returns_Same_Fd_When_Called_Multiple_Times(t *testing.T) {
 	t.Parallel()
 
 	root := t.TempDir()
@@ -1093,11 +1109,11 @@ func Test_File_Fd_Opens_File_When_Not_Already_Open(t *testing.T) {
 
 	opts := []fileproc.Option{fileproc.WithFileWorkers(1)}
 
-	var fd uintptr
+	var firstFD, secondFD uintptr
 
 	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, _ *fileproc.FileWorker) (*struct{}, error) {
-		// Don't call Bytes() or Read(), just Fd()
-		fd = f.Fd()
+		firstFD = f.Fd()
+		secondFD = f.Fd()
 
 		return &struct{}{}, nil
 	}, opts...)
@@ -1110,12 +1126,76 @@ func Test_File_Fd_Opens_File_When_Not_Already_Open(t *testing.T) {
 		t.Fatalf("expected 1 result, got %d", len(results))
 	}
 
-	if fd == invalidFD {
-		t.Fatal("expected valid fd, got -1")
+	if firstFD == invalidFD {
+		t.Fatal("expected valid fd on first call, got -1")
+	}
+
+	if secondFD != firstFD {
+		t.Fatalf("expected same fd across repeated calls, first=%d second=%d", firstFD, secondFD)
 	}
 }
 
-func Test_File_Fd_Works_When_Called_After_Bytes(t *testing.T) {
+func Test_File_Fd_Is_Usable_For_LinuxSyscalls_When_Called(t *testing.T) {
+	t.Parallel()
+
+	if runtime.GOOS != "linux" {
+		t.Skip("linux-specific fd syscall test")
+	}
+
+	root := t.TempDir()
+	content := []byte("syscall-fd-check")
+	writeFile(t, root, "test.txt", content)
+
+	var (
+		statSize int64
+		gotData  []byte
+	)
+
+	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, _ *fileproc.FileWorker) (*struct{}, error) {
+		fd := f.Fd()
+		if fd == invalidFD {
+			return nil, errors.New("expected valid fd, got -1")
+		}
+
+		var st syscall.Stat_t
+
+		err := syscall.Fstat(int(fd), &st)
+		if err != nil {
+			return nil, fmt.Errorf("fstat: %w", err)
+		}
+
+		var buf [64]byte
+
+		n, err := syscall.Pread(int(fd), buf[:len(content)], 0)
+		if err != nil {
+			return nil, fmt.Errorf("pread: %w", err)
+		}
+
+		statSize = st.Size
+
+		gotData = append([]byte(nil), buf[:n]...)
+
+		return &struct{}{}, nil
+	}, fileproc.WithFileWorkers(1))
+
+	if len(errs) != 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+
+	if statSize != int64(len(content)) {
+		t.Fatalf("unexpected fstat size: got %d want %d", statSize, len(content))
+	}
+
+	if !bytes.Equal(gotData, content) {
+		t.Fatalf("pread content mismatch: got %q want %q", gotData, content)
+	}
+}
+
+func Test_File_Fd_Works_When_Called_After_ReadAll(t *testing.T) {
 	t.Parallel()
 
 	root := t.TempDir()
@@ -1141,7 +1221,7 @@ func Test_File_Fd_Works_When_Called_After_Bytes(t *testing.T) {
 	}
 
 	if fd == invalidFD {
-		t.Fatal("expected valid fd after Bytes(), got -1")
+		t.Fatal("expected valid fd after ReadAll(), got -1")
 	}
 }
 
@@ -1177,134 +1257,40 @@ func Test_File_Fd_Works_When_Called_After_Read(t *testing.T) {
 	}
 }
 
-// Mutual exclusion tests
+// ============================================================================
+// ReadAllOwned tests
 // ============================================================================
 
-func Test_File_Read_And_Bytes_Return_Error_When_Called_In_Different_Order(t *testing.T) {
-	t.Parallel()
-
-	root := t.TempDir()
-	writeFile(t, root, "test.txt", []byte("content"))
-
-	opts := []fileproc.Option{fileproc.WithFileWorkers(1)}
-
-	cases := []struct {
-		name       string
-		first      func(f *fileproc.File) error
-		second     func(f *fileproc.File) error
-		wantFirst  bool
-		wantSecond bool
-	}{
-		{
-			name: "BytesThenRead",
-			first: func(f *fileproc.File) error {
-				_, err := f.ReadAll()
-				if err != nil {
-					return fmt.Errorf("bytes: %w", err)
-				}
-
-				return nil
-			},
-			second: func(f *fileproc.File) error {
-				var buf [4]byte
-
-				_, err := f.Read(buf[:])
-				if err != nil {
-					return fmt.Errorf("read: %w", err)
-				}
-
-				return nil
-			},
-			wantFirst:  false,
-			wantSecond: true,
-		},
-		{
-			name: "ReadThenBytes",
-			first: func(f *fileproc.File) error {
-				var buf [4]byte
-
-				_, err := f.Read(buf[:])
-				if err != nil {
-					return fmt.Errorf("read: %w", err)
-				}
-
-				return nil
-			},
-			second: func(f *fileproc.File) error {
-				_, err := f.ReadAll()
-				if err != nil {
-					return fmt.Errorf("bytes: %w", err)
-				}
-
-				return nil
-			},
-			wantFirst:  false,
-			wantSecond: true,
-		},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-
-			results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, _ *fileproc.FileWorker) (*struct{}, error) {
-				firstErr := tc.first(f)
-
-				secondErr := tc.second(f)
-				if (firstErr != nil) != tc.wantFirst {
-					return nil, fmt.Errorf("first call error=%w", firstErr)
-				}
-
-				if (secondErr != nil) != tc.wantSecond {
-					return nil, fmt.Errorf("second call error=%w", secondErr)
-				}
-
-				return &struct{}{}, nil
-			}, opts...)
-
-			if len(errs) != 0 {
-				t.Fatalf("unexpected errors: %v", errs)
-			}
-
-			if len(results) != 1 {
-				t.Fatalf("expected 1 result, got %d", len(results))
-			}
-		})
-	}
-}
-
-// ============================================================================
-// ReadAllIntoAt tests
-// ============================================================================
-
-func Test_File_ReadAllIntoAt_Returns_Error_When_Destination_Offset_Is_Invalid(t *testing.T) {
+func Test_File_ReadAllOwned_Returns_Error_When_Destination_Offset_Is_Invalid(t *testing.T) {
 	t.Parallel()
 
 	root := t.TempDir()
 	writeFile(t, root, "test.txt", []byte("abc"))
 
-	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, _ *fileproc.FileWorker) (*struct{}, error) {
-		var dst [3]byte
+	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, w *fileproc.FileWorker) (*struct{}, error) {
+		dst := w.AllocateOwned(3)
 
-		n, err := f.ReadAllIntoAt(dst[:], -1)
+		_, n, err := f.ReadAllOwned(dst, -1)
 		if n != 0 || err == nil {
 			return nil, fmt.Errorf("negative offset: n=%d err=%w", n, err)
 		}
 
-		n, err = f.ReadAllIntoAt(dst[:], len(dst)+1)
+		_, n, err = f.ReadAllOwned(dst, len(dst.Buf)+1)
 		if n != 0 || err == nil {
 			return nil, fmt.Errorf("offset > len(dst): n=%d err=%w", n, err)
 		}
 
 		// Invalid offsets should not mutate File mode state.
-		n, err = f.ReadAllIntoAt(dst[:], 0)
+		got, n, err := f.ReadAllOwned(dst, 0)
 		if err != nil {
 			return nil, fmt.Errorf("valid call after invalid offset should succeed: %w", err)
 		}
 
-		if n != 3 || !bytes.Equal(dst[:], []byte("abc")) {
-			return nil, fmt.Errorf("unexpected valid call result: n=%d dst=%q", n, dst)
+		if n != 3 || !bytes.Equal(got.Buf, []byte("abc")) {
+			return nil, fmt.Errorf("unexpected valid call result: n=%d dst=%q", n, got.Buf)
 		}
+
+		got.Free()
 
 		return &struct{}{}, nil
 	}, fileproc.WithFileWorkers(1))
@@ -1318,27 +1304,30 @@ func Test_File_ReadAllIntoAt_Returns_Error_When_Destination_Offset_Is_Invalid(t 
 	}
 }
 
-func Test_File_ReadAllIntoAt_Writes_Content_When_Destination_Has_Space(t *testing.T) {
+func Test_File_ReadAllOwned_Writes_Content_When_Destination_Has_Space(t *testing.T) {
 	t.Parallel()
 
 	root := t.TempDir()
 	writeFile(t, root, "test.txt", []byte("hello"))
 
-	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, _ *fileproc.FileWorker) (*struct{}, error) {
-		dst := []byte("__________")
+	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, w *fileproc.FileWorker) (*struct{}, error) {
+		dst := w.AllocateOwned(10)
+		copy(dst.Buf, "__________")
 
-		n, err := f.ReadAllIntoAt(dst, 2)
+		got, n, err := f.ReadAllOwned(dst, 2)
 		if err != nil {
-			return nil, fmt.Errorf("ReadAllIntoAt: %w", err)
+			return nil, fmt.Errorf("ReadAllOwned: %w", err)
 		}
 
 		if n != 5 {
 			return nil, fmt.Errorf("unexpected n: got %d, want 5", n)
 		}
 
-		if !bytes.Equal(dst, []byte("__hello___")) {
-			return nil, fmt.Errorf("unexpected dst: %q", dst)
+		if !bytes.Equal(got.Buf, []byte("__hello___")) {
+			return nil, fmt.Errorf("unexpected dst: %q", got.Buf)
 		}
+
+		got.Free()
 
 		return &struct{}{}, nil
 	}, fileproc.WithFileWorkers(1))
@@ -1352,27 +1341,30 @@ func Test_File_ReadAllIntoAt_Writes_Content_When_Destination_Has_Space(t *testin
 	}
 }
 
-func Test_File_ReadAllIntoAt_Returns_ShortBuffer_When_Content_Exceeds_Remaining_Destination(t *testing.T) {
+func Test_File_ReadAllOwned_Applies_MaxBytes_To_FileData_When_Offset_Is_NonZero(t *testing.T) {
 	t.Parallel()
 
 	root := t.TempDir()
 	writeFile(t, root, "test.txt", []byte("hello"))
 
-	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, _ *fileproc.FileWorker) (*struct{}, error) {
-		dst := []byte("____")
+	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, w *fileproc.FileWorker) (*struct{}, error) {
+		dst := w.AllocateOwned(8)
+		copy(dst.Buf, "________")
 
-		n, err := f.ReadAllIntoAt(dst, 1)
-		if !errors.Is(err, io.ErrShortBuffer) {
-			return nil, fmt.Errorf("expected io.ErrShortBuffer, got n=%d err=%w", n, err)
+		got, n, err := f.ReadAllOwned(dst, 3, fileproc.WithMaxBytes(5))
+		if err != nil {
+			return nil, fmt.Errorf("ReadAllOwned: %w", err)
 		}
 
-		if n != 3 {
-			return nil, fmt.Errorf("unexpected n: got %d, want 3", n)
+		if n != 5 {
+			return nil, fmt.Errorf("unexpected n: got %d, want 5", n)
 		}
 
-		if !bytes.Equal(dst, []byte("_hel")) {
-			return nil, fmt.Errorf("unexpected dst: %q", dst)
+		if !bytes.Equal(got.Buf, []byte("___hello")) {
+			return nil, fmt.Errorf("unexpected dst: %q", got.Buf)
 		}
+
+		got.Free()
 
 		return &struct{}{}, nil
 	}, fileproc.WithFileWorkers(1))
@@ -1386,16 +1378,66 @@ func Test_File_ReadAllIntoAt_Returns_ShortBuffer_When_Content_Exceeds_Remaining_
 	}
 }
 
-func Test_File_ReadAllIntoAt_Returns_Nil_When_Content_Exactly_Fits_Remaining_Destination(t *testing.T) {
+func Test_File_ReadAllOwned_Returns_Partial_Write_When_MaxBytes_Is_Exceeded(t *testing.T) {
 	t.Parallel()
 
 	root := t.TempDir()
 	writeFile(t, root, "test.txt", []byte("hello"))
 
-	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, _ *fileproc.FileWorker) (*struct{}, error) {
-		dst := []byte("______")
+	var (
+		gotN   int
+		gotErr error
+		gotBuf []byte
+	)
 
-		n, err := f.ReadAllIntoAt(dst, 1)
+	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, w *fileproc.FileWorker) (*struct{}, error) {
+		dst := w.AllocateOwned(8)
+		copy(dst.Buf, "________")
+
+		got, n, err := f.ReadAllOwned(dst, 2, fileproc.WithMaxBytes(4))
+
+		gotN = n
+		gotErr = err
+
+		gotBuf = append([]byte(nil), got.Buf...)
+
+		got.Free()
+
+		return &struct{}{}, nil
+	}, fileproc.WithFileWorkers(1))
+
+	if len(errs) != 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+
+	if !errors.Is(gotErr, fileproc.ErrFileTooLarge) {
+		t.Fatalf("expected ErrFileTooLarge, got %v", gotErr)
+	}
+
+	if gotN != 4 {
+		t.Fatalf("expected partial write of 4 bytes, got %d", gotN)
+	}
+
+	if !bytes.Equal(gotBuf[:6], []byte("__hell")) {
+		t.Fatalf("unexpected partial content: %q", gotBuf[:6])
+	}
+}
+
+func Test_File_ReadAllOwned_Grows_Destination_When_Content_Exceeds_Remaining_Destination(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	writeFile(t, root, "test.txt", []byte("hello"))
+
+	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, w *fileproc.FileWorker) (*struct{}, error) {
+		dst := w.AllocateOwned(4)
+		copy(dst.Buf, "____")
+
+		got, n, err := f.ReadAllOwned(dst, 1)
 		if err != nil {
 			return nil, fmt.Errorf("expected nil error, got n=%d err=%w", n, err)
 		}
@@ -1404,9 +1446,15 @@ func Test_File_ReadAllIntoAt_Returns_Nil_When_Content_Exactly_Fits_Remaining_Des
 			return nil, fmt.Errorf("unexpected n: got %d, want 5", n)
 		}
 
-		if !bytes.Equal(dst, []byte("_hello")) {
-			return nil, fmt.Errorf("unexpected dst: %q", dst)
+		if len(got.Buf) < 6 {
+			return nil, fmt.Errorf("expected grown destination, got len=%d", len(got.Buf))
 		}
+
+		if !bytes.Equal(got.Buf[:6], []byte("_hello")) {
+			return nil, fmt.Errorf("unexpected dst prefix: %q", got.Buf[:6])
+		}
+
+		got.Free()
 
 		return &struct{}{}, nil
 	}, fileproc.WithFileWorkers(1))
@@ -1420,16 +1468,54 @@ func Test_File_ReadAllIntoAt_Returns_Nil_When_Content_Exactly_Fits_Remaining_Des
 	}
 }
 
-func Test_File_ReadAllIntoAt_Returns_Zero_When_File_Is_Empty(t *testing.T) {
+func Test_File_ReadAllOwned_Returns_Nil_When_Content_Exactly_Fits_Remaining_Destination(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	writeFile(t, root, "test.txt", []byte("hello"))
+
+	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, w *fileproc.FileWorker) (*struct{}, error) {
+		dst := w.AllocateOwned(6)
+		copy(dst.Buf, "______")
+
+		got, n, err := f.ReadAllOwned(dst, 1)
+		if err != nil {
+			return nil, fmt.Errorf("expected nil error, got n=%d err=%w", n, err)
+		}
+
+		if n != 5 {
+			return nil, fmt.Errorf("unexpected n: got %d, want 5", n)
+		}
+
+		if !bytes.Equal(got.Buf, []byte("_hello")) {
+			return nil, fmt.Errorf("unexpected dst: %q", got.Buf)
+		}
+
+		got.Free()
+
+		return &struct{}{}, nil
+	}, fileproc.WithFileWorkers(1))
+
+	if len(errs) != 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+}
+
+func Test_File_ReadAllOwned_Returns_Zero_When_File_Is_Empty(t *testing.T) {
 	t.Parallel()
 
 	root := t.TempDir()
 	writeFile(t, root, "empty.txt", []byte{})
 
-	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, _ *fileproc.FileWorker) (*struct{}, error) {
-		dst := []byte("___")
+	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, w *fileproc.FileWorker) (*struct{}, error) {
+		dst := w.AllocateOwned(3)
+		copy(dst.Buf, "___")
 
-		n, err := f.ReadAllIntoAt(dst, len(dst))
+		got, n, err := f.ReadAllOwned(dst, len(dst.Buf))
 		if err != nil {
 			return nil, fmt.Errorf("expected nil error for empty file, got n=%d err=%w", n, err)
 		}
@@ -1438,9 +1524,11 @@ func Test_File_ReadAllIntoAt_Returns_Zero_When_File_Is_Empty(t *testing.T) {
 			return nil, fmt.Errorf("unexpected n: got %d, want 0", n)
 		}
 
-		if !bytes.Equal(dst, []byte("___")) {
-			return nil, fmt.Errorf("destination should stay unchanged: %q", dst)
+		if !bytes.Equal(got.Buf, []byte("___")) {
+			return nil, fmt.Errorf("destination should stay unchanged: %q", got.Buf)
 		}
+
+		got.Free()
 
 		return &struct{}{}, nil
 	}, fileproc.WithFileWorkers(1))
@@ -1454,68 +1542,160 @@ func Test_File_ReadAllIntoAt_Returns_Zero_When_File_Is_Empty(t *testing.T) {
 	}
 }
 
-func Test_File_Read_And_ReadAllIntoAt_Return_Error_When_Called_In_Different_Order(t *testing.T) {
+func Test_File_ReadMethods_Return_Expected_Errors_When_Called_In_Invalid_Order(t *testing.T) {
 	t.Parallel()
+
+	type readCallResult struct {
+		firstErr  error
+		secondErr error
+	}
 
 	root := t.TempDir()
 	writeFile(t, root, "test.txt", []byte("content"))
 
 	cases := []struct {
-		name       string
-		first      func(f *fileproc.File) error
-		second     func(f *fileproc.File) error
-		wantFirst  bool
-		wantSecond bool
+		name string
+		run  func(f *fileproc.File, w *fileproc.FileWorker) readCallResult
 	}{
 		{
-			name: "ReadAllIntoAtThenRead",
-			first: func(f *fileproc.File) error {
-				var dst [16]byte
+			name: "ReadThenReadAll",
+			run: func(f *fileproc.File, _ *fileproc.FileWorker) readCallResult {
+				var buf [1]byte
 
-				_, err := f.ReadAllIntoAt(dst[:], 0)
-				if err != nil {
-					return fmt.Errorf("ReadAllIntoAt: %w", err)
+				_, firstErr := f.Read(buf[:])
+				_, secondErr := f.ReadAll()
+
+				return readCallResult{
+					firstErr:  firstErr,
+					secondErr: secondErr,
 				}
-
-				return nil
 			},
-			second: func(f *fileproc.File) error {
-				var buf [4]byte
-
-				_, err := f.Read(buf[:])
-				if err != nil {
-					return fmt.Errorf("Read: %w", err)
-				}
-
-				return nil
-			},
-			wantFirst:  false,
-			wantSecond: true,
 		},
 		{
-			name: "ReadThenReadAllIntoAt",
-			first: func(f *fileproc.File) error {
-				var buf [4]byte
+			name: "ReadThenReadAllOwned",
+			run: func(f *fileproc.File, w *fileproc.FileWorker) readCallResult {
+				var buf [1]byte
 
-				_, err := f.Read(buf[:])
-				if err != nil {
-					return fmt.Errorf("Read: %w", err)
+				_, firstErr := f.Read(buf[:])
+
+				dst := w.AllocateOwned(16)
+
+				got, _, secondErr := f.ReadAllOwned(dst, 0)
+				if secondErr == nil {
+					got.Free()
 				}
 
-				return nil
+				return readCallResult{
+					firstErr:  firstErr,
+					secondErr: secondErr,
+				}
 			},
-			second: func(f *fileproc.File) error {
-				var dst [16]byte
+		},
+		{
+			name: "ReadAllThenRead",
+			run: func(f *fileproc.File, _ *fileproc.FileWorker) readCallResult {
+				_, firstErr := f.ReadAll()
 
-				_, err := f.ReadAllIntoAt(dst[:], 0)
-				if err != nil {
-					return fmt.Errorf("ReadAllIntoAt: %w", err)
+				var buf [1]byte
+
+				_, secondErr := f.Read(buf[:])
+
+				return readCallResult{
+					firstErr:  firstErr,
+					secondErr: secondErr,
+				}
+			},
+		},
+		{
+			name: "ReadAllOwnedThenRead",
+			run: func(f *fileproc.File, w *fileproc.FileWorker) readCallResult {
+				dst := w.AllocateOwned(16)
+
+				got, _, firstErr := f.ReadAllOwned(dst, 0)
+				if firstErr == nil {
+					got.Free()
 				}
 
-				return nil
+				var buf [1]byte
+
+				_, secondErr := f.Read(buf[:])
+
+				return readCallResult{
+					firstErr:  firstErr,
+					secondErr: secondErr,
+				}
 			},
-			wantFirst:  false,
-			wantSecond: true,
+		},
+		{
+			name: "ReadAllThenReadAll",
+			run: func(f *fileproc.File, _ *fileproc.FileWorker) readCallResult {
+				_, firstErr := f.ReadAll()
+				_, secondErr := f.ReadAll()
+
+				return readCallResult{
+					firstErr:  firstErr,
+					secondErr: secondErr,
+				}
+			},
+		},
+		{
+			name: "ReadAllOwnedThenReadAllOwned",
+			run: func(f *fileproc.File, w *fileproc.FileWorker) readCallResult {
+				firstDst := w.AllocateOwned(16)
+
+				firstGot, _, firstErr := f.ReadAllOwned(firstDst, 0)
+				if firstErr == nil {
+					firstGot.Free()
+				}
+
+				secondDst := w.AllocateOwned(16)
+
+				secondGot, _, secondErr := f.ReadAllOwned(secondDst, 0)
+				if secondErr == nil {
+					secondGot.Free()
+				}
+
+				return readCallResult{
+					firstErr:  firstErr,
+					secondErr: secondErr,
+				}
+			},
+		},
+		{
+			name: "ReadAllThenReadAllOwned",
+			run: func(f *fileproc.File, w *fileproc.FileWorker) readCallResult {
+				_, firstErr := f.ReadAll()
+
+				dst := w.AllocateOwned(16)
+
+				got, _, secondErr := f.ReadAllOwned(dst, 0)
+				if secondErr == nil {
+					got.Free()
+				}
+
+				return readCallResult{
+					firstErr:  firstErr,
+					secondErr: secondErr,
+				}
+			},
+		},
+		{
+			name: "ReadAllOwnedThenReadAll",
+			run: func(f *fileproc.File, w *fileproc.FileWorker) readCallResult {
+				dst := w.AllocateOwned(16)
+
+				got, _, firstErr := f.ReadAllOwned(dst, 0)
+				if firstErr == nil {
+					got.Free()
+				}
+
+				_, secondErr := f.ReadAll()
+
+				return readCallResult{
+					firstErr:  firstErr,
+					secondErr: secondErr,
+				}
+			},
 		},
 	}
 
@@ -1523,17 +1703,10 @@ func Test_File_Read_And_ReadAllIntoAt_Return_Error_When_Called_In_Different_Orde
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, _ *fileproc.FileWorker) (*struct{}, error) {
-				firstErr := tc.first(f)
-				secondErr := tc.second(f)
+			var callResult readCallResult
 
-				if (firstErr != nil) != tc.wantFirst {
-					return nil, fmt.Errorf("first call error=%w", firstErr)
-				}
-
-				if (secondErr != nil) != tc.wantSecond {
-					return nil, fmt.Errorf("second call error=%w", secondErr)
-				}
+			results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, w *fileproc.FileWorker) (*struct{}, error) {
+				callResult = tc.run(f, w)
 
 				return &struct{}{}, nil
 			}, fileproc.WithFileWorkers(1))
@@ -1545,6 +1718,690 @@ func Test_File_Read_And_ReadAllIntoAt_Return_Error_When_Called_In_Different_Orde
 			if len(results) != 1 {
 				t.Fatalf("expected 1 result, got %d", len(results))
 			}
+
+			if callResult.firstErr != nil {
+				t.Fatalf("unexpected first-call error: %v", callResult.firstErr)
+			}
+
+			if callResult.secondErr == nil {
+				t.Fatal("expected second call to fail")
+			}
 		})
+	}
+}
+
+func Test_File_ReadVariants_Apply_Options_When_ReadAllOptions_Are_Provided(t *testing.T) {
+	t.Parallel()
+
+	type readVariant struct {
+		name string
+		call func(f *fileproc.File, w *fileproc.FileWorker, opts ...fileproc.ReadAllOption) ([]byte, error)
+	}
+
+	readVariants := []readVariant{
+		{
+			name: "ReadAll",
+			call: func(f *fileproc.File, _ *fileproc.FileWorker, opts ...fileproc.ReadAllOption) ([]byte, error) {
+				data, err := f.ReadAll(opts...)
+				if err != nil {
+					return nil, fmt.Errorf("read all: %w", err)
+				}
+
+				return append([]byte(nil), data...), nil
+			},
+		},
+		{
+			name: "ReadAllOwned",
+			call: func(f *fileproc.File, w *fileproc.FileWorker, opts ...fileproc.ReadAllOption) ([]byte, error) {
+				dst := w.AllocateOwned(0)
+
+				got, n, err := f.ReadAllOwned(dst, 0, opts...)
+				if err != nil {
+					return nil, fmt.Errorf("read all owned: %w", err)
+				}
+
+				out := append([]byte(nil), got.Buf[:n]...)
+				got.Free()
+
+				return out, nil
+			},
+		},
+	}
+
+	maxInt := int(^uint(0) >> 1)
+
+	cases := []struct {
+		name            string
+		content         []byte
+		opts            []fileproc.ReadAllOption
+		wantErr         bool
+		wantErrTooLarge bool
+	}{
+		{
+			name:            "MaxBytesExceeded",
+			content:         []byte("hello"),
+			opts:            []fileproc.ReadAllOption{fileproc.WithMaxBytes(4)},
+			wantErrTooLarge: true,
+		},
+		{
+			name:    "LastMaxBytesWins",
+			content: []byte("hello"),
+			opts: []fileproc.ReadAllOption{
+				fileproc.WithMaxBytes(2),
+				fileproc.WithMaxBytes(8),
+			},
+		},
+		{
+			name:    "NegativeMaxBytesReturnsError",
+			content: []byte("abc"),
+			opts: []fileproc.ReadAllOption{
+				fileproc.WithMaxBytes(-1),
+			},
+			wantErr: true,
+		},
+		{
+			name:    "PlatformIntLimitIsEnforced",
+			content: []byte("abc"),
+			opts: []fileproc.ReadAllOption{
+				fileproc.WithMaxBytes(maxInt),
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, variant := range readVariants {
+		for _, tc := range cases {
+			t.Run(variant.name+"_"+tc.name, func(t *testing.T) {
+				t.Parallel()
+
+				root := t.TempDir()
+				writeFile(t, root, "test.txt", tc.content)
+
+				var (
+					gotData []byte
+					gotErr  error
+				)
+
+				results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, w *fileproc.FileWorker) (*struct{}, error) {
+					gotData, gotErr = variant.call(f, w, tc.opts...)
+
+					return &struct{}{}, nil
+				}, fileproc.WithFileWorkers(1))
+
+				if len(errs) != 0 {
+					t.Fatalf("unexpected process errors: %v", errs)
+				}
+
+				if len(results) != 1 {
+					t.Fatalf("expected 1 result, got %d", len(results))
+				}
+
+				if tc.wantErrTooLarge {
+					if !errors.Is(gotErr, fileproc.ErrFileTooLarge) {
+						t.Fatalf("expected ErrFileTooLarge, got %v", gotErr)
+					}
+
+					return
+				}
+
+				if tc.wantErr {
+					if gotErr == nil {
+						t.Fatal("expected read error, got nil")
+					}
+
+					return
+				}
+
+				if gotErr != nil {
+					t.Fatalf("unexpected read error: %v", gotErr)
+				}
+
+				if !bytes.Equal(gotData, tc.content) {
+					t.Fatalf("content mismatch: got %q want %q", gotData, tc.content)
+				}
+			})
+		}
+	}
+}
+
+func Test_File_ReadAll_Applies_SizeHint_Rules_When_SizeHint_Options_Are_Provided(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name          string
+		content       []byte
+		callStatFirst bool
+		opts          []fileproc.ReadAllOption
+	}{
+		{
+			name:    "HintExceedsMaxWithoutStatIsClamped",
+			content: []byte("a"),
+			opts:    []fileproc.ReadAllOption{fileproc.WithSizeHint(1024), fileproc.WithMaxBytes(1)},
+		},
+		{
+			name:          "HintExceedsMaxWithPriorStatIsClamped",
+			content:       []byte("abc"),
+			callStatFirst: true,
+			opts:          []fileproc.ReadAllOption{fileproc.WithSizeHint(8), fileproc.WithMaxBytes(4)},
+		},
+		{
+			name:    "LastSizeHintWins",
+			content: []byte("abc"),
+			opts: []fileproc.ReadAllOption{
+				fileproc.WithSizeHint(8),
+				fileproc.WithSizeHint(3),
+				fileproc.WithMaxBytes(4),
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			root := t.TempDir()
+			writeFile(t, root, "test.txt", tc.content)
+
+			var (
+				gotData []byte
+				gotErr  error
+			)
+
+			results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, _ *fileproc.FileWorker) (*struct{}, error) {
+				if tc.callStatFirst {
+					_, statErr := f.Stat()
+					if statErr != nil {
+						return nil, fmt.Errorf("stat: %w", statErr)
+					}
+				}
+
+				gotData, gotErr = f.ReadAll(tc.opts...)
+
+				return &struct{}{}, nil
+			}, fileproc.WithFileWorkers(1))
+
+			if len(errs) != 0 {
+				t.Fatalf("unexpected process errors: %v", errs)
+			}
+
+			if len(results) != 1 {
+				t.Fatalf("expected 1 result, got %d", len(results))
+			}
+
+			if gotErr != nil {
+				t.Fatalf("unexpected read error: %v", gotErr)
+			}
+
+			if !bytes.Equal(gotData, tc.content) {
+				t.Fatalf("content mismatch: got %q want %q", gotData, tc.content)
+			}
+		})
+	}
+}
+
+func Test_File_ReadVariants_Do_Not_Change_Mode_When_Options_Are_Invalid(t *testing.T) {
+	t.Parallel()
+
+	type readVariant struct {
+		name string
+		call func(f *fileproc.File, w *fileproc.FileWorker, opts ...fileproc.ReadAllOption) ([]byte, error)
+	}
+
+	readVariants := []readVariant{
+		{
+			name: "ReadAll",
+			call: func(f *fileproc.File, _ *fileproc.FileWorker, opts ...fileproc.ReadAllOption) ([]byte, error) {
+				data, err := f.ReadAll(opts...)
+				if err != nil {
+					return nil, fmt.Errorf("read all: %w", err)
+				}
+
+				return append([]byte(nil), data...), nil
+			},
+		},
+		{
+			name: "ReadAllOwned",
+			call: func(f *fileproc.File, w *fileproc.FileWorker, opts ...fileproc.ReadAllOption) ([]byte, error) {
+				dst := w.AllocateOwned(0)
+
+				got, n, err := f.ReadAllOwned(dst, 0, opts...)
+				if err != nil {
+					return nil, fmt.Errorf("read all owned: %w", err)
+				}
+
+				out := append([]byte(nil), got.Buf[:n]...)
+				got.Free()
+
+				return out, nil
+			},
+		},
+	}
+
+	for _, variant := range readVariants {
+		t.Run(variant.name, func(t *testing.T) {
+			t.Parallel()
+
+			root := t.TempDir()
+			content := []byte("content")
+			writeFile(t, root, "test.txt", content)
+
+			var (
+				firstErr  error
+				second    []byte
+				secondErr error
+			)
+
+			results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, w *fileproc.FileWorker) (*struct{}, error) {
+				_, firstErr = variant.call(f, w, fileproc.WithMaxBytes(-1))
+				second, secondErr = variant.call(f, w)
+
+				return &struct{}{}, nil
+			}, fileproc.WithFileWorkers(1))
+
+			if len(errs) != 0 {
+				t.Fatalf("unexpected process errors: %v", errs)
+			}
+
+			if len(results) != 1 {
+				t.Fatalf("expected 1 result, got %d", len(results))
+			}
+
+			if firstErr == nil {
+				t.Fatal("expected first call to fail with invalid options")
+			}
+
+			if secondErr != nil {
+				t.Fatalf("second call should succeed after options parse failure: %v", secondErr)
+			}
+
+			if !bytes.Equal(second, content) {
+				t.Fatalf("unexpected second call content: got %q want %q", second, content)
+			}
+		})
+	}
+}
+
+func Test_File_Fd_Returns_InvalidFd_When_File_Is_Removed_Before_Call(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	filePath := filepath.Join(root, "test.txt")
+	writeFile(t, root, "test.txt", []byte("content"))
+
+	var fd uintptr
+
+	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, _ *fileproc.FileWorker) (*struct{}, error) {
+		removeErr := os.Remove(filePath)
+		if removeErr != nil {
+			return nil, fmt.Errorf("remove: %w", removeErr)
+		}
+
+		fd = f.Fd()
+
+		return &struct{}{}, nil
+	}, fileproc.WithFileWorkers(1))
+
+	if len(errs) != 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+
+	if fd != invalidFD {
+		t.Fatalf("expected invalid fd, got %d", fd)
+	}
+}
+
+func Test_File_Stat_Returns_Fresh_Metadata_When_File_Changes_Between_Calls(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	filePath := filepath.Join(root, "test.txt")
+	initialContent := []byte("small")
+	updatedContent := []byte("this content is larger than before")
+
+	writeFile(t, root, "test.txt", initialContent)
+
+	var first, second fileproc.Stat
+
+	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, _ *fileproc.FileWorker) (*struct{}, error) {
+		var err error
+
+		first, err = f.Stat()
+		if err != nil {
+			return nil, fmt.Errorf("first stat: %w", err)
+		}
+
+		writeErr := os.WriteFile(filePath, updatedContent, 0o644)
+		if writeErr != nil {
+			return nil, fmt.Errorf("write: %w", writeErr)
+		}
+
+		second, err = f.Stat()
+		if err != nil {
+			return nil, fmt.Errorf("second stat: %w", err)
+		}
+
+		return &struct{}{}, nil
+	}, fileproc.WithFileWorkers(1))
+
+	if len(errs) != 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+
+	if first == second {
+		t.Fatalf("expected second stat to refresh after file change, first=%+v second=%+v", first, second)
+	}
+
+	if first.Size != int64(len(initialContent)) {
+		t.Fatalf("unexpected first size: got %d want %d", first.Size, len(initialContent))
+	}
+
+	if second.Size != int64(len(updatedContent)) {
+		t.Fatalf("unexpected second size: got %d want %d", second.Size, len(updatedContent))
+	}
+}
+
+func Test_File_Methods_Skip_File_When_Path_Becomes_Directory_Before_Access(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		call func(f *fileproc.File, w *fileproc.FileWorker) error
+	}{
+		{
+			name: "Stat",
+			call: func(f *fileproc.File, _ *fileproc.FileWorker) error {
+				_, err := f.Stat()
+				if err != nil {
+					return fmt.Errorf("stat: %w", err)
+				}
+
+				return nil
+			},
+		},
+		{
+			name: "ReadAll",
+			call: func(f *fileproc.File, _ *fileproc.FileWorker) error {
+				_, err := f.ReadAll()
+				if err != nil {
+					return fmt.Errorf("read all: %w", err)
+				}
+
+				return nil
+			},
+		},
+		{
+			name: "Read",
+			call: func(f *fileproc.File, _ *fileproc.FileWorker) error {
+				var buf [1]byte
+
+				_, err := f.Read(buf[:])
+				if err != nil {
+					return fmt.Errorf("read: %w", err)
+				}
+
+				return nil
+			},
+		},
+		{
+			name: "ReadAllOwned",
+			call: func(f *fileproc.File, w *fileproc.FileWorker) error {
+				dst := w.AllocateOwned(1)
+
+				got, _, err := f.ReadAllOwned(dst, 0)
+				if err == nil {
+					got.Free()
+				}
+
+				if err != nil {
+					return fmt.Errorf("read all owned: %w", err)
+				}
+
+				return nil
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			root := t.TempDir()
+			filePath := filepath.Join(root, "test.txt")
+			writeFile(t, root, "test.txt", []byte("content"))
+
+			callbackCalls := 0
+
+			results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, w *fileproc.FileWorker) (*struct{}, error) {
+				callbackCalls++
+
+				removeErr := os.Remove(filePath)
+				if removeErr != nil {
+					return nil, fmt.Errorf("remove: %w", removeErr)
+				}
+
+				mkdirErr := os.Mkdir(filePath, 0o755)
+				if mkdirErr != nil {
+					return nil, fmt.Errorf("mkdir: %w", mkdirErr)
+				}
+
+				callErr := tc.call(f, w)
+				if callErr != nil {
+					return nil, callErr
+				}
+
+				return &struct{}{}, nil
+			}, fileproc.WithFileWorkers(1))
+
+			if len(errs) != 0 {
+				t.Fatalf("expected no process errors for skip path, got %v", errs)
+			}
+
+			if len(results) != 0 {
+				t.Fatalf("expected file to be skipped, got %d results", len(results))
+			}
+
+			if callbackCalls != 1 {
+				t.Fatalf("expected callback to run exactly once, got %d", callbackCalls)
+			}
+		})
+	}
+}
+
+func Test_File_Methods_Skip_File_When_Path_Becomes_SelfReferentialSymlink_Before_Access(t *testing.T) {
+	t.Parallel()
+
+	if runtime.GOOS == windowsOS {
+		t.Skip("symlink tests skipped on windows")
+	}
+
+	cases := []struct {
+		name string
+		call func(f *fileproc.File, w *fileproc.FileWorker) error
+	}{
+		{
+			name: "Stat",
+			call: func(f *fileproc.File, _ *fileproc.FileWorker) error {
+				_, err := f.Stat()
+				if err != nil {
+					return fmt.Errorf("stat: %w", err)
+				}
+
+				return nil
+			},
+		},
+		{
+			name: "ReadAll",
+			call: func(f *fileproc.File, _ *fileproc.FileWorker) error {
+				_, err := f.ReadAll()
+				if err != nil {
+					return fmt.Errorf("read all: %w", err)
+				}
+
+				return nil
+			},
+		},
+		{
+			name: "Read",
+			call: func(f *fileproc.File, _ *fileproc.FileWorker) error {
+				var buf [1]byte
+
+				_, err := f.Read(buf[:])
+				if err != nil {
+					return fmt.Errorf("read: %w", err)
+				}
+
+				return nil
+			},
+		},
+		{
+			name: "ReadAllOwned",
+			call: func(f *fileproc.File, w *fileproc.FileWorker) error {
+				dst := w.AllocateOwned(1)
+
+				got, _, err := f.ReadAllOwned(dst, 0)
+				if err == nil {
+					got.Free()
+				}
+
+				if err != nil {
+					return fmt.Errorf("read all owned: %w", err)
+				}
+
+				return nil
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			root := t.TempDir()
+			filePath := filepath.Join(root, "test.txt")
+			writeFile(t, root, "test.txt", []byte("content"))
+
+			callbackCalls := 0
+
+			results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, w *fileproc.FileWorker) (*struct{}, error) {
+				callbackCalls++
+
+				removeErr := os.Remove(filePath)
+				if removeErr != nil {
+					return nil, fmt.Errorf("remove: %w", removeErr)
+				}
+
+				// Relative target to the same name creates a self-referential symlink.
+				linkErr := os.Symlink("test.txt", filePath)
+				if linkErr != nil {
+					return nil, fmt.Errorf("symlink: %w", linkErr)
+				}
+
+				callErr := tc.call(f, w)
+				if callErr != nil {
+					return nil, callErr
+				}
+
+				return &struct{}{}, nil
+			}, fileproc.WithFileWorkers(1))
+
+			if len(errs) != 0 {
+				t.Fatalf("expected no process errors for skip path, got %v", errs)
+			}
+
+			if len(results) != 0 {
+				t.Fatalf("expected file to be skipped, got %d results", len(results))
+			}
+
+			if callbackCalls != 1 {
+				t.Fatalf("expected callback to run exactly once, got %d", callbackCalls)
+			}
+		})
+	}
+}
+
+func Test_File_ReadAllOwned_Propagates_Error_When_File_Unreadable(t *testing.T) {
+	t.Parallel()
+
+	if runtime.GOOS == windowsOS {
+		t.Skip("chmod 000 unsupported on windows")
+	}
+
+	root := t.TempDir()
+	writeFile(t, root, "secret.txt", []byte("secret"))
+
+	filePath := filepath.Join(root, "secret.txt")
+	makeUnreadable(t, filePath)
+
+	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, w *fileproc.FileWorker) (*struct{}, error) {
+		dst := w.AllocateOwned(16)
+
+		_, _, err := f.ReadAllOwned(dst, 0)
+		if err != nil {
+			return nil, fmt.Errorf("test: %w", err)
+		}
+
+		return &struct{}{}, nil
+	}, fileproc.WithFileWorkers(1))
+
+	if len(results) != 0 {
+		t.Fatalf("expected 0 results, got %d", len(results))
+	}
+
+	if len(errs) != 1 {
+		t.Fatalf("expected 1 error, got %d", len(errs))
+	}
+
+	var procErr *fileproc.ProcessError
+	if !errors.As(errs[0], &procErr) {
+		t.Fatalf("expected ProcessError, got %T", errs[0])
+	}
+}
+
+func Test_File_ReadAllOwned_Returns_Error_When_File_Is_Deleted_Before_Read(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	filePath := filepath.Join(root, "doomed.txt")
+
+	err := os.WriteFile(filePath, []byte("doomed"), 0o644)
+	if err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	results, errs := fileproc.Process(t.Context(), root, func(f *fileproc.File, w *fileproc.FileWorker) (*struct{}, error) {
+		removeErr := os.Remove(filePath)
+		if removeErr != nil {
+			return nil, fmt.Errorf("remove: %w", removeErr)
+		}
+
+		dst := w.AllocateOwned(16)
+
+		_, _, err := f.ReadAllOwned(dst, 0)
+		if err != nil {
+			return nil, fmt.Errorf("test: %w", err)
+		}
+
+		return &struct{}{}, nil
+	}, fileproc.WithFileWorkers(1))
+
+	if len(errs) != 1 {
+		t.Fatalf("expected 1 error, got %d", len(errs))
+	}
+
+	var procErr *fileproc.ProcessError
+	if !errors.As(errs[0], &procErr) {
+		t.Fatalf("expected ProcessError, got %T", errs[0])
+	}
+
+	if len(results) != 0 {
+		t.Fatalf("expected 0 results, got %d", len(results))
 	}
 }

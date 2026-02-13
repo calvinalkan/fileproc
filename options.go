@@ -20,7 +20,7 @@ type Option func(*options)
 // Recursive: NumCPU / 2, clamped to [4, 16].
 //
 // Defaults are tuned for I/O-bound workloads where callbacks primarily read
-// file content via [File.Bytes] or [File.Read], or stat via [File.Stat].
+// file content via [File.ReadAll] or [File.Read], or stat via [File.Stat].
 // Profiling shows 90%+ of runtime is spent in syscalls (open/read/close),
 // so kernel throughput is the bottleneck, not CPU.
 //
@@ -40,7 +40,7 @@ type Option func(*options)
 //   - Stat-only ([File.Stat]): similar to I/O bound; kernel contention
 //     on fstatat limits gains beyond 16 workers.
 //
-// Benchmarks on 24-core (flat 100k files, bytes mode):
+// Benchmarks on 24-core (flat 100k files, ReadAll mode):
 //
 //	w=16:  39ms (optimal)
 //	w=64:  41ms (+5%, syscalls 2× slower due to VFS contention)

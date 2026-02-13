@@ -69,3 +69,18 @@ var (
 	_ ioDirHandle  = dirHandle{}
 	_ ioFileHandle = fileHandle{}
 )
+
+// statKind classifies stat results so callers can skip non-regular files
+// without extra syscalls or mode checks.
+type statKind uint8
+
+const (
+	// statKindReg indicates a regular file.
+	statKindReg statKind = iota
+	// statKindDir indicates a directory.
+	statKindDir
+	// statKindSymlink indicates a symlink.
+	statKindSymlink
+	// statKindOther indicates a non-regular, non-dir, non-symlink entry.
+	statKindOther
+)

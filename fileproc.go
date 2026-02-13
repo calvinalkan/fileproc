@@ -45,7 +45,7 @@ var ErrSkip = errors.New("skip")
 //
 // Each callback receives:
 //   - *File: lazy access to path, metadata, and content (AbsPath, Stat,
-//     Bytes, Read, Fd).
+//     ReadAll, Read, Fd).
 //   - *FileWorker: reusable low-level memory helpers (ID, AllocateScratch,
 //     AllocateOwned).
 //
@@ -117,7 +117,7 @@ var ErrSkip = errors.New("skip")
 // # Usage
 //
 // [Process] provides a *File for lazy access to stat/content and a *FileWorker
-// for reusable temporary buffers. Use [File.Bytes] for full-content reads or
+// for reusable temporary buffers. Use [File.ReadAll] for full-content reads or
 // [File.Read] for streaming access.
 //
 // Example:
@@ -135,7 +135,7 @@ var ErrSkip = errors.New("skip")
 //	        return nil, err
 //	    }
 //
-//	    data, err := f.Bytes(opt)
+//	    data, err := f.ReadAll(opt)
 //	    if err != nil {
 //	        return nil, err
 //	    }
@@ -193,7 +193,7 @@ func Process[T any](ctx context.Context, path string, fn ProcessFunc[T], opts ..
 //
 // ProcessFunc may be called concurrently and must be safe for concurrent use.
 //
-// f provides access to [File] metadata and content (AbsPath, Stat, Bytes,
+// f provides access to [File] metadata and content (AbsPath, Stat, ReadAll,
 // Read, Fd). w provides reusable temporary buffers (ID, AllocateScratch, AllocateOwned).
 //
 // Both f and w are only valid during the callback. Borrowed slices from f and

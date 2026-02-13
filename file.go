@@ -2,34 +2,29 @@ package fileproc
 
 import (
 	"errors"
-	"io"
+	"fmt"
 	"os"
 	"syscall"
 )
 
-// Stat holds metadata for a file discovered by [Process].
-//
-// ModTime is expressed as Unix nanoseconds to avoid time.Time allocations
-// in hot paths. Use time.Unix(0, st.ModTime) to convert when needed.
-type Stat struct {
-	// Size is the file size in bytes.
-	Size int64
-	// ModTime is the modification time in Unix nanoseconds.
-	ModTime int64
-	// Mode is the file mode bits (os.FileMode).
-	Mode uint32
-	// Inode is the inode number when available (0 on platforms without it).
-	Inode uint64
-}
+var (
+	// ErrFileTooLarge indicates file content exceeded the active ReadAll max-byte limit.
+	ErrFileTooLarge = errors.New("file too large")
+
+	// errSkipFile is an internal sentinel indicating the file should be
+	// silently skipped (e.g., became a directory due to race condition).
+	// Not reported as an error to the user.
+	errSkipFile = errors.New("skip file")
+)
 
 // File provides access to a file being processed by [Process].
 //
 // All methods are lazy: the underlying file is opened on first content access
-// (ReadAll, ReadAllIntoAt, Read, or Fd). The handle is owned by fileproc and
+// (ReadAll, ReadAllOwned, Read, or Fd). The handle is owned by fileproc and
 // closed after the callback returns. File must not be retained beyond the
 // callback.
 //
-// ReadAll(), ReadAllIntoAt(), and Read() are mutually exclusive per file.
+// ReadAll(), ReadAllOwned(), and Read() are mutually exclusive per file.
 // Calling one after another returns an error.
 type File struct {
 	// File identity and path context (constant for this callback).
@@ -56,16 +51,6 @@ type File struct {
 	// absPath caches the built absolute absPath (no trailing NUL).
 	absPath []byte
 
-	// Cached stat result (populated lazily on first Stat call).
-	// stat caches the file stat result.
-	stat Stat
-
-	// statDone tracks whether stat has been attempted.
-	statDone bool
-
-	// statErr caches stat errors for lazy stat.
-	statErr error
-
 	// Lazy-open/read state for ReadAll/Read/Fd paths.
 	// fh points at the currently open file handle.
 	fh *fileHandle
@@ -73,11 +58,8 @@ type File struct {
 	// fhOpened indicates whether fh is open.
 	fhOpened *bool
 
-	// mode tracks the Bytes/Read usage state.
+	// mode tracks ReadAll/ReadAllOwned vs Read usage state.
 	mode fileMode
-
-	// openErr caches open errors for lazy open.
-	openErr error
 
 	// Worker-local scratch/reuse state shared across File methods.
 	// worker provides internal scratch slots for path/read operations.
@@ -144,10 +126,24 @@ func (f *File) RelPath() []byte {
 	return abs[start:]
 }
 
+// Stat holds metadata for a file discovered by [Process].
+//
+// ModTime is expressed as Unix nanoseconds to avoid time.Time allocations
+// in hot paths. Use time.Unix(0, st.ModTime) to convert when needed.
+type Stat struct {
+	// Size is the file size in bytes.
+	Size int64
+	// ModTime is the modification time in Unix nanoseconds.
+	ModTime int64
+	// Mode is the file mode bits (os.FileMode).
+	Mode uint32
+	// Inode is the inode number when available (0 on platforms without it).
+	Inode uint64
+}
+
 // Stat returns file metadata.
 //
-// Lazy: the stat syscall is made on first call and cached. Subsequent calls
-// return the cached value with no additional I/O.
+// Lazy: the stat syscall is made only when Stat is called.
 //
 // Returns zero Stat and an error if the stat syscall fails (e.g., file was
 // deleted or became a non-regular file). If the file is now a directory or
@@ -165,17 +161,23 @@ func (f *File) RelPath() []byte {
 //	}
 //	return &Result{Size: st.Size}, nil
 func (f *File) Stat() (Stat, error) {
-	if !f.statDone {
-		f.lazyStat()
-	}
-
-	return f.stat, f.statErr
+	return f.fetchStat()
 }
 
-// ReadAllOption configures the behavior of [File.ReadAll].
+// ReadAllOption configures [File.ReadAll] and [File.ReadAllOwned].
+//
+// Defaults when no option sets a field:
+//   - sizeHint: 0 (disabled)
+//   - maxBytes: 2 GiB
+//
+// If multiple options are passed, the last non-zero value for each field wins.
 type ReadAllOption struct {
 	// sizeHint is the expected file size to pre-size buffers.
+	// 0 means "no hint".
 	sizeHint int
+	// maxBytes is the maximum number of file bytes allowed to be read.
+	// 0 means "use default" (2 GiB).
+	maxBytes int
 }
 
 // WithSizeHint provides an expected file size to optimize buffer allocation.
@@ -186,9 +188,6 @@ type ReadAllOption struct {
 // The hint is a suggestion, not a limit. Files larger than the hint are
 // read completely; smaller files don't waste the extra space (only the
 // actual content is returned).
-//
-// The hint is ignored if [File.Stat] was called previously, since the
-// actual size is already known.
 //
 // Example:
 //
@@ -203,6 +202,16 @@ func WithSizeHint(size int) ReadAllOption {
 	return ReadAllOption{sizeHint: size}
 }
 
+// WithMaxBytes sets an upper bound on bytes read by [File.ReadAll] and
+// [File.ReadAllOwned].
+//
+// Values must be > 0.
+//
+// If omitted, the default limit is 2 GiB.
+func WithMaxBytes(limit int) ReadAllOption {
+	return ReadAllOption{maxBytes: limit}
+}
+
 // ReadAll reads and returns the full file content.
 //
 // The returned slice points into a reusable buffer and is only valid during
@@ -212,7 +221,7 @@ func WithSizeHint(size int) ReadAllOption {
 // Empty files return a non-nil empty slice ([]byte{}, nil).
 //
 // Single-use: ReadAll can only be called once per File and is mutually exclusive
-// with [File.Read] and [File.ReadAllIntoAt].
+// with [File.Read] and [File.ReadAllOwned].
 //
 // Returns error if called after [File.Read], or on I/O failure. If the file
 // changes type (becomes a directory or symlink) between scan and read, ReadAll
@@ -224,9 +233,13 @@ func WithSizeHint(size int) ReadAllOption {
 //
 // Buffer sizing: ReadAll does not call stat internally. The buffer size is
 // determined by (in priority order):
-//  1. The actual size from [File.Stat], if it was called previously
-//  2. The hint from [WithSizeHint], if provided
-//  3. A default 512-byte buffer, grown as needed
+//  1. The hint from [WithSizeHint], if provided
+//  2. A default 4KiB buffer, grown as needed
+//
+// ReadAll enforces a max-byte limit (default 2 GiB). Use [WithMaxBytes] to
+// override it.
+//
+// If the file exceeds the limit, ReadAll returns [ErrFileTooLarge].
 //
 // For workloads with known/uniform file sizes, use [WithSizeHint] to avoid
 // buffer resizing without the overhead of a stat syscall.
@@ -241,48 +254,39 @@ func WithSizeHint(size int) ReadAllOption {
 //	copy(owned.Buf, data)
 //	return &Result{Len: len(owned.Buf)}, nil
 func (f *File) ReadAll(opts ...ReadAllOption) ([]byte, error) {
-	if f.mode == fileModeReader {
-		return nil, errBytesAfterRead
+	readOpts, err := parseReadAllOptions(opts)
+	if err != nil {
+		return nil, err
 	}
 
-	if f.mode == fileModeBytes {
-		return nil, errBytesAlreadyCalled
+	err = f.prepareReadAll()
+	if err != nil {
+		return nil, err
 	}
 
-	// Open file if needed.
-	openErr := f.open()
-	if openErr != nil {
-		return nil, openErr
-	}
-
-	f.mode = fileModeBytes
-
-	// Buffer size priority: stat > sizeHint > default.
-	maxInt := int(^uint(0) >> 1)
-	maxSize := maxInt - 1
-
+	// Buffer size priority: sizeHint > default.
 	var size int
 
-	if f.statDone && f.statErr == nil {
-		if f.stat.Size > 0 {
-			if f.stat.Size > int64(maxSize) {
-				size = maxSize
-			} else {
-				size = int(f.stat.Size)
-			}
-		}
-	} else if len(opts) > 0 && opts[0].sizeHint > 0 {
-		size = min(opts[0].sizeHint, maxSize)
+	if readOpts.sizeHint > 0 {
+		// sizeHint is advisory for pre-allocation only; never fail early on it.
+		size = min(readOpts.sizeHint, readOpts.maxBytes)
 	}
 
 	// +1 to detect growth / read past expected size.
-	readSize := max(size+1, defaultReadBufSize)
+	readSize := min(max(size+1, defaultReadBufSize), readOpts.maxBytes)
 
 	// Internal read scratch uses a reserved worker slot.
 	// allocateScratchAt returns len=0, so reslice to expose readSize bytes.
 	readBuf := f.worker.allocateScratchAt(scratchSlotFileBytes, readSize)[:readSize]
 
-	n, out, err := f.readAllInto(readBuf, 0, true)
+	n, out, err := f.readAllInto(readBuf, 0, readOpts.maxBytes, func(buf []byte, minLen int) ([]byte, error) {
+		nextLen, growErr := nextReadAllBufferLen(len(buf), minLen, readOpts.maxBytes)
+		if growErr != nil {
+			return nil, growErr
+		}
+
+		return append(buf, make([]byte, nextLen-len(buf))...), nil
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -298,50 +302,72 @@ func (f *File) ReadAll(opts ...ReadAllOption) ([]byte, error) {
 	return out[:n], nil
 }
 
-// ReadAllIntoAt reads the full file content into dst starting at destOffset.
+// ReadAllOwned reads the full file content into dst starting at offset.
 //
-// It writes into dst[destOffset:] and returns the number of bytes written.
+// It writes into dst.Buf[offset:] and returns the updated Owned plus the number
+// of bytes written.
 //
-// If the file does not fit in the remaining destination space, it writes as much
-// as possible and returns io.ErrShortBuffer. If it fits exactly, it returns nil.
+// The returned Owned may differ from dst when growth happens; callers must use
+// the returned value for further use/free.
 //
-// Empty files return (0, nil).
+// If dst does not have enough space, ReadAllOwned allocates a larger owned
+// buffer, copies existing prefix bytes up to offset, frees the old owned
+// buffer, and continues.
 //
-// Single-use: ReadAllIntoAt can only be called once per File and is mutually
+// Empty files return n=0 and leave dst unchanged.
+//
+// Single-use: ReadAllOwned can only be called once per File and is mutually
 // exclusive with [File.ReadAll] and [File.Read].
 //
-// Returns an error when destOffset is outside [0, len(dst)].
+// Returns an error when offset is outside [0, len(dst.Buf)].
 // If the file changes type (becomes a directory or symlink) between scan and
-// read, ReadAllIntoAt returns a skip error that Process ignores when returned
+// read, ReadAllOwned returns a skip error that Process ignores when returned
 // by the callback.
-func (f *File) ReadAllIntoAt(dst []byte, destOffset int) (int, error) {
-	if f.mode == fileModeReader {
-		return 0, errBytesAfterRead
-	}
-
-	if f.mode == fileModeBytes {
-		return 0, errBytesAlreadyCalled
-	}
-
+//
+// ReadAllOwned enforces a max-byte limit (default 2 GiB). Use [WithMaxBytes]
+// to override it.
+//
+// If the file exceeds the limit, ReadAllOwned returns [ErrFileTooLarge].
+func (f *File) ReadAllOwned(dst Owned, offset int, opts ...ReadAllOption) (Owned, int, error) {
 	// Validate destination before mutating file state.
-	if destOffset < 0 || destOffset > len(dst) {
-		return 0, errInvalidDestOffset
+	if offset < 0 || offset > len(dst.Buf) {
+		return dst, 0, errors.New("invalid offset")
 	}
 
-	// Open file if needed.
-	openErr := f.open()
-	if openErr != nil {
-		return 0, openErr
-	}
-
-	f.mode = fileModeBytes
-
-	n, _, err := f.readAllInto(dst, destOffset, false)
+	readOpts, err := parseReadAllOptions(opts)
 	if err != nil {
-		return n, err
+		return dst, 0, err
 	}
 
-	return n, nil
+	err = f.prepareReadAll()
+	if err != nil {
+		return dst, 0, err
+	}
+
+	n, out, err := f.readAllInto(dst.Buf, offset, readOpts.maxBytes, func(buf []byte, minLen int) ([]byte, error) {
+		currentDataLen := len(buf) - offset
+		minDataLen := minLen - offset
+
+		nextDataLen, growErr := nextReadAllBufferLen(currentDataLen, minDataLen, readOpts.maxBytes)
+		if growErr != nil {
+			return nil, growErr
+		}
+
+		grown := f.worker.AllocateOwned(offset + nextDataLen)
+		copy(grown.Buf, buf[:minLen-1])
+
+		dst.Free()
+		dst = grown
+
+		return dst.Buf, nil
+	})
+	if err != nil {
+		return dst, n, err
+	}
+
+	dst.Buf = out
+
+	return dst, n, nil
 }
 
 // Read implements io.Reader for streaming access.
@@ -351,7 +377,7 @@ func (f *File) ReadAllIntoAt(dst []byte, destOffset int) (int, error) {
 // caller provides and manages the buffer.
 //
 // Read may be called multiple times until it returns io.EOF. It is mutually
-// exclusive with [File.ReadAll] and [File.ReadAllIntoAt], and returns an error
+// exclusive with [File.ReadAll] and [File.ReadAllOwned], and returns an error
 // if one of those methods was used first.
 //
 // If the file changes type (becomes a directory or symlink) between scan and
@@ -378,7 +404,7 @@ func (f *File) ReadAllIntoAt(dst []byte, destOffset int) (int, error) {
 //	}
 func (f *File) Read(p []byte) (int, error) {
 	if f.mode == fileModeBytes {
-		return 0, errReadAfterBytes
+		return 0, errors.New("cannot call after ReadAll/ReadAllOwned")
 	}
 
 	if f.mode != fileModeReader {
@@ -417,21 +443,34 @@ func (f *File) Fd() uintptr {
 	return f.fh.fdValue()
 }
 
-// readAllInto reads file content into dst starting at destOff.
+// readAllGrowFn grows buf to at least minLen and returns the grown buffer.
+type readAllGrowFn func(buf []byte, minLen int) ([]byte, error)
+
+// readAllInto reads file content into dst starting at destOffset.
 //
-// When allowGrow is true, dst may be grown to fit full content.
-// When allowGrow is false, io.ErrShortBuffer is returned if content exceeds
-// remaining destination capacity.
-func (f *File) readAllInto(dst []byte, destOffset int, allowGrow bool) (int, []byte, error) {
+// maxBytes limits bytes read from the file (excluding existing dst prefix data
+// before destOffset). When capacity is exhausted, grow is called.
+func (f *File) readAllInto(dst []byte, destOffset int, maxBytes int, grow readAllGrowFn) (int, []byte, error) {
 	// destOffset==len(dst) is valid (zero remaining capacity).
 	if destOffset < 0 || destOffset > len(dst) {
-		return 0, dst, errInvalidDestOffset
+		return 0, dst, errors.New("invalid destination offset")
+	}
+
+	if maxBytes <= 0 {
+		return 0, dst, errors.New("max bytes must be > 0")
+	}
+
+	maxWriteCursor := destOffset + maxBytes
+	if maxWriteCursor < destOffset {
+		return 0, dst, ErrFileTooLarge
 	}
 
 	buffer := dst
 
 	// Fast path: one read handles empty/small files without entering the grow loop.
-	initialRead, isDir, err := f.fh.readInto(buffer[destOffset:])
+	initialReadEnd := min(len(buffer), maxWriteCursor)
+
+	initialRead, isDir, err := f.fh.readInto(buffer[destOffset:initialReadEnd])
 	if isDir {
 		return 0, buffer, errSkipFile
 	}
@@ -443,42 +482,55 @@ func (f *File) readAllInto(dst []byte, destOffset int, allowGrow bool) (int, []b
 	writeCursor := destOffset + initialRead
 
 	// A full initial read means there may be more bytes; continue until EOF/error.
-	if initialRead == len(buffer)-destOffset {
+	if initialRead == initialReadEnd-destOffset {
 		var readFailure error
 
 		for {
-			if writeCursor == len(buffer) {
-				if !allowGrow {
-					// Distinguish exact fit vs truncation without growing destination:
-					// if one more byte exists, caller buffer was too small.
-					var probe [1]byte
+			if writeCursor == len(buffer) || writeCursor == maxWriteCursor {
+				// Probe for one more byte to distinguish exact-fit EOF from
+				// "more data available" before growing.
+				var probe [1]byte
 
-					probeRead, isDir, err := f.fh.readInto(probe[:])
-					if isDir {
-						return writeCursor - destOffset, buffer, errSkipFile
-					}
+				probeRead, isDir, err := f.fh.readInto(probe[:])
+				if isDir {
+					return writeCursor - destOffset, buffer, errSkipFile
+				}
 
-					if err != nil {
-						return writeCursor - destOffset, buffer, err
-					}
+				if err != nil {
+					return writeCursor - destOffset, buffer, err
+				}
 
-					if probeRead > 0 {
-						return writeCursor - destOffset, buffer, io.ErrShortBuffer
-					}
-
+				if probeRead == 0 {
 					break
 				}
 
-				// Geometric growth keeps realloc count low on large files.
-				growBy := max(len(buffer), 4096)
-				if growBy == 0 {
-					growBy = defaultReadBufSize
+				if writeCursor == maxWriteCursor {
+					return writeCursor - destOffset, buffer, ErrFileTooLarge
 				}
 
-				buffer = append(buffer, make([]byte, growBy)...)
+				if grow == nil {
+					return writeCursor - destOffset, buffer, ErrFileTooLarge
+				}
+
+				grown, growErr := grow(buffer, writeCursor+1)
+				if growErr != nil {
+					return writeCursor - destOffset, buffer, growErr
+				}
+
+				if len(grown) <= writeCursor {
+					return writeCursor - destOffset, buffer, ErrFileTooLarge
+				}
+
+				buffer = grown
+				buffer[writeCursor] = probe[0]
+				writeCursor++
+
+				continue
 			}
 
-			chunkRead, isDir, err := f.fh.readInto(buffer[writeCursor:])
+			chunkReadEnd := min(len(buffer), maxWriteCursor)
+
+			chunkRead, isDir, err := f.fh.readInto(buffer[writeCursor:chunkReadEnd])
 			if isDir {
 				return writeCursor - destOffset, buffer, errSkipFile
 			}
@@ -506,91 +558,144 @@ func (f *File) readAllInto(dst []byte, destOffset int, allowGrow bool) (int, []b
 	return writeCursor - destOffset, buffer, nil
 }
 
-var (
-	errBytesAfterRead     = errors.New("bytes: cannot call after read")
-	errBytesAlreadyCalled = errors.New("bytes: already called")
-	errReadAfterBytes     = errors.New("read: cannot call after bytes")
-	errInvalidDestOffset  = errors.New("read all into: invalid destination offset")
+// prepareReadAll enforces ReadAll/ReadAllOwned access rules and read state.
+//
+// It rejects invalid mode transitions (after Read, or repeated ReadAll reads),
+// lazily opens the file handle, and marks the file as fileModeBytes.
+func (f *File) prepareReadAll() error {
+	if f.mode == fileModeReader {
+		return errors.New("cannot call after Read")
+	}
 
-	// errSkipFile is an internal sentinel indicating the file should be
-	// silently skipped (e.g., became a directory due to race condition).
-	// Not reported as an error to the user.
-	errSkipFile = errors.New("skip file")
-)
+	if f.mode == fileModeBytes {
+		return errors.New("already called")
+	}
+
+	// Open file if needed.
+	openErr := f.open()
+	if openErr != nil {
+		return openErr
+	}
+
+	f.mode = fileModeBytes
+
+	return nil
+}
+
+type readAllOptions struct {
+	sizeHint int
+	maxBytes int
+}
+
+func parseReadAllOptions(opts []ReadAllOption) (readAllOptions, error) {
+	maxInt := int(^uint(0) >> 1)
+	// ReadAll may compute `size+1` for probe headroom; keep maxBytes <= MaxInt-1
+	// so that addition is always int-safe.
+	maxSizePlusOneSafe := maxInt - 1
+
+	readOpts := readAllOptions{
+		maxBytes: defaultReadAllMaxBytes,
+	}
+
+	for _, opt := range opts {
+		if opt.sizeHint != 0 {
+			readOpts.sizeHint = opt.sizeHint
+		}
+
+		if opt.maxBytes != 0 {
+			readOpts.maxBytes = opt.maxBytes
+		}
+	}
+
+	if readOpts.maxBytes <= 0 {
+		return readOpts, errors.New("max bytes must be > 0")
+	}
+
+	if readOpts.maxBytes > maxSizePlusOneSafe {
+		return readOpts, fmt.Errorf("max bytes %d exceeds platform int limit %d", readOpts.maxBytes, maxSizePlusOneSafe)
+	}
+
+	return readOpts, nil
+}
+
+func nextReadAllBufferLen(currentLen, minLen, maxBytes int) (int, error) {
+	if minLen > maxBytes {
+		return 0, fmt.Errorf("%w (max bytes: %d)", ErrFileTooLarge, maxBytes)
+	}
+
+	// Geometric growth: double once buffers are large; use 4KiB minimum for
+	// small buffers. If the immediate demand is larger, grow exactly to need.
+	growBy := max(currentLen, 4096)
+
+	need := minLen - currentLen
+	if growBy < need {
+		growBy = need
+	}
+
+	nextLen := currentLen + growBy
+	if nextLen < currentLen {
+		return 0, fmt.Errorf("%w (max bytes: %d)", ErrFileTooLarge, maxBytes)
+	}
+
+	if nextLen > maxBytes {
+		nextLen = maxBytes
+	}
+
+	if nextLen < minLen {
+		return 0, fmt.Errorf("%w (max bytes: %d)", ErrFileTooLarge, maxBytes)
+	}
+
+	return nextLen, nil
+}
 
 // fileMode tracks which content access method has been used for a File.
-// It enforces the Bytes/Read exclusivity without extra flags.
+// It enforces ReadAll/ReadAllOwned vs Read exclusivity without extra flags.
 type fileMode uint8
 
-// Zero value means no content access yet.
 const (
-	// fileModeBytes indicates Bytes() was used.
+	// fileModeBytes indicates ReadAll/ReadAllOwned was used.
 	fileModeBytes fileMode = iota + 1
 	// fileModeReader indicates Read() was used.
 	fileModeReader
+	// defaultReadAllMaxBytes is the default max bytes ReadAll/ReadAllOwned
+	// will read before returning [ErrFileTooLarge].
+	//
+	// 32-bit builds are not supported right now.
+	defaultReadAllMaxBytes = 2 << 30 // 2GiB
 )
 
-// statKind classifies stat results so callers can skip non-regular files
-// without extra syscalls or mode checks.
-type statKind uint8
-
-const (
-	// statKindReg indicates a regular file.
-	statKindReg statKind = iota
-	// statKindDir indicates a directory.
-	statKindDir
-	// statKindSymlink indicates a symlink.
-	statKindSymlink
-	// statKindOther indicates a non-regular, non-dir, non-symlink entry.
-	statKindOther
-)
-
-// lazyStat performs a single stat call and caches the result.
+// fetchStat performs a stat call.
 // Non-regular files are mapped to errSkipFile so callers can ignore races.
-func (f *File) lazyStat() {
+func (f *File) fetchStat() (Stat, error) {
 	st, kind, err := f.dh.statFile(f.name)
-	f.statDone = true
-
 	if err != nil {
 		if errors.Is(err, syscall.ELOOP) || kind == statKindSymlink {
-			f.statErr = errSkipFile
-		} else {
-			f.statErr = err
+			return Stat{}, errSkipFile
 		}
 
-		return
+		return Stat{}, err
 	}
 
 	if kind != statKindReg {
-		f.statErr = errSkipFile
-
-		return
+		return Stat{}, errSkipFile
 	}
 
-	f.stat = st
+	return st, nil
 }
 
-// open lazily opens the file and caches the result.
+// open lazily opens the file.
 // Symlink/dir races are normalized to errSkipFile so callers can skip silently.
 func (f *File) open() error {
 	if f.fhOpened != nil && *f.fhOpened {
 		return nil // already open
 	}
 
-	if f.openErr != nil {
-		return f.openErr // previous attempt failed
-	}
-
 	fh, err := f.dh.openFile(f.name)
 	if err != nil {
 		// Symlink detected (race: was regular file during scan).
 		if errors.Is(err, syscall.ELOOP) || errors.Is(err, syscall.EISDIR) {
-			f.openErr = errSkipFile
-
 			return errSkipFile
 		}
-
-		f.openErr = err
 
 		return err
 	}

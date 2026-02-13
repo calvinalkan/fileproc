@@ -420,7 +420,7 @@ const (
 
 	// defaultReadBufSize is the initial buffer size for file reads and
 	// buffer growth heuristics.
-	defaultReadBufSize = 512
+	defaultReadBufSize = 4096
 
 	// defaultChunkSize is the default number of entries per work unit.
 	//
